@@ -1,0 +1,10 @@
+[package]
+name = "maker-app-core"
+version = "0.1.0"
+edition = "2021"
+description = "Mount controller: supervises a `juicefs mount` child process for the Tauri app."
+license = "Apache-2.0"
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }

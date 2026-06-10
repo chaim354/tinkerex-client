@@ -1,0 +1,17 @@
+[package]
+name = "juicefs-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Pluggable data-path backend behind the CfAPI/File Provider on-demand providers. WebDAV now, libjfs later — same trait."
+license = "Apache-2.0"
+
+[dependencies]
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+quick-xml = "0.37"
+thiserror = "2"
+httpdate = "1"
+percent-encoding = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
