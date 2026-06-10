@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+  <head><meta charset="UTF-8" /><title>Maker — Mount</title></head>
+  <body style="font-family: sans-serif; padding: 2rem">
+    <h1>Maker — JuiceFS Mount</h1>
+    <p>Status: <strong id="state">…</strong> <span id="detail"></span></p>
+    <button id="mount">Mount</button>
+    <button id="unmount">Unmount</button>
+    <script type="module">
+      const { invoke } = window.__TAURI__.core;
+      const stateEl = document.getElementById("state");
+      const detailEl = document.getElementById("detail");
+      const render = (s) => {
+        stateEl.textContent = `${s.state} (${s.mount_point})`;
+        detailEl.textContent = s.detail ? `— ${s.detail}` : "";
+      };
+      const refresh = async () => render(await invoke("status"));
+      document.getElementById("mount").onclick = async () => {
+        try { render(await invoke("mount")); } catch (e) { detailEl.textContent = `— ${e}`; }
+      };
+      document.getElementById("unmount").onclick = async () => {
+        try { render(await invoke("unmount")); } catch (e) { detailEl.textContent = `— ${e}`; }
+      };
+      refresh();
+      setInterval(refresh, 2000);
+    </script>
+  </body>
+</html>
