@@ -1,9 +1,9 @@
 use std::sync::Mutex;
 
-use maker_app_core::{MountConfig, MountController, MountStatus};
+use maker_app_core::{platform_mounter, Mounter, MountStatus};
 use tauri::State;
 
-struct AppState(Mutex<MountController>);
+struct AppState(Mutex<Box<dyn Mounter>>);
 
 #[tauri::command]
 fn mount(state: State<AppState>) -> Result<MountStatus, String> {
@@ -26,9 +26,9 @@ fn status(state: State<AppState>) -> MountStatus {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let controller = MountController::new(MountConfig::from_env());
+    let mounter = platform_mounter();
     tauri::Builder::default()
-        .manage(AppState(Mutex::new(controller)))
+        .manage(AppState(Mutex::new(mounter)))
         .invoke_handler(tauri::generate_handler![mount, unmount, status])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
