@@ -6,6 +6,9 @@
 //! drives the CfAPI provider once that lands (which is why mount logic lives
 //! behind this controller, not inline in the Tauri commands).
 
+mod webdav;
+pub use webdav::{WebDavConfig, WebDavMountController};
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -74,6 +77,14 @@ pub struct MountStatus {
     pub state: MountState,
     pub mount_point: String,
     pub detail: Option<String>,
+}
+
+/// Common interface over the platform-specific mount strategies, so the app
+/// holds a `Box<dyn Mounter>` and the Tauri commands don't care which one.
+pub trait Mounter: Send {
+    fn mount(&mut self) -> Result<(), MountError>;
+    fn unmount(&mut self) -> Result<(), MountError>;
+    fn status(&mut self) -> MountStatus;
 }
 
 pub struct MountController {
@@ -191,6 +202,32 @@ impl MountController {
             mount_point: self.config.mount_point.clone(),
             detail: self.last_error.clone(),
         }
+    }
+}
+
+impl Mounter for MountController {
+    fn mount(&mut self) -> Result<(), MountError> {
+        MountController::mount(self)
+    }
+    fn unmount(&mut self) -> Result<(), MountError> {
+        MountController::unmount(self)
+    }
+    fn status(&mut self) -> MountStatus {
+        MountController::status(self)
+    }
+}
+
+/// Build the right mounter for this OS:
+/// - **macOS**: `juicefs webdav` sidecar + the native WebDAV client (no FUSE).
+/// - **Windows/Linux**: `juicefs mount` (WinFsp / libfuse).
+pub fn platform_mounter() -> Box<dyn Mounter> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(WebDavMountController::new(WebDavConfig::from_env()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(MountController::new(MountConfig::from_env()))
     }
 }
 
