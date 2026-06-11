@@ -26,6 +26,8 @@ pub enum Error {
     Server { status: u16, body: String },
     #[error("not authenticated")]
     Unauthenticated,
+    #[error("websocket: {0}")]
+    Ws(#[from] tungstenite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -297,6 +299,53 @@ impl ServerClient {
             Ok(resp.bytes()?.to_vec())
         } else {
             Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+        }
+    }
+
+    /// The `/cable` WebSocket URL for this client's device token (`http`→`ws`).
+    fn cable_url(&self) -> Result<String> {
+        let token = self.token.as_ref().ok_or(Error::Unauthenticated)?;
+        let ws_base = self
+            .base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        Ok(format!("{ws_base}/cable?token={token}"))
+    }
+
+    /// Subscribe to the server's `LibraryChannel` and call `on_head_seq(seq)` for each
+    /// `{head_seq}` nudge (the "pull now" signal — the server broadcasts it on every
+    /// commit). **Blocking**: this is one connection's lifetime; it returns `Ok(())` if
+    /// the server closes the stream cleanly, or `Err` on a socket/handshake failure.
+    /// The caller reconnects on return — the nudge is a latency optimization over the
+    /// cursor-delta poll, which remains the correctness backbone, so a dropped socket is
+    /// not fatal. Pings/`confirm_subscription`/other frames are ignored.
+    pub fn watch_library(&self, mut on_head_seq: impl FnMut(i64)) -> Result<()> {
+        use tungstenite::Message;
+        let (mut socket, _resp) = tungstenite::connect(self.cable_url()?)?;
+        // ActionCable subscribe: the identifier is a *stringified* JSON object.
+        let subscribe = serde_json::json!({
+            "command": "subscribe",
+            "identifier": "{\"channel\":\"LibraryChannel\"}",
+        })
+        .to_string();
+        socket.send(Message::Text(subscribe))?;
+        loop {
+            match socket.read()? {
+                Message::Text(txt) => {
+                    // Envelope: {"identifier":..,"message":{"head_seq":N}}. Only act on
+                    // frames that carry a head_seq (skip welcome/confirm/ping).
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        if let Some(seq) =
+                            v.get("message").and_then(|m| m.get("head_seq")).and_then(|s| s.as_i64())
+                        {
+                            on_head_seq(seq);
+                        }
+                    }
+                }
+                Message::Ping(p) => socket.send(Message::Pong(p))?,
+                Message::Close(_) => return Ok(()),
+                _ => {}
+            }
         }
     }
 }
