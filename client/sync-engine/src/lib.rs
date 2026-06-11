@@ -158,10 +158,18 @@ impl SyncEngine {
     pub fn pull_changes(provider: &SqliteProvider, client: &ServerClient, cursor: i64) -> Result<i64> {
         let resp = client.changes(cursor)?;
         for ch in &resp.changes {
-            if let Some(sn) = change_to_sync(ch) {
+            // The server soft-deletes, so a `delete` change still carries the node
+            // (with `deleted: true`). Treat either signal as a delete and remove the
+            // node — and any descendants — locally. A *move* is not a delete: the
+            // server models it as op `move` on the same stable node_id with a new
+            // parent/name, so it falls through to `apply_remote` below and updates the
+            // existing row in place (no delete, no duplicate).
+            let deleted = ch.node.as_ref().is_some_and(|n| n.deleted);
+            if ch.op == "delete" || deleted {
+                provider.apply_remote_delete(&ch.node_id)?;
+            } else if let Some(sn) = change_to_sync(ch) {
                 provider.apply_remote(&sn)?;
             }
-            // NOTE: 'delete' tombstones are not yet applied locally (basic daemon).
         }
         Ok(resp.head_seq)
     }
@@ -305,10 +313,12 @@ fn tree_node_to_sync(n: &TreeNode) -> SyncNode {
 }
 
 fn change_to_sync(ch: &Change) -> Option<SyncNode> {
-    if ch.op == "delete" {
+    let view = ch.node.as_ref()?;
+    // Deletes are applied by the caller (`apply_remote_delete`); never reconstruct a
+    // tombstoned node here.
+    if ch.op == "delete" || view.deleted {
         return None;
     }
-    let view = ch.node.as_ref()?;
     let manifest = ch.manifest.clone().unwrap_or_default();
     let manifest_id = (!manifest.is_empty()).then(|| sync_client::manifest_id(&manifest));
     let chunks = manifest

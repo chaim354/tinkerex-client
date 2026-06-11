@@ -134,6 +134,11 @@ impl<P: Provider + 'static> DavFileSystem for WebdavFs<P> {
                     }
                     Err(e) => return Err(map_err(e)),
                 };
+                // A truncating open (the usual PUT-overwrite) drops the old body first,
+                // so replacing a file with a shorter one leaves no stale tail.
+                if options.truncate {
+                    self.provider.truncate(ino, 0).map_err(map_err)?;
+                }
                 Ok(self.make_file(ino))
             } else {
                 let (ino, attr) = self.resolve(path)?;

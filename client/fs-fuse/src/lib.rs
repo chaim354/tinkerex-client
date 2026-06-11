@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fs_provider::{Attr, FsError, Kind, Provider};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 
 const TTL: Duration = Duration::from_secs(1);
@@ -95,6 +95,41 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        match self.provider.getattr(ino) {
+            Ok(a) => reply.attr(&TTL, &file_attr(&a)),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        // The only attribute we persist is size: a `size` change is a truncate (the
+        // kernel issues `setattr(size=0)` on an `O_TRUNC` open, then writes the new,
+        // possibly shorter, body). Drop the old tail past the new EOF here. Other
+        // attrs (mode/owner/times) are accepted as no-ops and we echo current state.
+        if let Some(sz) = size {
+            if let Err(e) = self.provider.truncate(ino, sz) {
+                reply.error(errno(&e));
+                return;
+            }
+        }
         match self.provider.getattr(ino) {
             Ok(a) => reply.attr(&TTL, &file_attr(&a)),
             Err(e) => reply.error(errno(&e)),

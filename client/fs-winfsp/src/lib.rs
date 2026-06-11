@@ -10,9 +10,9 @@
 //! This crate was written against the real `winfsp` 0.13 API but has **not been
 //! compiled or run** (the author's build host is macOS; `winfsp` only builds on
 //! Windows with WinFsp installed). Treat it as a faithful first cut that needs a
-//! Windows build pass — see `BUILD.md` and the `windows-mount` CI job. Known gaps are
-//! flagged inline (`LIMITATION:`), the main one being truncate/overwrite (the
-//! `Provider` has no truncate yet).
+//! Windows build pass — see `BUILD.md` and the `windows-mount` CI job. Truncate /
+//! overwrite-with-shorter is wired (`set_file_size` + the `overwrite` disposition both
+//! call `Provider::truncate`); any remaining gaps are flagged inline (`LIMITATION:`).
 //!
 //! Everything real is behind `#[cfg(windows)]`; on other platforms this is an empty
 //! crate, so it never affects the macOS/Linux builds.
@@ -249,9 +249,10 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> Result<()> {
-        // LIMITATION: the Provider has no truncate, so we can't reset the file to empty
-        // here. CREATE_ALWAYS/OVERWRITE on an *existing* file keeps the old tail until a
-        // `truncate` lands on the Provider. New-file writes are unaffected.
+        // CREATE_ALWAYS / FILE_OVERWRITE(_IF): reset the file to empty so the new (often
+        // shorter) body leaves no stale tail. This is the common "save a smaller file"
+        // path on Windows — WinFsp signals it here, not via `set_file_size`.
+        self.provider.truncate(context.ino, 0).map_err(to_fsp)?;
         let attr = self.provider.getattr(context.ino).map_err(to_fsp)?;
         fill_file_info(file_info, &attr);
         Ok(())
@@ -371,12 +372,10 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
         _set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> Result<()> {
-        let cur = self.provider.getattr(context.ino).map_err(to_fsp)?.size;
-        if new_size > cur && new_size > 0 {
-            // Grow: write a single zero byte at the new EOF (the gap reads back as zeros).
-            let _ = self.provider.write(context.ino, new_size - 1, &[0]);
-        }
-        // LIMITATION: shrink needs a Provider truncate (not yet implemented).
+        // Resize to exactly `new_size`: the Provider truncate shrinks (dropping any
+        // stale tail past the new EOF) or grows with zero-fill, so an
+        // overwrite-with-shorter leaves no stale bytes.
+        self.provider.truncate(context.ino, new_size).map_err(to_fsp)?;
         let attr = self.provider.getattr(context.ino).map_err(to_fsp)?;
         fill_file_info(file_info, &attr);
         Ok(())

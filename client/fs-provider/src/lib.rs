@@ -133,6 +133,11 @@ pub trait Provider: Send + Sync {
     fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32>;
     /// Finalize writeback: chunk the staged content, store + dedup, update the tree.
     fn flush(&self, ino: u64) -> Result<()>;
+    /// Resize the file to exactly `size` bytes (the kernel's `setattr`/`O_TRUNC`).
+    /// Shrinking drops any content past the new EOF (so an overwrite-with-shorter
+    /// leaves no stale tail); growing zero-fills. The new length is what `flush`
+    /// will commit and what the sync push will export.
+    fn truncate(&self, ino: u64, size: u64) -> Result<()>;
     fn unlink(&self, parent: u64, name: &str) -> Result<()>;
     fn rmdir(&self, parent: u64, name: &str) -> Result<()>;
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()>;
@@ -414,6 +419,32 @@ impl SqliteProvider {
         Ok(())
     }
 
+    /// Apply a delete pulled from the server: remove the node identified by its stable
+    /// `node_id` (and any descendants) from the local tree. Idempotent — a no-op if the
+    /// node is already gone (the server may delete a node this device never saw, or a
+    /// parent delete may arrive before/after its children). Does **not** touch the
+    /// outbox: this is an inbound change, not a local one, so it must never echo back.
+    ///
+    /// Orphan-safe: a directory delete sweeps the whole subtree via a recursive CTE, so
+    /// even if per-child deletes don't arrive (or arrive out of order) the local tree
+    /// stays consistent. Manifest/chunk rows are left for GC, matching the local
+    /// `unlink`/`rmdir` path.
+    pub fn apply_remote_delete(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM nodes WHERE ino IN (
+                 WITH RECURSIVE sub(ino) AS (
+                     SELECT ino FROM nodes WHERE node_id = ?1
+                     UNION ALL
+                     SELECT n.ino FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                 )
+                 SELECT ino FROM sub
+             )",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
     pub fn ino_for_node_id(&self, node_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -677,6 +708,28 @@ impl Provider for SqliteProvider {
         Ok(())
     }
 
+    fn truncate(&self, ino: u64, size: u64) -> Result<()> {
+        // If the file is already open for write, resize the live staging buffer in
+        // place; the eventual `flush`/`release` commits the new length. Shrinking here
+        // is what clears the stale tail an overwrite-with-shorter would otherwise leave
+        // (the kernel issues this `setattr(size=0)` on an `O_TRUNC` open, before the
+        // shorter `write`).
+        {
+            let mut staging = self.staging.lock().unwrap();
+            if let Some(buf) = staging.get_mut(&ino) {
+                buf.resize(size as usize, 0);
+                return Ok(());
+            }
+        }
+        // Not open for write (e.g. a bare `truncate(2)` syscall): seed from the
+        // committed content, resize, and commit immediately so the new length — and its
+        // outbox entry — is durable even when no write follows.
+        let mut content = self.current_content(ino)?;
+        content.resize(size as usize, 0);
+        self.staging.lock().unwrap().insert(ino, content);
+        self.flush(ino)
+    }
+
     fn unlink(&self, parent: u64, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let node_id: Option<String> = conn
@@ -777,6 +830,9 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     fn flush(&self, ino: u64) -> Result<()> {
         (**self).flush(ino)
     }
+    fn truncate(&self, ino: u64, size: u64) -> Result<()> {
+        (**self).truncate(ino, size)
+    }
     fn unlink(&self, parent: u64, name: &str) -> Result<()> {
         (**self).unlink(parent, name)
     }
@@ -865,6 +921,51 @@ mod tests {
         assert_eq!(&out[500..510], &[9u8; 10]);
         assert_eq!(out[0], 1);
         assert_eq!(out[1999], 1);
+    }
+
+    #[test]
+    fn overwrite_with_shorter_leaves_no_stale_tail() {
+        // The §12.4 bug: overwrite a file with fewer bytes than before. The kernel does
+        // this as `setattr(size=0)` (truncate on `O_TRUNC` open) then a short `write`.
+        // Without a truncate path the committed manifest kept the old trailing chunks,
+        // so reads returned a stale tail / wrong size.
+        let p = provider();
+        let f = p.create(ROOT_INO, "x.bin").unwrap();
+        p.write(f.ino, 0, &vec![1u8; 2000]).unwrap();
+        p.flush(f.ino).unwrap();
+        assert_eq!(p.getattr(f.ino).unwrap().size, 2000);
+
+        // Overwrite-with-shorter, exactly as the kernel sequences it.
+        p.truncate(f.ino, 0).unwrap();
+        p.write(f.ino, 0, &vec![9u8; 100]).unwrap();
+        p.flush(f.ino).unwrap();
+
+        assert_eq!(p.getattr(f.ino).unwrap().size, 100, "size reflects only the new content");
+        // A generous read returns *exactly* the new 100 bytes — no stale tail past EOF.
+        let out = p.read(f.ino, 0, 4096).unwrap();
+        assert_eq!(out.len(), 100, "no chunks past the new EOF");
+        assert_eq!(out, vec![9u8; 100]);
+    }
+
+    #[test]
+    fn truncate_grows_with_zero_fill_and_shrinks_committed_file() {
+        let p = provider();
+        let f = p.create(ROOT_INO, "x.bin").unwrap();
+        p.write(f.ino, 0, &vec![7u8; 500]).unwrap();
+        p.flush(f.ino).unwrap();
+
+        // Shrink a *committed* (not-open-for-write) file: commits immediately.
+        p.truncate(f.ino, 200).unwrap();
+        assert_eq!(p.getattr(f.ino).unwrap().size, 200);
+        assert_eq!(p.read(f.ino, 0, 4096).unwrap(), vec![7u8; 200]);
+
+        // Grow back: the gap zero-fills.
+        p.truncate(f.ino, 350).unwrap();
+        assert_eq!(p.getattr(f.ino).unwrap().size, 350);
+        let out = p.read(f.ino, 0, 4096).unwrap();
+        assert_eq!(out.len(), 350);
+        assert_eq!(&out[..200], &vec![7u8; 200][..]);
+        assert_eq!(&out[200..], &vec![0u8; 150][..], "grown region reads back as zeros");
     }
 
     #[test]
@@ -995,5 +1096,184 @@ mod tests {
         assert!(p.lookup(ROOT_INO, "final.bin").is_ok());
         p.unlink(ROOT_INO, "final.bin").unwrap();
         assert!(p.lookup(ROOT_INO, "final.bin").is_err());
+    }
+
+    #[test]
+    fn apply_remote_delete_removes_node_and_subtree() {
+        // Build proj/{x.bin, sub/y.bin} on A, replicate to B.
+        let a = provider();
+        let proj = a.mkdir(ROOT_INO, "proj").unwrap();
+        let x = a.create(proj.ino, "x.bin").unwrap();
+        a.write(x.ino, 0, &vec![1u8; 500]).unwrap();
+        a.flush(x.ino).unwrap();
+        let sub = a.mkdir(proj.ino, "sub").unwrap();
+        let y = a.create(sub.ino, "y.bin").unwrap();
+        a.write(y.ino, 0, &vec![2u8; 500]).unwrap();
+        a.flush(y.ino).unwrap();
+
+        let b = provider();
+        for n in &a.export_tree().unwrap() {
+            b.apply_remote(n).unwrap();
+        }
+        let x_id = a.node_id_for(x.ino).unwrap().unwrap();
+        let proj_id = a.node_id_for(proj.ino).unwrap().unwrap();
+        let sub_id = a.node_id_for(sub.ino).unwrap().unwrap();
+        let y_id = a.node_id_for(y.ino).unwrap().unwrap();
+
+        // Delete a single file: gone on B, siblings untouched.
+        b.apply_remote_delete(&x_id).unwrap();
+        assert!(b.ino_for_node_id(&x_id).unwrap().is_none());
+        assert!(b.ino_for_node_id(&y_id).unwrap().is_some(), "sibling subtree intact");
+
+        // Idempotent: deleting again (and deleting an unknown id) is a no-op.
+        b.apply_remote_delete(&x_id).unwrap();
+        b.apply_remote_delete("never-existed").unwrap();
+
+        // Delete the parent dir: the whole subtree (sub/ and y.bin) goes with it,
+        // even though no per-child delete was applied — no orphaned rows.
+        b.apply_remote_delete(&proj_id).unwrap();
+        assert!(b.ino_for_node_id(&proj_id).unwrap().is_none());
+        assert!(b.ino_for_node_id(&sub_id).unwrap().is_none(), "nested dir swept");
+        assert!(b.ino_for_node_id(&y_id).unwrap().is_none(), "nested file swept");
+        assert!(b.export_tree().unwrap().is_empty(), "tree fully emptied");
+    }
+
+    /// Convergence harness: drive a deterministic pseudo-random stream of create /
+    /// overwrite / delete / move ops on a source provider, replicate each step's outbox
+    /// to a replica via `apply_remote`/`apply_remote_delete` (exactly what the daemon's
+    /// pull does), and assert the two trees stay byte-identical after **every** op. This
+    /// is the mechanical backstop that would have caught the dropped-delete and
+    /// duplicated-move bugs.
+    #[test]
+    fn convergence_under_random_ops() {
+        struct E {
+            ino: u64,
+            parent: u64,
+            name: String,
+            dir: bool,
+        }
+
+        fn snapshot(p: &SqliteProvider) -> Vec<(String, Option<String>, String, String, Option<String>)> {
+            let mut v: Vec<_> = p
+                .export_tree()
+                .unwrap()
+                .into_iter()
+                .map(|n| (n.node_id, n.parent_node_id, n.name, n.kind.as_str().to_string(), n.manifest_id))
+                .collect();
+            v.sort();
+            v
+        }
+
+        fn mirror(src: &SqliteProvider, dst: &SqliteProvider) {
+            for (node_id, op) in src.outbox_list().unwrap() {
+                if op == "delete" {
+                    dst.apply_remote_delete(&node_id).unwrap();
+                } else if let Some(n) = src.sync_node(&node_id).unwrap() {
+                    dst.apply_remote(&n).unwrap();
+                }
+                src.outbox_clear(&node_id).unwrap();
+            }
+        }
+
+        let src = provider();
+        let dst = provider();
+        let mut entries: Vec<E> = Vec::new();
+        let mut ctr = 0u64;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+
+        for iter in 0..250 {
+            // Candidate parent dirs = root + every live directory.
+            let dirs: Vec<u64> = std::iter::once(ROOT_INO)
+                .chain(entries.iter().filter(|e| e.dir).map(|e| e.ino))
+                .collect();
+            let files: Vec<usize> = entries.iter().enumerate().filter(|(_, e)| !e.dir).map(|(i, _)| i).collect();
+
+            match next() % 6 {
+                0 => {
+                    // mkdir
+                    let parent = dirs[next() % dirs.len()];
+                    ctr += 1;
+                    let name = format!("d{ctr}");
+                    let a = src.mkdir(parent, &name).unwrap();
+                    entries.push(E { ino: a.ino, parent, name, dir: true });
+                }
+                1 => {
+                    // create + write + flush (a committed file)
+                    let parent = dirs[next() % dirs.len()];
+                    ctr += 1;
+                    let name = format!("f{ctr}");
+                    let a = src.create(parent, &name).unwrap();
+                    let len = 64 + next() % 600;
+                    let data: Vec<u8> = (0..len).map(|i| (i ^ ctr as usize) as u8).collect();
+                    src.write(a.ino, 0, &data).unwrap();
+                    src.flush(a.ino).unwrap();
+                    entries.push(E { ino: a.ino, parent, name, dir: false });
+                }
+                2 => {
+                    // overwrite an existing file with a *new, often shorter* body, the
+                    // way the kernel does it on `O_TRUNC`: truncate to 0, then write. The
+                    // small `len` ceiling makes shrink the common case, exercising the
+                    // stale-tail path. We assert the source committed exactly the new
+                    // bytes (no tail), and the snapshot's content-addressed `manifest_id`
+                    // proves the replica converges on that same content.
+                    if !files.is_empty() {
+                        let e = &entries[files[next() % files.len()]];
+                        let len = 16 + next() % 200;
+                        let data: Vec<u8> = (0..len).map(|i| (i.wrapping_add(iter)) as u8).collect();
+                        src.truncate(e.ino, 0).unwrap();
+                        src.write(e.ino, 0, &data).unwrap();
+                        src.flush(e.ino).unwrap();
+                        assert_eq!(
+                            src.read(e.ino, 0, 4096).unwrap(),
+                            data,
+                            "overwrite-with-shorter left a stale tail at iter {iter}"
+                        );
+                    }
+                }
+                3 => {
+                    // delete a file
+                    if !files.is_empty() {
+                        let e = entries.remove(files[next() % files.len()]);
+                        src.unlink(e.parent, &e.name).unwrap();
+                    }
+                }
+                4 => {
+                    // rmdir an empty directory (no tracked children)
+                    let empty: Vec<usize> = entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.dir && !entries.iter().any(|c| c.parent == e.ino))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !empty.is_empty() {
+                        let e = entries.remove(empty[next() % empty.len()]);
+                        src.rmdir(e.parent, &e.name).unwrap();
+                    }
+                }
+                _ => {
+                    // move a file to a (possibly different) directory under a fresh name
+                    if !files.is_empty() {
+                        let i = files[next() % files.len()];
+                        let newparent = dirs[next() % dirs.len()];
+                        ctr += 1;
+                        let newname = format!("f{ctr}");
+                        let (op, on) = (entries[i].parent, entries[i].name.clone());
+                        src.rename(op, &on, newparent, &newname).unwrap();
+                        entries[i].parent = newparent;
+                        entries[i].name = newname;
+                    }
+                }
+            }
+
+            mirror(&src, &dst);
+            assert_eq!(snapshot(&src), snapshot(&dst), "replicas diverged after iter {iter}");
+        }
+
+        // Sanity: the harness actually built and tore down a non-trivial tree.
+        assert!(!entries.is_empty(), "expected a surviving tree to compare");
     }
 }
