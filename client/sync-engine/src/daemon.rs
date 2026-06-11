@@ -19,12 +19,18 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fs_fuse::FuseAdapter;
 use fs_provider::{LocalChunkStore, SqliteProvider};
-use fuser::MountOption;
 use sync_client::ServerClient;
 
-use crate::{EngineHydrator, PresignedIO, SyncEngine};
+use crate::{PresignedIO, SyncEngine};
+
+// FUSE bits — Linux/Windows only (macOS mounts via WebDAV; see `WebdavMount`).
+#[cfg(not(target_os = "macos"))]
+use crate::EngineHydrator;
+#[cfg(not(target_os = "macos"))]
+use fs_fuse::FuseAdapter;
+#[cfg(not(target_os = "macos"))]
+use fuser::MountOption;
 
 /// Default poll fallback interval (the nudge is the fast path; this bounds staleness if
 /// the WebSocket is down).
@@ -69,8 +75,9 @@ impl DaemonConfig {
     }
 }
 
-/// A running mount + its two background loops. Drop (or [`stop`](Self::stop)) unmounts
-/// and tears the loops down.
+/// A running FUSE mount + its two background loops (Linux/Windows). Drop (or
+/// [`stop`](Self::stop)) unmounts and tears the loops down. macOS uses [`WebdavMount`].
+#[cfg(not(target_os = "macos"))]
 pub struct Daemon {
     stop: Arc<AtomicBool>,
     session: Option<fuser::BackgroundSession>,
@@ -78,6 +85,7 @@ pub struct Daemon {
     mountpoint: PathBuf,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Daemon {
     /// Mount and start syncing. Returns once the mount is live (non-blocking). The nudge
     /// thread is detached (a dropped socket just falls back to the poll; it's reaped on
@@ -154,6 +162,7 @@ impl Daemon {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();

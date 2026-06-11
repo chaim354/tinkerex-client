@@ -7,11 +7,15 @@ license = "Apache-2.0"
 
 [dependencies]
 fs-provider = { path = "../fs-provider" }
-fs-fuse = { path = "../fs-fuse" }
 fs-webdav = { path = "../fs-webdav" }
 sync-client = { path = "../sync-client" }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# The FUSE mount (`Daemon`) is used on Linux/Windows; macOS mounts via WebDAV, so
+# `fuser` (and the FUSE-T it needs to build) is excluded there entirely.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+fs-fuse = { path = "../fs-fuse" }
 fuser = "0.14"
 libc = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread"] }
