@@ -22,6 +22,16 @@ The backend lives in `src-tauri/src/lib.rs` (commands `sync_start` / `sync_stop`
 - **A FUSE driver:**
   - **macOS:** **FUSE-T** — https://www.fuse-t.org (no kext; no macFUSE).
   - **Linux:** libfuse (`apt install libfuse-dev`, usually present).
+- **Linux only — Tauri's system libraries + libfuse** (Debian/Ubuntu names; see
+  https://tauri.app/start/prerequisites for other distros):
+  ```sh
+  sudo apt update && sudo apt install -y \
+    libwebkit2gtk-4.1-dev build-essential curl wget file \
+    libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+    libfuse-dev pkg-config fuse
+  ```
+  No pkg-config alias or rpath dance on Linux — libfuse ships the standard `fuse.pc`,
+  and `fuser` links it directly. (Skip the macOS FUSE-T block below.)
 - **macOS only — the FUSE-T pkg-config alias.** `fuser` probes pkg-config for the
   macFUSE names; FUSE-T ships different ones, so alias them once per shell
   (verbatim from `client/fs-fuse/BUILD.md`):
