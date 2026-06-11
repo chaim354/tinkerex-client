@@ -1,28 +1,76 @@
 <!doctype html>
 <html>
-  <head><meta charset="UTF-8" /><title>Maker — Mount</title></head>
-  <body style="font-family: sans-serif; padding: 2rem">
-    <h1>Maker — JuiceFS Mount</h1>
-    <p>Status: <strong id="state">…</strong> <span id="detail"></span></p>
-    <button id="mount">Mount</button>
-    <button id="unmount">Unmount</button>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Maker — Sync</title>
+    <style>
+      body { font-family: system-ui, sans-serif; padding: 2rem; max-width: 36rem; }
+      h1 { margin-top: 0; }
+      label { display: block; margin: 0.75rem 0 0.2rem; font-weight: 600; font-size: 0.9rem; }
+      input { width: 100%; padding: 0.4rem; box-sizing: border-box; font-size: 0.95rem; }
+      .row { margin-top: 1.25rem; display: flex; gap: 0.5rem; }
+      button { padding: 0.5rem 1rem; font-size: 0.95rem; cursor: pointer; }
+      #status { margin-top: 1.25rem; padding: 0.6rem 0.8rem; border-radius: 6px;
+                background: #f2f2f2; font-family: ui-monospace, monospace; font-size: 0.9rem; }
+      .err { color: #b00020; }
+    </style>
+  </head>
+  <body>
+    <h1>Maker — Sync</h1>
+    <p>Register this device, mount the library, and start syncing.</p>
+
+    <label for="server">Sync server URL</label>
+    <input id="server" value="http://localhost:3001" />
+
+    <label for="email">Account email (same email = same library)</label>
+    <input id="email" value="maker@example.com" />
+
+    <label for="mount">Mount point (a directory; created if missing)</label>
+    <input id="mount" value="/tmp/MakerDrive" />
+
+    <div class="row">
+      <button id="mountBtn">Mount &amp; sync</button>
+      <button id="unmountBtn">Unmount</button>
+      <button id="refreshBtn">Refresh status</button>
+    </div>
+
+    <div id="status">status: …</div>
+
     <script type="module">
       const { invoke } = window.__TAURI__.core;
-      const stateEl = document.getElementById("state");
-      const detailEl = document.getElementById("detail");
-      const render = (s) => {
-        stateEl.textContent = `${s.state} (${s.mount_point})`;
-        detailEl.textContent = s.detail ? `— ${s.detail}` : "";
+      const statusEl = document.getElementById("status");
+      const val = (id) => document.getElementById(id).value.trim();
+      const show = (text, isErr = false) => {
+        statusEl.textContent = `status: ${text}`;
+        statusEl.classList.toggle("err", isErr);
       };
-      const refresh = async () => render(await invoke("status"));
-      document.getElementById("mount").onclick = async () => {
-        try { render(await invoke("mount")); } catch (e) { detailEl.textContent = `— ${e}`; }
+
+      const refresh = async () => {
+        try { show(await invoke("sync_status")); }
+        catch (e) { show(String(e), true); }
       };
-      document.getElementById("unmount").onclick = async () => {
-        try { render(await invoke("unmount")); } catch (e) { detailEl.textContent = `— ${e}`; }
+
+      document.getElementById("mountBtn").onclick = async () => {
+        show("mounting…");
+        try {
+          const msg = await invoke("sync_start", {
+            serverUrl: val("server"),
+            email: val("email"),
+            mountpoint: val("mount"),
+          });
+          show(msg);
+        } catch (e) { show(String(e), true); }
       };
+
+      document.getElementById("unmountBtn").onclick = async () => {
+        try { show(await invoke("sync_stop")); }
+        catch (e) { show(String(e), true); }
+      };
+
+      document.getElementById("refreshBtn").onclick = refresh;
+
       refresh();
-      setInterval(refresh, 2000);
+      setInterval(refresh, 3000);
     </script>
   </body>
 </html>

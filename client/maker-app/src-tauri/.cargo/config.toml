@@ -1,0 +1,5 @@
+# The app links the sync daemon → fs-fuse → FUSE-T (libfuse-t.dylib, @rpath install
+# name) on macOS. Bake the rpath so the bundled binary loads it at runtime. macOS-only;
+# on Windows the sync-engine dep isn't compiled in. (Mirrors fs-fuse/.cargo/config.toml.)
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib"]

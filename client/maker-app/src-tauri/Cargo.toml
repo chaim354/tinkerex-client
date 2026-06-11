@@ -22,4 +22,11 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-maker-app-core = { path = "../../maker-app-core" }
+
+# The native sync daemon (mount + sync loop + nudge). fs-fuse builds on `fuser`, which
+# is Unix-only, so the mount backend is gated to macOS/Linux. On Windows the app still
+# builds and launches — the mount commands return a "not yet supported" error until the
+# winfsp-rs adapter (CLAUDE.md §12 step 4) lands.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+sync-engine = { path = "../../sync-engine" }
+sync-client = { path = "../../sync-client" }

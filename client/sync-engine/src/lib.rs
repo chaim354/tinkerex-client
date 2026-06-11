@@ -15,6 +15,9 @@ use std::sync::Arc;
 use fs_provider::{ChunkLoc, Kind, SqliteProvider, SyncNode};
 use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
 
+mod daemon;
+pub use daemon::{Daemon, DaemonConfig, DEFAULT_POLL};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("fs: {0}")]
