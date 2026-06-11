@@ -1,201 +1,128 @@
-# Real-world Windows test: mount a drive from the Tauri app
+# Run the Maker client (Tauri app) and mount a synced drive
 
-Goal: run a Tauri app on Windows, click **Mount**, and get a working `Z:` drive
-backed by JuiceFS that Explorer and apps can read/write.
+The app registers a device, mounts the local-first filesystem, and runs the sync
+daemon (push on save, pull on a `{head_seq}` nudge / poll, hydrate on read) — all
+in one process. Mounting uses **FUSE** (`fuser`): **macOS and Linux today**.
+**Windows mounting is not wired yet** (it needs the winfsp-rs adapter, CLAUDE.md
+§12 step 4) — the app still builds and launches on Windows, but the mount button
+returns a clear "not supported yet" message. See [§Windows](#windows) below.
 
-This uses `juicefs mount` (via WinFsp) supervised by the app — the fastest path
-to a real drive. The CfAPI provider (no WinFsp) comes later; this proves the
-stack first. WinFsp is GPLv3 but you install it yourself for this test, so
-there's nothing to redistribute and no licensing issue.
-
-The mount logic is the verified `maker-app-core` crate in this repo. Everything
-below runs **on the Windows machine**.
-
----
-
-## 1. Install the prerequisites (Windows)
-
-1. **WinFsp** — https://winfsp.dev → run the installer. This is the FUSE driver
-   `juicefs` loads to expose a drive letter.
-2. **JuiceFS** — download `juicefs.exe` from
-   https://github.com/juicedata/juicefs/releases, put it somewhere on `PATH`
-   (or note its full path).
-3. **Rust** — https://rustup.rs (MSVC toolchain).
-4. **Tauri CLI**:
-   ```powershell
-   cargo install tauri-cli --version "^2.0" --locked
-   cargo install create-tauri-app --locked
-   ```
-
-> Visual Studio C++ Build Tools + WebView2 are needed by Tauri; the rustup and
-> Tauri installers prompt for them if missing.
+The backend lives in `src-tauri/src/lib.rs` (commands `sync_start` / `sync_stop` /
+`sync_status`), driving `sync_engine::Daemon`.
 
 ---
 
-## 2. Create a JuiceFS volume (single-box quick test)
+## macOS / Linux — the real test
 
-Simplest possible backing for a first test: **SQLite metadata + local-folder
-storage** — no servers at all.
+### 1. Prerequisites
 
-```powershell
-mkdir C:\juicefs\meta, C:\juicefs\data
-juicefs format --storage file --bucket C:/juicefs/data sqlite3://C:/juicefs/meta/maker.db maker
+- **Rust** — https://rustup.rs
+- **Tauri CLI** — `cargo install tauri-cli --version "^2.0" --locked` (or use a
+  global `cargo-tauri` you already have).
+- **A FUSE driver:**
+  - **macOS:** **FUSE-T** — https://www.fuse-t.org (no kext; no macFUSE).
+  - **Linux:** libfuse (`apt install libfuse-dev`, usually present).
+- **macOS only — the FUSE-T pkg-config alias.** `fuser` probes pkg-config for the
+  macFUSE names; FUSE-T ships different ones, so alias them once per shell
+  (verbatim from `client/fs-fuse/BUILD.md`):
+  ```sh
+  mkdir -p /tmp/fuse-pc
+  for n in osxfuse fuse; do
+    cat > /tmp/fuse-pc/$n.pc <<EOF
+  prefix=/usr/local
+  libdir=\${prefix}/lib
+  includedir=\${prefix}/include/fuse
+  Name: $n
+  Description: FUSE-T compat alias
+  Version: 2.9.7
+  Libs: -L\${libdir} -Wl,-rpath,\${libdir} -lfuse-t
+  Cflags: -I\${includedir}
+  EOF
+  done
+  export PKG_CONFIG_PATH=/tmp/fuse-pc:/usr/local/lib/pkgconfig
+  ```
+  (The FUSE-T runtime rpath is baked in by `src-tauri/.cargo/config.toml`.)
+
+### 2. Start the sync server (from the repo root, separate terminal)
+
+```sh
+STORAGE_BACKEND=memory bin/rails server -p 3001
 ```
+`memory` keeps chunk bytes in-process — fine for a single-box test. For real
+object storage, boot with `STORAGE_BACKEND=s3 …` instead (see CLAUDE.md §13).
 
-That `sqlite3://C:/juicefs/meta/maker.db` string is your **meta URL** below.
+### 3. Launch the app
 
-> Going multi-device later: swap SQLite → Postgres (`postgres://…`) or Redis,
-> and the local folder → S3/R2/B2 (`--storage s3 --bucket https://…`). The app
-> doesn't change — only the meta URL and the `format` storage flags.
-
-Sanity-check the volume mounts at all, straight from the CLI:
-
-```powershell
-juicefs mount sqlite3://C:/juicefs/meta/maker.db Z:
-# open Explorer → Z: should exist. Ctrl+C here to unmount, then continue.
-```
-
-If `Z:` appears, the hard part works and the app will too.
-
----
-
-## 3. Scaffold the Tauri app
-
-From `client/` in this repo:
-
-```powershell
-cargo create-tauri-app
-#  Project name:        maker-app
-#  Frontend language:   TypeScript / JavaScript  ->  pick "JavaScript"
-#  UI template:         Vanilla
-#  package manager:     (none needed for Vanilla)
-```
-
-You now have `client/maker-app/` next to `client/maker-app-core/`.
-
----
-
-## 4. Wire in the controller
-
-**a. Add the dependency** — `client/maker-app/src-tauri/Cargo.toml`:
-
-```toml
-[dependencies]
-maker-app-core = { path = "../../maker-app-core" }
-```
-
-**b. Replace** `client/maker-app/src-tauri/src/lib.rs` with:
-
-```rust
-use std::sync::Mutex;
-
-use maker_app_core::{MountConfig, MountController, MountStatus};
-use tauri::State;
-
-struct AppState(Mutex<MountController>);
-
-#[tauri::command]
-fn mount(state: State<AppState>) -> Result<MountStatus, String> {
-    let mut c = state.0.lock().unwrap();
-    c.mount().map_err(|e| e.to_string())?;
-    Ok(c.status())
-}
-
-#[tauri::command]
-fn unmount(state: State<AppState>) -> Result<MountStatus, String> {
-    let mut c = state.0.lock().unwrap();
-    c.unmount().map_err(|e| e.to_string())?;
-    Ok(c.status())
-}
-
-#[tauri::command]
-fn status(state: State<AppState>) -> MountStatus {
-    state.0.lock().unwrap().status()
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    let controller = MountController::new(MountConfig::from_env());
-    tauri::Builder::default()
-        .manage(AppState(Mutex::new(controller)))
-        .invoke_handler(tauri::generate_handler![mount, unmount, status])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
-```
-
-**c. Enable the global API** so the plain-HTML frontend can call commands —
-in `client/maker-app/src-tauri/tauri.conf.json`, set:
-
-```json
-"app": {
-  "withGlobalTauri": true
-}
-```
-
-**d. Replace** `client/maker-app/src/index.html` with:
-
-```html
-<!doctype html>
-<html>
-  <head><meta charset="UTF-8" /><title>Maker — Mount</title></head>
-  <body style="font-family: sans-serif; padding: 2rem">
-    <h1>Maker — JuiceFS Mount</h1>
-    <p>Status: <strong id="state">…</strong> <span id="detail"></span></p>
-    <button id="mount">Mount</button>
-    <button id="unmount">Unmount</button>
-    <script type="module">
-      const { invoke } = window.__TAURI__.core;
-      const stateEl = document.getElementById("state");
-      const detailEl = document.getElementById("detail");
-      const render = (s) => {
-        stateEl.textContent = `${s.state} (${s.mount_point})`;
-        detailEl.textContent = s.detail ? `— ${s.detail}` : "";
-      };
-      const refresh = async () => render(await invoke("status"));
-      document.getElementById("mount").onclick = async () => {
-        try { render(await invoke("mount")); } catch (e) { detailEl.textContent = `— ${e}`; }
-      };
-      document.getElementById("unmount").onclick = async () => {
-        try { render(await invoke("unmount")); } catch (e) { detailEl.textContent = `— ${e}`; }
-      };
-      refresh();
-      setInterval(refresh, 2000);
-    </script>
-  </body>
-</html>
-```
-
----
-
-## 5. Run it
-
-Point the controller at your volume (PowerShell, same session you launch from):
-
-```powershell
-$env:JUICEFS_META = "sqlite3://C:/juicefs/meta/maker.db"
-$env:JUICEFS_MOUNTPOINT = "Z:"
-# $env:JUICEFS_BIN = "C:\tools\juicefs.exe"   # only if not on PATH
-# $env:JUICEFS_ARGS = "--cache-size 10240"    # optional tuning
-
-cd client\maker-app
+```sh
+cd client/maker-app
+# macOS: keep PKG_CONFIG_PATH exported from step 1 in this shell
 cargo tauri dev
 ```
+First build pulls Tauri + the sync engine (a minute or two); then a window opens.
+There's no `npm install` — the frontend is plain HTML served from `src/`.
 
-The window opens → click **Mount** → status flips to `mounted (Z:)` and **`Z:`
-appears in Explorer**. Drop a file in, open it, edit it. Click **Unmount** to
-tear it down cleanly.
+### 4. Mount and test
+
+In the window:
+1. **Sync server URL** — `http://localhost:3001` (default)
+2. **Account email** — any email; the *same* email is the *same* library across
+   devices.
+3. **Mount point** — a directory, e.g. `/tmp/MakerDrive` (created if missing).
+4. Click **Mount & sync**. Status flips to `mounted at /tmp/MakerDrive`.
+
+Then, in Finder / a terminal:
+```sh
+echo "hello maker" > /tmp/MakerDrive/notes.txt      # save → pushed to the server
+ls /tmp/MakerDrive
+cat /tmp/MakerDrive/notes.txt                        # read → hydrates from storage
+```
+Click **Unmount** to tear it down cleanly.
+
+> Local state (the SQLite tree + chunk cache) lives under
+> `$TMPDIR/maker-app/` — delete it to start fresh.
+
+### Two-device demo (one box)
+
+Run a second instance pointed at a *different* mount point but the *same* email,
+and watch a file made in one appear in the other (nudge-driven, ~tens of ms):
+```sh
+# second terminal (server + PKG_CONFIG_PATH already set)
+cd client/maker-app && cargo tauri dev
+# mount this one at /tmp/MakerDrive2, same email → same library
+```
+(For a pure-CLI version of the same thing without the GUI, use the `maker-syncd`
+binary — see CLAUDE.md §13.)
+
+### Troubleshooting
+
+- **`could not find system library 'fuse'` at build** — the pkg-config alias
+  isn't exported in this shell (step 1).
+- **`Library not loaded: @rpath/libfuse-t.dylib`** — FUSE-T isn't installed, or
+  you're running a binary built before `src-tauri/.cargo/config.toml` existed
+  (`cargo clean -p maker-app` and rebuild).
+- **Mount button errors / nothing appears** — FUSE-T needs an interactive GUI
+  session; it won't hold a mount from a headless/ssh context. Run the app from a
+  normal desktop session. Check the `cargo tauri dev` console for daemon logs.
+- **`register failed`** — the server isn't up on the URL in the form (step 2).
 
 ---
 
-## Troubleshooting
+## Windows
 
-- **"juicefs exited immediately: …"** — the app caught the failure; the message
-  is juicefs's own stderr. Common causes: WinFsp not installed, `Z:` already in
-  use (set `JUICEFS_MOUNTPOINT` to a free letter), or a bad meta URL.
-- **Drive doesn't appear but status says mounted** — check the `cargo tauri dev`
-  console for `[juicefs] …` log lines.
-- **Permission error calling a command** — confirm `withGlobalTauri: true` and
-  that all three commands are in `generate_handler!`.
-- **Multi-device freshness** — out of scope for this single-box test; that's the
-  change-notification channel, validated separately.
+The mount path is **not available yet**. `fs-fuse` is built on `fuser`
+(Linux/macOS only); the Windows mount adapter (`winfsp-rs`, CLAUDE.md §12 step 4)
+isn't written. The app is gated so it still **builds and launches** on Windows —
+`cargo tauri dev` works — but **Mount & sync** returns:
+
+> Mounting isn't supported on Windows yet — it needs the winfsp-rs adapter.
+
+You can still exercise the **sync engine** itself on Windows (push/pull/hydrate,
+no mount) via the cross-platform example flows against the server:
+```powershell
+cd client\sync-engine
+$env:SERVER_URL = "http://localhost:3001"
+cargo run --example daemon_loop          # outbox → push → pull → hydrate
+cargo run --example presigned_roundtrip  # real bytes through S3-compatible storage
+```
+When the winfsp-rs adapter lands, the same `Daemon` + Tauri commands light up on
+Windows with no frontend changes.
