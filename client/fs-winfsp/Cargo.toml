@@ -12,7 +12,10 @@ fs-provider = { path = "../fs-provider" }
 # an empty lib (everything real is behind `#[cfg(windows)]`), so it never breaks the
 # macOS/Linux builds.
 [target.'cfg(windows)'.dependencies]
-winfsp = "0.13"
+# `system` enables loading winfsp-x64.dll from the installed location (registry
+# InstallDir) at init — without it, winfsp_init can't find the DLL (WIN32 1285,
+# ERROR_DELAY_LOAD_FAILED).
+winfsp = { version = "0.13", features = ["system"] }
 widestring = "1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
