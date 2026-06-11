@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use fs_provider::{ChunkLoc, Kind, SqliteProvider, SyncNode};
 use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
@@ -91,36 +92,38 @@ pub struct SyncEngine;
 
 impl SyncEngine {
     /// Push the whole local tree to the server, uploading missing chunks via `io`.
+    /// (Idempotent; used by the examples/tests. The running daemon uses
+    /// [`push_outbox`](Self::push_outbox) for incremental pushes.)
     pub fn push(provider: &SqliteProvider, client: &ServerClient, io: &dyn ChunkIO) -> Result<()> {
         for node in provider.export_tree()? {
-            match node.kind {
-                Kind::Dir => {
-                    client.mkdir(&node.node_id, node.parent_node_id.as_deref(), &node.name)?;
+            push_node(provider, client, io, &node)?;
+        }
+        Ok(())
+    }
+
+    /// Incremental push: drain the local outbox (dirty `node_id`s queued by FUSE
+    /// writes), sending only what changed. Order is parents-first (the outbox preserves
+    /// insertion order). The SQLite lock is **never held across WAN I/O** — each
+    /// provider call locks and releases on its own — so the metadata path stays local.
+    pub fn push_outbox(provider: &SqliteProvider, client: &ServerClient, io: &dyn ChunkIO) -> Result<()> {
+        for (node_id, op) in provider.outbox_list()? {
+            if op == "delete" {
+                match client.delete_node(&node_id) {
+                    Ok(_) => {}
+                    // The node may never have reached the server (created then deleted
+                    // before this drained). Treat "unknown" as already-gone.
+                    Err(sync_client::Error::Server { status: 404, .. }) => {}
+                    Err(e) => return Err(e.into()),
                 }
-                Kind::File => {
-                    let manifest: Vec<ChunkRef> = node
-                        .chunks
-                        .iter()
-                        .map(|c| ChunkRef { hash: c.hash.clone(), offset: c.offset, length: c.length })
-                        .collect();
-                    let size = node.chunks.iter().map(|c| c.length).sum();
-                    let commit_id = uuid::Uuid::new_v4().to_string();
-                    let begin = client.commit_begin(&CommitBegin {
-                        commit_id: commit_id.clone(),
-                        node_id: node.node_id.clone(),
-                        parent_node_id: node.parent_node_id.clone(),
-                        name: node.name.clone(),
-                        base_version_id: None,
-                        size,
-                        manifest,
-                    })?;
-                    for hash in &begin.missing {
-                        let bytes = provider.chunk_get(hash)?;
-                        io.put(hash, &begin.put_urls, bytes)?;
-                    }
-                    client.commit_finalize(&commit_id)?;
+            } else {
+                // 'upsert'. If the node vanished between enqueue and now (a delete races
+                // ahead), there's nothing to send — just drop the stale entry.
+                match provider.sync_node(&node_id)? {
+                    Some(node) => push_node(provider, client, io, &node)?,
+                    None => {}
                 }
             }
+            provider.outbox_clear(&node_id)?;
         }
         Ok(())
     }
@@ -175,7 +178,8 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// One loop iteration: push local changes, then pull remote ones.
+    /// One whole-tree loop iteration: push the full tree, then pull remote changes.
+    /// (Retained for the examples; the daemon uses [`sync_tick`](Self::sync_tick).)
     pub fn sync_once(
         provider: &SqliteProvider,
         client: &ServerClient,
@@ -184,6 +188,90 @@ impl SyncEngine {
     ) -> Result<i64> {
         Self::push(provider, client, io)?;
         Self::pull_changes(provider, client, cursor)
+    }
+
+    /// The daemon's loop body: drain the outbox (incremental push), then pull the
+    /// changelog delta since `cursor`. Returns the new cursor to persist. This is the
+    /// reusable tick the background sync thread calls on each interval.
+    pub fn sync_tick(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        cursor: i64,
+    ) -> Result<i64> {
+        Self::push_outbox(provider, client, io)?;
+        Self::pull_changes(provider, client, cursor)
+    }
+}
+
+/// Push a single node (dir → `mkdir`; file → commit_begin → upload missing chunks →
+/// finalize). Shared by whole-tree [`push`](SyncEngine::push) and incremental
+/// [`push_outbox`](SyncEngine::push_outbox).
+fn push_node(
+    provider: &SqliteProvider,
+    client: &ServerClient,
+    io: &dyn ChunkIO,
+    node: &SyncNode,
+) -> Result<()> {
+    match node.kind {
+        Kind::Dir => {
+            client.mkdir(&node.node_id, node.parent_node_id.as_deref(), &node.name)?;
+        }
+        Kind::File => {
+            let manifest: Vec<ChunkRef> = node
+                .chunks
+                .iter()
+                .map(|c| ChunkRef { hash: c.hash.clone(), offset: c.offset, length: c.length })
+                .collect();
+            let size = node.chunks.iter().map(|c| c.length).sum();
+            let commit_id = uuid::Uuid::new_v4().to_string();
+            let begin = client.commit_begin(&CommitBegin {
+                commit_id: commit_id.clone(),
+                node_id: node.node_id.clone(),
+                parent_node_id: node.parent_node_id.clone(),
+                name: node.name.clone(),
+                base_version_id: None,
+                size,
+                manifest,
+            })?;
+            for hash in &begin.missing {
+                let bytes = provider.chunk_get(hash)?;
+                io.put(hash, &begin.put_urls, bytes)?;
+            }
+            client.commit_finalize(&commit_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Bridges the FUSE read path to the sync engine: on a chunk-cache miss the adapter
+/// calls [`Hydrate::hydrate`], which fetches the file's chunks from the cloud via
+/// presigned GET. Holds `Arc` clones shared with the mount + sync threads.
+pub struct EngineHydrator {
+    provider: Arc<SqliteProvider>,
+    client: ServerClient,
+}
+
+impl EngineHydrator {
+    pub fn new(provider: Arc<SqliteProvider>, client: ServerClient) -> Self {
+        Self { provider, client }
+    }
+}
+
+impl fs_fuse::Hydrate for EngineHydrator {
+    fn hydrate(&self, ino: u64) {
+        let node_id = match self.provider.node_id_for(ino) {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("hydrate: node_id lookup for ino {ino} failed: {e}");
+                return;
+            }
+        };
+        let io = PresignedIO::new(&self.client);
+        if let Err(e) = SyncEngine::hydrate(&self.provider, &self.client, &io, &node_id) {
+            eprintln!("hydrate: ino {ino} (node {node_id}) failed: {e}");
+        }
     }
 }
 

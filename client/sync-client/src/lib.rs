@@ -152,6 +152,9 @@ pub struct DownloadResponse {
 
 // ---- the API client -------------------------------------------------------
 
+/// Cheap to clone — `reqwest::blocking::Client` shares its connection pool via an
+/// internal `Arc`, so the sync daemon hands a clone to each of its threads.
+#[derive(Clone)]
 pub struct ServerClient {
     base: String,
     token: Option<String>,

@@ -7,6 +7,9 @@ license = "Apache-2.0"
 
 [dependencies]
 fs-provider = { path = "../fs-provider" }
+fs-fuse = { path = "../fs-fuse" }
 sync-client = { path = "../sync-client" }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+fuser = "0.14"
+libc = "0.2"

@@ -180,6 +180,19 @@ impl SqliteProvider {
                 offset      INTEGER NOT NULL,
                 length      INTEGER NOT NULL,
                 PRIMARY KEY (manifest_id, seq)
+            );
+            -- Sync outbox: node_ids dirtied by local writes, drained by the sync
+            -- engine's push. Insertion-order `id` preserves parent-before-child order
+            -- (a child can't be created before its parent exists in the tree).
+            CREATE TABLE IF NOT EXISTS outbox (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL UNIQUE,
+                op      TEXT NOT NULL        -- 'upsert' | 'delete'
+            );
+            -- Misc sync state (the changelog cursor lives here under key 'cursor').
+            CREATE TABLE IF NOT EXISTS sync_state (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
             );",
         )?;
         // Ensure the root directory (ino 1) exists.
@@ -278,6 +291,10 @@ impl SqliteProvider {
             Err(e) => return Err(e.into()),
         }
         let ino = conn.last_insert_rowid() as u64;
+        // Dirs are sync-ready on creation; files wait until `flush` has a manifest.
+        if kind == Kind::Dir {
+            Self::enqueue(&conn, &node_id, "upsert")?;
+        }
         Ok(Attr {
             ino,
             kind,
@@ -438,6 +455,93 @@ impl SqliteProvider {
     pub fn has_chunk(&self, hash: &str) -> bool {
         self.store.has(hash)
     }
+
+    // ---- sync outbox + cursor (the daemon's push queue & changelog position) ----
+
+    /// Enqueue `node_id` as dirty. Called under the caller's held conn lock/tx so the
+    /// outbox entry is atomic with the tree change that dirtied it. Re-enqueueing a
+    /// node coalesces to its latest `op` (keeps the original insertion order).
+    fn enqueue(conn: &Connection, node_id: &str, op: &str) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO outbox(node_id, op) VALUES (?1, ?2)
+             ON CONFLICT(node_id) DO UPDATE SET op = excluded.op",
+            params![node_id, op],
+        )?;
+        Ok(())
+    }
+
+    /// The pending outbox entries `(node_id, op)` in insertion order (parents first).
+    pub fn outbox_list(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT node_id, op FROM outbox ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Remove one outbox entry once it has been pushed to the server.
+    pub fn outbox_clear(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM outbox WHERE node_id = ?1", params![node_id])?;
+        Ok(())
+    }
+
+    /// The local changelog cursor (highest applied `seq`); 0 if never synced.
+    pub fn cursor(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT value FROM sync_state WHERE key = 'cursor'", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub fn set_cursor(&self, cursor: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_state(key, value) VALUES ('cursor', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![cursor],
+        )?;
+        Ok(())
+    }
+
+    /// A single node as a sync-ready descriptor (incremental push). `None` if the inode
+    /// no longer exists (e.g. created then deleted before a push drained the outbox).
+    pub fn sync_node(&self, node_id: &str) -> Result<Option<SyncNode>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT n.name, n.kind, n.manifest_id,
+                        CASE WHEN n.parent_ino = ?2 THEN NULL ELSE p.node_id END
+                 FROM nodes n LEFT JOIN nodes p ON p.ino = n.parent_ino
+                 WHERE n.node_id = ?1",
+                params![node_id, ROOT_INO as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (name, kind_s, manifest_id, parent_node_id) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let chunks = match &manifest_id {
+            Some(m) => Self::manifest_rows(&conn, m)?,
+            None => Vec::new(),
+        };
+        Ok(Some(SyncNode {
+            node_id: node_id.to_string(),
+            parent_node_id,
+            name,
+            kind: Kind::from_str(&kind_s),
+            manifest_id,
+            chunks,
+        }))
+    }
 }
 
 impl Provider for SqliteProvider {
@@ -559,18 +663,38 @@ impl Provider for SqliteProvider {
             "UPDATE nodes SET size = ?1, manifest_id = ?2 WHERE ino = ?3",
             params![buf.len() as i64, manifest_id, ino as i64],
         )?;
+        // Mark the file dirty for sync, atomically with its new manifest.
+        if let Some(node_id) =
+            tx.query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten()
+        {
+            Self::enqueue(&tx, &node_id, "upsert")?;
+        }
         tx.commit()?;
         Ok(())
     }
 
     fn unlink(&self, parent: u64, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let node_id: Option<String> = conn
+            .query_row(
+                "SELECT node_id FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND kind = 'file'",
+                params![parent as i64, name],
+                |r| r.get(0),
+            )
+            .optional()?;
         let n = conn.execute(
             "DELETE FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND kind = 'file'",
             params![parent as i64, name],
         )?;
         if n == 0 {
             return Err(FsError::NotFound);
+        }
+        if let Some(id) = node_id {
+            Self::enqueue(&conn, &id, "delete")?;
         }
         Ok(())
     }
@@ -592,12 +716,25 @@ impl Provider for SqliteProvider {
         if count > 0 {
             return Err(FsError::NotEmpty);
         }
+        let node_id: Option<String> = conn
+            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino], |r| r.get(0))
+            .optional()?;
         conn.execute("DELETE FROM nodes WHERE ino = ?1", params![ino])?;
+        if let Some(id) = node_id {
+            Self::enqueue(&conn, &id, "delete")?;
+        }
         Ok(())
     }
 
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let node_id: Option<String> = conn
+            .query_row(
+                "SELECT node_id FROM nodes WHERE parent_ino = ?1 AND name = ?2",
+                params![parent as i64, name],
+                |r| r.get(0),
+            )
+            .optional()?;
         let n = conn.execute(
             "UPDATE nodes SET parent_ino = ?1, name = ?2 WHERE parent_ino = ?3 AND name = ?4",
             params![newparent as i64, newname, parent as i64, name],
@@ -605,7 +742,49 @@ impl Provider for SqliteProvider {
         if n == 0 {
             return Err(FsError::NotFound);
         }
+        if let Some(id) = node_id {
+            Self::enqueue(&conn, &id, "upsert")?;
+        }
         Ok(())
+    }
+}
+
+/// Shared ownership of a provider. The FUSE mount (`fuser::mount2` takes the adapter by
+/// value and blocks) and the background sync loop each hold an `Arc` clone of the same
+/// provider; every method is `&self`, so delegation is a straight deref.
+impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
+    fn lookup(&self, parent: u64, name: &str) -> Result<Attr> {
+        (**self).lookup(parent, name)
+    }
+    fn getattr(&self, ino: u64) -> Result<Attr> {
+        (**self).getattr(ino)
+    }
+    fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>> {
+        (**self).readdir(ino)
+    }
+    fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+        (**self).read(ino, offset, size)
+    }
+    fn create(&self, parent: u64, name: &str) -> Result<Attr> {
+        (**self).create(parent, name)
+    }
+    fn mkdir(&self, parent: u64, name: &str) -> Result<Attr> {
+        (**self).mkdir(parent, name)
+    }
+    fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32> {
+        (**self).write(ino, offset, data)
+    }
+    fn flush(&self, ino: u64) -> Result<()> {
+        (**self).flush(ino)
+    }
+    fn unlink(&self, parent: u64, name: &str) -> Result<()> {
+        (**self).unlink(parent, name)
+    }
+    fn rmdir(&self, parent: u64, name: &str) -> Result<()> {
+        (**self).rmdir(parent, name)
+    }
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()> {
+        (**self).rename(parent, name, newparent, newname)
     }
 }
 
@@ -751,6 +930,59 @@ mod tests {
         let idb = p.node_id_for(b.ino).unwrap().unwrap();
         assert_ne!(ida, idb);
         assert_eq!(p.node_id_for(a.ino).unwrap().unwrap(), ida, "stable across calls");
+    }
+
+    #[test]
+    fn outbox_tracks_local_changes() {
+        let p = provider();
+        // mkdir enqueues an upsert immediately.
+        let dir = p.mkdir(ROOT_INO, "proj").unwrap();
+        let dir_id = p.node_id_for(dir.ino).unwrap().unwrap();
+        // create alone does NOT enqueue (no manifest yet); flush does.
+        let f = p.create(dir.ino, "part.bin").unwrap();
+        let file_id = p.node_id_for(f.ino).unwrap().unwrap();
+        assert_eq!(p.outbox_list().unwrap(), vec![(dir_id.clone(), "upsert".into())]);
+        p.write(f.ino, 0, &vec![1u8; 1000]).unwrap();
+        p.flush(f.ino).unwrap();
+        // Parent dir enqueued before the file (insertion order preserved).
+        assert_eq!(
+            p.outbox_list().unwrap(),
+            vec![(dir_id.clone(), "upsert".into()), (file_id.clone(), "upsert".into())]
+        );
+        // A delete coalesces the file's entry to 'delete' (no duplicate row).
+        p.unlink(dir.ino, "part.bin").unwrap();
+        assert_eq!(
+            p.outbox_list().unwrap(),
+            vec![(dir_id.clone(), "upsert".into()), (file_id.clone(), "delete".into())]
+        );
+        // Draining clears entries.
+        p.outbox_clear(&dir_id).unwrap();
+        p.outbox_clear(&file_id).unwrap();
+        assert!(p.outbox_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cursor_round_trips() {
+        let p = provider();
+        assert_eq!(p.cursor().unwrap(), 0, "defaults to 0");
+        p.set_cursor(42).unwrap();
+        assert_eq!(p.cursor().unwrap(), 42);
+        p.set_cursor(99).unwrap();
+        assert_eq!(p.cursor().unwrap(), 99, "upserts in place");
+    }
+
+    #[test]
+    fn sync_node_matches_export_tree() {
+        let p = provider();
+        let dir = p.mkdir(ROOT_INO, "proj").unwrap();
+        let f = p.create(dir.ino, "x.bin").unwrap();
+        p.write(f.ino, 0, &vec![5u8; 1500]).unwrap();
+        p.flush(f.ino).unwrap();
+        let file_id = p.node_id_for(f.ino).unwrap().unwrap();
+        let from_export = p.export_tree().unwrap().into_iter().find(|n| n.node_id == file_id).unwrap();
+        let from_single = p.sync_node(&file_id).unwrap().unwrap();
+        assert_eq!(from_single, from_export, "single-node export equals whole-tree export");
+        assert!(p.sync_node("does-not-exist").unwrap().is_none());
     }
 
     #[test]

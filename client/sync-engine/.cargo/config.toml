@@ -1,0 +1,5 @@
+# maker-syncd links FUSE-T (via fs-fuse). FUSE-T installs libfuse-t.dylib in
+# /usr/local/lib with an @rpath install name, so bake the rpath into our binaries so
+# they load it at runtime without install_name_tool. (Mirrors fs-fuse/.cargo/config.toml.)
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib"]

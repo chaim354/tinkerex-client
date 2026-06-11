@@ -6,6 +6,10 @@
 //! [`Provider`](crate::Provider) doesn't change.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process counter making each in-flight temp file unique (see `put`).
+static TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// A content-addressed blob store. `hash` is the hex SHA-256 of `data`.
 pub trait ChunkStore: Send + Sync {
@@ -56,12 +60,25 @@ impl ChunkStore for LocalChunkStore {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Write to a temp file then rename, so a concurrent reader never sees a
-        // half-written chunk.
-        let tmp = p.with_extension("tmp");
+        // Write to a *unique* temp file then rename, so a concurrent reader never sees
+        // a half-written chunk. The temp name must be unique per writer: two threads
+        // storing the same chunk hash (CAS dedup, identical content) would otherwise
+        // share one temp path and race on the rename (the loser hits ENOENT). The sync
+        // daemon writes this store from multiple threads (flush + hydrate), so this is
+        // load-bearing, not theoretical.
+        let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = p.with_extension(format!("tmp.{}.{}", std::process::id(), nonce));
         std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, &p)?;
-        Ok(())
+        match std::fs::rename(&tmp, &p) {
+            Ok(()) => Ok(()),
+            // A concurrent writer landed the same chunk first — that's the dedup win,
+            // not an error. Drop our temp copy and treat it as stored.
+            Err(_) if p.exists() => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn has(&self, hash: &str) -> bool {

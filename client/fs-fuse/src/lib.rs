@@ -6,6 +6,7 @@
 //! WinFsp (Windows, via the winfsp-rs binding). The driver is installed by the user.
 
 use std::ffi::OsStr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs_provider::{Attr, FsError, Kind, Provider};
@@ -57,13 +58,31 @@ fn file_attr(a: &Attr) -> FileAttr {
     }
 }
 
+/// On-demand byte hydration for the read path. The sync engine implements this; when a
+/// read hits a chunk-cache miss, the adapter calls `hydrate(ino)` to fetch the file's
+/// chunks from the cloud, then retries the read. Keeping it a trait here means `fs-fuse`
+/// stays free of any server/transport dependency.
+pub trait Hydrate: Send + Sync {
+    /// Best-effort: pull `ino`'s missing chunks into the local cache. Errors are the
+    /// hydrator's to log; the adapter just retries the read once afterward.
+    fn hydrate(&self, ino: u64);
+}
+
 pub struct FuseAdapter<P: Provider> {
     provider: P,
+    hydrator: Option<Arc<dyn Hydrate>>,
 }
 
 impl<P: Provider> FuseAdapter<P> {
+    /// A mount with no hydrator — reads serve only what's already in the local cache
+    /// (a cache miss is `EIO`). Used by the plain `maker-mount` binary and tests.
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self { provider, hydrator: None }
+    }
+
+    /// A mount whose read path hydrates missing chunks on demand (the sync daemon).
+    pub fn with_hydrator(provider: P, hydrator: Arc<dyn Hydrate>) -> Self {
+        Self { provider, hydrator: Some(hydrator) }
     }
 }
 
@@ -124,6 +143,17 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
     ) {
         match self.provider.read(ino, offset as u64, size) {
             Ok(data) => reply.data(&data),
+            // A chunk-cache miss on a file we know about: ask the hydrator to fetch the
+            // bytes from the cloud, then retry the read once. This is the on-demand
+            // hydration path (placeholder → materialized) for both initial pulls and
+            // files repointed at new manifests by a remote change.
+            Err(FsError::ChunkMissing(_)) if self.hydrator.is_some() => {
+                self.hydrator.as_ref().unwrap().hydrate(ino);
+                match self.provider.read(ino, offset as u64, size) {
+                    Ok(data) => reply.data(&data),
+                    Err(e) => reply.error(errno(&e)),
+                }
+            }
             Err(e) => reply.error(errno(&e)),
         }
     }
