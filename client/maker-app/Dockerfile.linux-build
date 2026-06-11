@@ -1,0 +1,32 @@
+# Build a Linux (amd64, Debian/Ubuntu) .deb for the Maker Tauri client, so it installs
+# and runs WITHOUT Rust or tauri-cli on the target machine — apt pulls the runtime libs
+# (webkit2gtk-4.1, libfuse, …) the .deb declares.
+#
+# Build context is the repo's `client/` directory (the path deps live there):
+#   docker build -f maker-app/Dockerfile.linux-build -t maker-linux .
+# Then extract:
+#   id=$(docker create maker-linux); docker cp "$id":/out ./out; docker rm "$id"
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl wget file ca-certificates build-essential pkg-config \
+      libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev \
+      libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
+      libfuse-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# Rust + tauri-cli — build-time only; never installed on the target machine.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install tauri-cli --version "^2.0" --locked
+
+WORKDIR /build
+COPY . /build
+WORKDIR /build/maker-app
+# No beforeBuildCommand in tauri.conf.json (static HTML frontend), so this just compiles
+# the Rust app (frontend embedded) and bundles a .deb.
+RUN cargo tauri build --bundles deb \
+  && mkdir -p /out \
+  && cp src-tauri/target/release/bundle/deb/*.deb /out/ \
+  && cp src-tauri/target/release/maker-app /out/maker-app-bin
