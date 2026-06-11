@@ -1,0 +1,19 @@
+[package]
+name = "fs-webdav"
+version = "0.1.0"
+edition = "2021"
+description = "Serve fs-provider over WebDAV — the macOS mount path (native /sbin/mount_webdav, no FUSE/kext/FSKit). Works on any OS with a WebDAV client."
+license = "Apache-2.0"
+
+[dependencies]
+fs-provider = { path = "../fs-provider" }
+dav-server = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+futures-util = "0.3"
+bytes = "1"
+
+[[bin]]
+name = "maker-webdav"
+path = "src/bin/maker-webdav.rs"

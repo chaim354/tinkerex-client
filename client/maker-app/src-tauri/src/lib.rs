@@ -10,11 +10,20 @@ use std::sync::Mutex;
 
 use tauri::State;
 
-/// Holds the running daemon (or `None` when stopped). On Windows there is no `Daemon`
-/// type to hold, so the state is just a marker.
+/// The mount backend, chosen per platform — both expose the same
+/// `start`/`stop`/`is_running`/`mountpoint` API:
+/// - **macOS:** WebDAV + the native `mount_webdav` (FUSE-T can't mount on macOS 26+).
+/// - **Linux:** FUSE (`fuser`) — works natively.
+#[cfg(target_os = "macos")]
+type Mount = sync_engine::WebdavMount;
+#[cfg(all(unix, not(target_os = "macos")))]
+type Mount = sync_engine::Daemon;
+
+/// Holds the running mount (or `None` when stopped). On Windows there is no mount
+/// backend yet, so the state is just a marker.
 #[cfg(not(target_os = "windows"))]
 #[derive(Default)]
-struct AppState(Mutex<Option<sync_engine::Daemon>>);
+struct AppState(Mutex<Option<Mount>>);
 #[cfg(target_os = "windows")]
 #[derive(Default)]
 struct AppState;
@@ -39,7 +48,7 @@ fn sync_start(
     #[cfg(not(target_os = "windows"))]
     {
         use sync_client::ServerClient;
-        use sync_engine::{Daemon, DaemonConfig};
+        use sync_engine::DaemonConfig;
 
         let mut guard = state.0.lock().unwrap();
         if guard.as_ref().is_some_and(|d| d.is_running()) {
@@ -60,9 +69,9 @@ fn sync_start(
         std::fs::create_dir_all(&mountpoint).map_err(|e| format!("mountpoint: {e}"))?;
 
         let cfg = DaemonConfig::new(&mountpoint, db, chunks, &server_url, reg.device_token);
-        let daemon = Daemon::start(cfg).map_err(|e| format!("mount failed: {e}"))?;
-        let mp = daemon.mountpoint().display().to_string();
-        *guard = Some(daemon);
+        let mount = Mount::start(cfg).map_err(|e| format!("mount failed: {e}"))?;
+        let mp = mount.mountpoint().display().to_string();
+        *guard = Some(mount);
         Ok(format!("mounted at {mp}"))
     }
 }

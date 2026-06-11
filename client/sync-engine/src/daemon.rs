@@ -11,7 +11,9 @@
 //! - the sync thread (`sync_tick` on a nudge or the poll fallback),
 //! - the nudge thread (`LibraryChannel` `{head_seq}` → wake the sync thread).
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
@@ -43,6 +45,8 @@ pub struct DaemonConfig {
     pub token: String,
     /// Poll fallback interval.
     pub poll: Duration,
+    /// Localhost port for the WebDAV mount path (macOS). Ignored by the FUSE `Daemon`.
+    pub webdav_port: u16,
 }
 
 impl DaemonConfig {
@@ -60,6 +64,7 @@ impl DaemonConfig {
             server_url: server_url.into(),
             token: token.into(),
             poll: DEFAULT_POLL,
+            webdav_port: 9988,
         }
     }
 }
@@ -153,6 +158,114 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// The **WebDAV** mount path — serves the provider over localhost HTTP and mounts it
+/// with the OS's native WebDAV client, instead of FUSE. This is the macOS path (FUSE-T
+/// can't mount on macOS 26+); the sync + nudge loops are identical to [`Daemon`]. Same
+/// `start`/`stop`/`is_running`/`mountpoint` shape, so a host can alias one or the other
+/// per platform.
+pub struct WebdavMount {
+    stop: Arc<AtomicBool>,
+    rt: Option<tokio::runtime::Runtime>, // owns the WebDAV server task; drop = shutdown
+    sync_handle: Option<JoinHandle<()>>,
+    mountpoint: PathBuf,
+}
+
+impl WebdavMount {
+    pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
+        let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
+        let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
+        let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
+
+        // Same sync + nudge threads as the FUSE Daemon.
+        let sync_handle = {
+            let provider = provider.clone();
+            let client = client.clone();
+            let stop = stop.clone();
+            let poll = cfg.poll;
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll))
+        };
+        {
+            let client = client.clone();
+            let stop = stop.clone();
+            thread::spawn(move || nudge_loop(client, stop, nudge_tx));
+        }
+
+        // Hydrate-on-read: resolve the WebDAV ino → node_id and pull missing chunks.
+        let hydrate: fs_webdav::Hydrate = {
+            let p = provider.clone();
+            let c = client.clone();
+            Arc::new(move |ino: u64| {
+                if let Ok(Some(node_id)) = p.node_id_for(ino) {
+                    let io = PresignedIO::new(&c);
+                    if let Err(e) = SyncEngine::hydrate(&p, &c, &io, &node_id) {
+                        eprintln!("webdav hydrate ino {ino}: {e}");
+                    }
+                }
+            })
+        };
+
+        // WebDAV server on its own multi-thread runtime (dropped on stop → shutdown).
+        let addr: SocketAddr = ([127, 0, 0, 1], cfg.webdav_port).into();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        rt.spawn(fs_webdav::serve(provider, addr, Some(hydrate)));
+
+        // Mount via the native client once the server is listening.
+        std::fs::create_dir_all(&cfg.mountpoint)?;
+        thread::sleep(Duration::from_millis(400));
+        mount_native(&addr, &cfg.mountpoint)?;
+        println!("WebDAV mounted at {} (http://{addr}/)", cfg.mountpoint.display());
+
+        Ok(Self { stop, rt: Some(rt), sync_handle: Some(sync_handle), mountpoint: cfg.mountpoint })
+    }
+
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.stop.load(Ordering::Relaxed)
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        unmount_native(&self.mountpoint);
+        self.rt.take(); // drop the runtime → WebDAV server task is cancelled
+        if let Some(h) = self.sync_handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for WebdavMount {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mount_native(addr: &SocketAddr, mp: &Path) -> std::io::Result<()> {
+    let status = Command::new("/sbin/mount_webdav")
+        .args(["-S", "-v", "Maker", &format!("http://{addr}/")])
+        .arg(mp)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("mount_webdav exited {status}")));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_native(_addr: &SocketAddr, _mp: &Path) -> std::io::Result<()> {
+    // Non-macOS: the server is up; mount with the OS's WebDAV client (gio/davfs/net use).
+    Ok(())
+}
+
+fn unmount_native(mp: &Path) {
+    let _ = Command::new("/sbin/umount").arg(mp).status();
 }
 
 /// Push the outbox + pull the changelog delta on each nudge or poll-timeout.
