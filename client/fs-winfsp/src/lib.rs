@@ -96,14 +96,26 @@ impl Context {
     }
 }
 
+/// On a chunk-cache miss, fetch `ino`'s chunks from the cloud (the read-path hydrate
+/// hook, same role as `fs-fuse`/`fs-webdav`). Closure-based so this crate stays free of
+/// any server dependency.
+pub type Hydrate = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
 /// The adapter: a `Provider` exposed as a WinFsp filesystem.
 pub struct WinFspAdapter<P: Provider> {
     provider: P,
+    hydrate: Option<Hydrate>,
 }
 
 impl<P: Provider> WinFspAdapter<P> {
+    /// Local-only (no hydration — a chunk-cache miss is an error). For `maker-mount-win`.
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self { provider, hydrate: None }
+    }
+
+    /// With a hydrate hook so reads pull missing chunks from the cloud (the sync daemon).
+    pub fn with_hydrate(provider: P, hydrate: Option<Hydrate>) -> Self {
+        Self { provider, hydrate }
     }
 
     /// Resolve a WinFsp path (`\`, `\a`, `\a\b`) to `(ino, parent_ino, is_dir)` by
@@ -246,10 +258,16 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
     }
 
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {
-        let data = self
-            .provider
-            .read(context.ino, offset, buffer.len() as u32)
-            .map_err(to_fsp)?;
+        let len = buffer.len() as u32;
+        let data = match self.provider.read(context.ino, offset, len) {
+            Ok(d) => d,
+            // Chunk-cache miss on a known file: hydrate from the cloud, then retry.
+            Err(FsError::ChunkMissing(_)) if self.hydrate.is_some() => {
+                (self.hydrate.as_ref().unwrap())(context.ino);
+                self.provider.read(context.ino, offset, len).map_err(to_fsp)?
+            }
+            Err(e) => return Err(to_fsp(e)),
+        };
         let n = data.len().min(buffer.len());
         buffer[..n].copy_from_slice(&data[..n]);
         Ok(n as u32)
@@ -372,14 +390,38 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
     }
 }
 
-/// Mount `provider` at `mountpoint` (e.g. `"Z:"` or a directory) and serve until the
-/// process exits (WinFsp auto-unmounts on exit). Blocking.
-pub fn mount_blocking<P: Provider + 'static>(provider: P, mountpoint: &str) -> Result<()> {
-    eprintln!("initializing WinFsp…");
-    // `winfsp_init()` (vs `_or_die`) so a load/version failure surfaces as an error
-    // instead of silently exiting the process. Must stay alive for the mount's lifetime.
+/// A live WinFsp mount. The WinFsp dispatcher runs on its own threads; keep this alive
+/// to keep the drive up. [`unmount`](Self::unmount) (or drop) tears it down. Not `Send` —
+/// create, hold, and drop it on one thread (the sync daemon runs it on a dedicated one).
+pub struct Mounted<P: Provider + 'static> {
+    _init: winfsp::FspInit, // must outlive the mount
+    host: FileSystemHost<WinFspAdapter<P>>,
+}
+
+impl<P: Provider + 'static> Mounted<P> {
+    pub fn unmount(&mut self) {
+        self.host.unmount();
+        self.host.stop();
+    }
+}
+
+impl<P: Provider + 'static> Drop for Mounted<P> {
+    fn drop(&mut self) {
+        self.unmount();
+    }
+}
+
+/// Mount `provider` at `mountpoint` (e.g. `"Z:"` or a directory), **non-blocking** —
+/// returns a [`Mounted`] handle while the dispatcher serves on its own threads. `hydrate`
+/// is the read-path hook (`None` = local-only).
+pub fn start_mount<P: Provider + 'static>(
+    provider: P,
+    mountpoint: &str,
+    hydrate: Option<Hydrate>,
+) -> Result<Mounted<P>> {
+    // `winfsp_init()` (vs `_or_die`) so a load failure surfaces as an error instead of
+    // silently exiting the process.
     let _init = winfsp::winfsp_init()?;
-    eprintln!("WinFsp initialized; mounting at {mountpoint}…");
 
     let mut params = VolumeParams::new();
     params
@@ -395,15 +437,19 @@ pub fn mount_blocking<P: Provider + 'static>(provider: P, mountpoint: &str) -> R
         .post_cleanup_when_modified_only(true);
 
     // Annotate the host type so `S` (the operation-guard strategy) resolves to its
-    // default (`FineGuard`) — otherwise `host.start()` is ambiguous between the
-    // FineGuard and CoarseGuard impls.
+    // default (`FineGuard`) — otherwise `host.start()` is ambiguous.
     let mut host: FileSystemHost<WinFspAdapter<P>> =
-        FileSystemHost::new(params, WinFspAdapter::new(provider))?;
+        FileSystemHost::new(params, WinFspAdapter::with_hydrate(provider, hydrate))?;
     host.mount(mountpoint.to_string())?;
     host.start()?;
-    println!("mounted at {mountpoint} (WinFsp); Ctrl-C to unmount");
+    Ok(Mounted { _init, host })
+}
 
-    // The WinFsp dispatcher runs on its own threads; keep `host` + `_init` alive.
+/// Mount and block until the process exits (WinFsp auto-unmounts). For `maker-mount-win`.
+pub fn mount_blocking<P: Provider + 'static>(provider: P, mountpoint: &str) -> Result<()> {
+    eprintln!("initializing WinFsp…");
+    let _m = start_mount(provider, mountpoint, None)?;
+    println!("mounted at {mountpoint} (WinFsp); Ctrl-C to unmount");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }

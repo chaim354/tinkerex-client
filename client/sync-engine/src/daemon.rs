@@ -24,12 +24,12 @@ use sync_client::ServerClient;
 
 use crate::{PresignedIO, SyncEngine};
 
-// FUSE bits — Linux/Windows only (macOS mounts via WebDAV; see `WebdavMount`).
-#[cfg(not(target_os = "macos"))]
+// FUSE bits — Linux only (macOS → WebDAV, Windows → WinFsp).
+#[cfg(target_os = "linux")]
 use crate::EngineHydrator;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use fs_fuse::FuseAdapter;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use fuser::MountOption;
 
 /// Default poll fallback interval (the nudge is the fast path; this bounds staleness if
@@ -75,9 +75,10 @@ impl DaemonConfig {
     }
 }
 
-/// A running FUSE mount + its two background loops (Linux/Windows). Drop (or
-/// [`stop`](Self::stop)) unmounts and tears the loops down. macOS uses [`WebdavMount`].
-#[cfg(not(target_os = "macos"))]
+/// A running FUSE mount + its two background loops (Linux). Drop (or
+/// [`stop`](Self::stop)) unmounts and tears the loops down. macOS uses [`WebdavMount`],
+/// Windows uses [`WinfspMount`].
+#[cfg(target_os = "linux")]
 pub struct Daemon {
     stop: Arc<AtomicBool>,
     session: Option<fuser::BackgroundSession>,
@@ -85,7 +86,7 @@ pub struct Daemon {
     mountpoint: PathBuf,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl Daemon {
     /// Mount and start syncing. Returns once the mount is live (non-blocking). The nudge
     /// thread is detached (a dropped socket just falls back to the poll; it's reaped on
@@ -162,7 +163,7 @@ impl Daemon {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
@@ -275,6 +276,122 @@ fn mount_native(_addr: &SocketAddr, _mp: &Path) -> std::io::Result<()> {
 
 fn unmount_native(mp: &Path) {
     let _ = Command::new("/sbin/umount").arg(mp).status();
+}
+
+/// The **WinFsp** mount path (Windows) — a drive letter via `fs-winfsp`, same
+/// `start`/`stop`/`is_running`/`mountpoint` API as the FUSE/WebDAV backends. The WinFsp
+/// host handle isn't `Send`, so it lives on its own thread; the sync + nudge loops are
+/// identical to the others.
+#[cfg(target_os = "windows")]
+pub struct WinfspMount {
+    stop: Arc<AtomicBool>,
+    fs_thread: Option<JoinHandle<()>>,
+    sync_handle: Option<JoinHandle<()>>,
+    mountpoint: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+impl WinfspMount {
+    pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
+        let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
+        let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
+        let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
+
+        // Same sync + nudge threads as the other backends.
+        let sync_handle = {
+            let provider = provider.clone();
+            let client = client.clone();
+            let stop = stop.clone();
+            let poll = cfg.poll;
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll))
+        };
+        {
+            let client = client.clone();
+            let stop = stop.clone();
+            thread::spawn(move || nudge_loop(client, stop, nudge_tx));
+        }
+
+        // Hydrate-on-read: WinFsp ino → node_id → pull missing chunks.
+        let hydrate: fs_winfsp::Hydrate = {
+            let p = provider.clone();
+            let c = client.clone();
+            Arc::new(move |ino: u64| {
+                if let Ok(Some(node_id)) = p.node_id_for(ino) {
+                    let io = PresignedIO::new(&c);
+                    if let Err(e) = SyncEngine::hydrate(&p, &c, &io, &node_id) {
+                        eprintln!("winfsp hydrate ino {ino}: {e}");
+                    }
+                }
+            })
+        };
+
+        // The WinFsp `Mounted` handle isn't `Send`, so create/hold/drop it on a dedicated
+        // thread. It reports mount success/failure back so `start` can surface errors.
+        let mountpoint = cfg.mountpoint.to_string_lossy().to_string();
+        let (ready_tx, ready_rx) = mpsc::channel::<crate::Result<()>>();
+        let fs_thread = {
+            let provider = provider.clone();
+            let stop = stop.clone();
+            thread::spawn(move || match fs_winfsp::start_mount(provider, &mountpoint, Some(hydrate)) {
+                Ok(mounted) => {
+                    let _ = ready_tx.send(Ok(()));
+                    while !stop.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(150));
+                    }
+                    drop(mounted); // unmount on stop
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(std::io::Error::other(format!(
+                        "winfsp mount failed: {e:?}"
+                    ))
+                    .into()));
+                }
+            })
+        };
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::other("winfsp mount thread exited").into());
+            }
+        }
+        println!("WinFsp mounted at {}", cfg.mountpoint.display());
+
+        Ok(Self {
+            stop,
+            fs_thread: Some(fs_thread),
+            sync_handle: Some(sync_handle),
+            mountpoint: cfg.mountpoint,
+        })
+    }
+
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.stop.load(Ordering::Relaxed)
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.fs_thread.take() {
+            let _ = h.join(); // unmounts on the way out
+        }
+        if let Some(h) = self.sync_handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WinfspMount {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Push the outbox + pull the changelog delta on each nudge or poll-timeout.

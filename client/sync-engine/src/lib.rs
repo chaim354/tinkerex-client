@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-#[cfg(not(target_os = "macos"))] // only the FUSE EngineHydrator holds an Arc
+#[cfg(target_os = "linux")] // only the FUSE EngineHydrator holds an Arc
 use std::sync::Arc;
 
 use fs_provider::{ChunkLoc, Kind, SqliteProvider, SyncNode};
@@ -18,8 +18,10 @@ use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
 
 mod daemon;
 pub use daemon::{DaemonConfig, WebdavMount, DEFAULT_POLL};
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub use daemon::Daemon;
+#[cfg(target_os = "windows")]
+pub use daemon::WinfspMount;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -254,20 +256,20 @@ fn push_node(
 /// calls [`Hydrate::hydrate`], which fetches the file's chunks from the cloud via
 /// presigned GET. Holds `Arc` clones shared with the mount + sync threads.
 /// (FUSE only — macOS's `WebdavMount` uses an inline closure hydrator.)
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub struct EngineHydrator {
     provider: Arc<SqliteProvider>,
     client: ServerClient,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl EngineHydrator {
     pub fn new(provider: Arc<SqliteProvider>, client: ServerClient) -> Self {
         Self { provider, client }
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl fs_fuse::Hydrate for EngineHydrator {
     fn hydrate(&self, ino: u64) {
         let node_id = match self.provider.node_id_for(ino) {

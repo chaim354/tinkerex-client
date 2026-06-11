@@ -9,21 +9,21 @@
 //! All the wiring lives in [`sync_engine::Daemon`] (shared with the Tauri app); this
 //! binary just parses args, starts it, and blocks until unmount (Ctrl-C / `umount`).
 
-// maker-syncd is the FUSE daemon (Linux/Windows). On macOS the mount path is WebDAV via
-// the Tauri app (`sync_engine::WebdavMount`), so there's no FUSE `Daemon` to drive here.
-#[cfg(target_os = "macos")]
+// maker-syncd is the FUSE daemon (Linux). macOS mounts via WebDAV and Windows via WinFsp
+// — both through the Maker app — so there's no FUSE `Daemon` to drive on those.
+#[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!(
-        "maker-syncd is the FUSE daemon for Linux/Windows. On macOS the client mounts via \
-         WebDAV — use the Maker app (client/maker-app)."
+        "maker-syncd is the Linux FUSE daemon. On macOS (WebDAV) and Windows (WinFsp), \
+         mount via the Maker app (client/maker-app)."
     );
     std::process::exit(1);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use sync_engine::{Daemon, DaemonConfig};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mountpoint, db, chunk_dir, server_url, token) =
