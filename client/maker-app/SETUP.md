@@ -32,6 +32,15 @@ The backend lives in `src-tauri/src/lib.rs` (commands `sync_start` / `sync_stop`
   ```
   No pkg-config alias or rpath dance on Linux — libfuse ships the standard `fuse.pc`,
   and `fuser` links it directly. (Skip the macOS FUSE-T block below.)
+- **Linux only — allow `allow_other`.** The mount uses `auto_unmount` (clean teardown
+  if the app dies), which `fuser`/libfuse couple with `allow_other`, and Debian/Ubuntu
+  gate that behind `/etc/fuse.conf`. Without it, Mount fails with *"option allow_other
+  only allowed if 'user_allow_other' is set"*. One-time:
+  ```sh
+  echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+  ```
+  Also make sure you can reach `/dev/fuse` (`sudo usermod -aG fuse $USER`, then re-login,
+  if a mount returns `permission denied (os error 13)`).
 - **macOS only — the FUSE-T pkg-config alias.** `fuser` probes pkg-config for the
   macFUSE names; FUSE-T ships different ones, so alias them once per shell
   (verbatim from `client/fs-fuse/BUILD.md`):
@@ -52,6 +61,19 @@ The backend lives in `src-tauri/src/lib.rs` (commands `sync_start` / `sync_stop`
   export PKG_CONFIG_PATH=/tmp/fuse-pc:/usr/local/lib/pkgconfig
   ```
   (The FUSE-T runtime rpath is baked in by `src-tauri/.cargo/config.toml`.)
+- **macOS only — use the NFS-based FUSE-T, not the FSKit build.** FUSE-T ≥1.1 ships an
+  experimental **FSKit** backend and makes it the default on macOS 26+. The library
+  loads and the app runs, but the mount silently never establishes — the symptom is the
+  app flips back to "unmounted" and the console loops `sync loop started / sync loop
+  stopped`. FSKit modules are third-party extensions that must be enabled in System
+  Settings → General → Login Items & Extensions → File System Extensions, and that
+  toggle is frequently greyed/broken on current macOS. Install the **standard
+  (NFS-based) FUSE-T** installer from https://github.com/macos-fuse-t/fuse-t/releases
+  (the plain `fuse-t` pkg, **not** the `*-fskit` one) — it mounts via a local NFS
+  loopback with no extension approval. If you're stuck on the FSKit build, build the
+  **Linux** client instead (`maker-app/Dockerfile.linux-build`); libfuse on Linux has
+  none of this. (Verified the known-good `maker-mount` fails identically with the FSKit
+  build, so this is FUSE-T-vs-macOS, not the app.)
 
 ### 2. Start the sync server (from the repo root, separate terminal)
 

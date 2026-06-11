@@ -42,5 +42,22 @@ The runtime rpath is handled by `.cargo/config.toml`. Then:
 mkdir / write / read / ls through `~/makermnt` are served by the local SQLite tree
 + content-addressed chunk store; files persist across remounts.
 
+### Runtime gotcha — use NFS-based FUSE-T, not the FSKit build (macOS 26+)
+
+FUSE-T ≥1.1 ships an experimental **FSKit** backend and defaults to it on macOS 26+.
+`libfuse-t` loads and `mount2`/`spawn_mount2` is called, but the mount **silently never
+establishes** (no error): `maker-mount` blocks with nothing in `mount`, and the daemon's
+`spawn_mount2` session ends immediately so the app shows "unmounted." FSKit modules are
+third-party extensions requiring approval in *System Settings → General → Login Items &
+Extensions → File System Extensions*, and that toggle is frequently greyed/broken on
+current macOS. Forcing the NFS backend (`-o backend=nfs`) didn't help either — the
+`go-nfsv4` server doesn't spawn.
+
+**Fix:** install the **standard NFS-based FUSE-T** (the plain `fuse-t` pkg from the
+[releases](https://github.com/macos-fuse-t/fuse-t/releases), *not* the `*-fskit` one),
+which mounts via a local NFS loopback with no extension approval. Confirmed on macOS
+26.3 that the FSKit build of 1.2.7 cannot mount even via the known-good `maker-mount`, so
+this is FUSE-T-vs-macOS, not the adapter. On Linux, libfuse has none of this.
+
 > TODO: replace the manual pkg-config alias with a `build.rs` that detects FUSE-T,
 > and add the `winfsp-rs` adapter for Windows.
