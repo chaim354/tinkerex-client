@@ -1,0 +1,12 @@
+[package]
+name = "sync-engine"
+version = "0.1.0"
+edition = "2021"
+description = "The daemon: bridges fs-provider (local tree + chunk cache) and sync-client (server API) to push local changes and pull remote ones. Pluggable chunk transport."
+license = "Apache-2.0"
+
+[dependencies]
+fs-provider = { path = "../fs-provider" }
+sync-client = { path = "../sync-client" }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }

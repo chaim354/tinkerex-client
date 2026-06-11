@@ -346,6 +346,98 @@ impl SqliteProvider {
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
+
+    // ---- sync apply (pull) ------------------------------------------------
+
+    /// Apply a node pulled from the server into the local tree (upsert by node_id).
+    /// Parents must already be applied (the server returns them parent-first).
+    pub fn apply_remote(&self, node: &SyncNode) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let parent_ino: i64 = match &node.parent_node_id {
+            None => ROOT_INO as i64,
+            Some(pid) => conn
+                .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![pid], |r| r.get(0))
+                .optional()?
+                .ok_or(FsError::NotFound)?,
+        };
+        if let Some(mid) = &node.manifest_id {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM manifest_chunks WHERE manifest_id = ?1)",
+                params![mid],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                for (i, c) in node.chunks.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO manifest_chunks(manifest_id, seq, chunk_hash, offset, length)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![mid, i as i64, c.hash, c.offset as i64, c.length as i64],
+                    )?;
+                }
+            }
+        }
+        let size: i64 = node.chunks.iter().map(|c| c.length as i64).sum();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE node_id = ?1)",
+            params![node.node_id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            conn.execute(
+                "UPDATE nodes SET parent_ino=?1, name=?2, kind=?3, manifest_id=?4, size=?5 WHERE node_id=?6",
+                params![parent_ino, node.name, node.kind.as_str(), node.manifest_id, size, node.node_id],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO nodes(parent_ino, name, kind, node_id, manifest_id, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![parent_ino, node.name, node.kind.as_str(), node.node_id, node.manifest_id, size],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn ino_for_node_id(&self, node_id: &str) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(|i| i as u64))
+    }
+
+    /// The ordered chunk hashes for a node's current manifest (for hydration).
+    pub fn node_manifest_hashes(&self, node_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mid: Option<String> = conn
+            .query_row("SELECT manifest_id FROM nodes WHERE node_id = ?1", params![node_id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten();
+        match mid {
+            None => Ok(Vec::new()),
+            Some(m) => {
+                let mut stmt =
+                    conn.prepare("SELECT chunk_hash FROM manifest_chunks WHERE manifest_id = ?1 ORDER BY seq")?;
+                let rows = stmt.query_map(params![m], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            }
+        }
+    }
+
+    // ---- chunk cache access (for the sync daemon to move bytes) -----------
+
+    pub fn chunk_get(&self, hash: &str) -> Result<Vec<u8>> {
+        self.store.get(hash).map_err(FsError::Io)
+    }
+    pub fn chunk_put(&self, hash: &str, data: &[u8]) -> Result<()> {
+        self.store.put(hash, data).map_err(FsError::Io)
+    }
+    pub fn has_chunk(&self, hash: &str) -> bool {
+        self.store.has(hash)
+    }
 }
 
 impl Provider for SqliteProvider {
@@ -616,6 +708,38 @@ mod tests {
                    "file's parent_node_id is the dir's node_id");
         assert!(file_n.manifest_id.is_some());
         assert!(!file_n.chunks.is_empty(), "file carries its manifest chunks");
+    }
+
+    #[test]
+    fn apply_remote_reconstructs_tree_and_content() {
+        // A and B share the temp chunk store (same process) — so once A flushes,
+        // B can read content after applying A's exported tree. This mirrors the
+        // real daemon where the shared store is the cloud (R2/SeaweedFS).
+        let a = provider();
+        let dir = a.mkdir(ROOT_INO, "proj").unwrap();
+        let f = a.create(dir.ino, "x.bin").unwrap();
+        let data = vec![9u8; 800];
+        a.write(f.ino, 0, &data).unwrap();
+        a.flush(f.ino).unwrap();
+        let exported = a.export_tree().unwrap();
+
+        let b = provider();
+        for n in &exported {
+            b.apply_remote(n).unwrap();
+        }
+
+        let proj = b.lookup(ROOT_INO, "proj").unwrap();
+        assert_eq!(proj.kind, Kind::Dir);
+        let xb = b.lookup(proj.ino, "x.bin").unwrap();
+        assert_eq!(xb.size, 800);
+
+        let file_node = exported.iter().find(|n| n.name == "x.bin").unwrap();
+        let hashes = b.node_manifest_hashes(&file_node.node_id).unwrap();
+        assert_eq!(hashes.len(), file_node.chunks.len());
+        assert!(b.ino_for_node_id(&file_node.node_id).unwrap().is_some());
+
+        // content round-trips (chunks present in the shared store)
+        assert_eq!(b.read(xb.ino, 0, 800).unwrap(), data);
     }
 
     #[test]
