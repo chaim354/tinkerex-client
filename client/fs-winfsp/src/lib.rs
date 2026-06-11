@@ -390,7 +390,11 @@ pub fn mount_blocking<P: Provider + 'static>(provider: P, mountpoint: &str) -> R
         .persistent_acls(false)
         .post_cleanup_when_modified_only(true);
 
-    let mut host = FileSystemHost::new(params, WinFspAdapter::new(provider))?;
+    // Annotate the host type so `S` (the operation-guard strategy) resolves to its
+    // default (`FineGuard`) — otherwise `host.start()` is ambiguous between the
+    // FineGuard and CoarseGuard impls.
+    let mut host: FileSystemHost<WinFspAdapter<P>> =
+        FileSystemHost::new(params, WinFspAdapter::new(provider))?;
     host.mount(mountpoint.to_string())?;
     host.start()?;
     println!("mounted at {mountpoint} (WinFsp); Ctrl-C to unmount");
