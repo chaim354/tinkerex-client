@@ -1,0 +1,15 @@
+[package]
+name = "fs-fuse"
+version = "0.1.0"
+edition = "2021"
+description = "FUSE adapter for fs-provider. One filesystem implementation; the driver (libfuse/FUSE-T/WinFsp) is installed by the user per OS."
+license = "Apache-2.0"
+
+[dependencies]
+fs-provider = { path = "../fs-provider" }
+fuser = "0.14"
+libc = "0.2"
+
+[[bin]]
+name = "maker-mount"
+path = "src/main.rs"

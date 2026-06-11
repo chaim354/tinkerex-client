@@ -1,0 +1,40 @@
+//! Mount the local-first provider as a real filesystem.
+//!
+//!   maker-mount <mountpoint> [db_path] [chunk_dir]
+//!
+//! Requires a FUSE driver installed: libfuse (Linux), FUSE-T (macOS), WinFsp
+//! (Windows). Ctrl-C to unmount.
+
+use std::path::PathBuf;
+
+use fs_fuse::FuseAdapter;
+use fs_provider::{LocalChunkStore, SqliteProvider};
+use fuser::MountOption;
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let mountpoint = match args.next() {
+        Some(m) => m,
+        None => {
+            eprintln!("usage: maker-mount <mountpoint> [db_path] [chunk_dir]");
+            std::process::exit(2);
+        }
+    };
+    let db_path = PathBuf::from(args.next().unwrap_or_else(|| "/tmp/maker-fs.db".into()));
+    let chunk_dir = args.next().unwrap_or_else(|| "/tmp/maker-fs-chunks".into());
+
+    let store = Box::new(LocalChunkStore::new(chunk_dir).expect("chunk dir"));
+    let provider = SqliteProvider::open(&db_path, store).expect("open provider");
+    let fs = FuseAdapter::new(provider);
+
+    println!("mounting at {mountpoint} (Ctrl-C to unmount)");
+    let opts = vec![
+        MountOption::FSName("maker".into()),
+        MountOption::AutoUnmount,
+        MountOption::DefaultPermissions,
+    ];
+    if let Err(e) = fuser::mount2(fs, &mountpoint, &opts) {
+        eprintln!("mount failed: {e}");
+        std::process::exit(1);
+    }
+}

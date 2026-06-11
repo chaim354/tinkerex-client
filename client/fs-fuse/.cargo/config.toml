@@ -1,0 +1,4 @@
+# FUSE-T installs libfuse-t.dylib in /usr/local/lib with an @rpath install name.
+# Bake the rpath into our binaries so they load it without install_name_tool.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/local/lib"]
