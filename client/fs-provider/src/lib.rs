@@ -60,6 +60,27 @@ pub struct DirEntry {
     pub kind: Kind,
 }
 
+/// A chunk's location within a file (sync export).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkLoc {
+    pub hash: String,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// A sync-ready node descriptor: the stable server id, its parent's id, and (for
+/// files) the manifest. This is what the sync engine pushes to the server — the
+/// glue between the local inode tree and the server's UUID-keyed tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncNode {
+    pub node_id: String,
+    pub parent_node_id: Option<String>,
+    pub name: String,
+    pub kind: Kind,
+    pub manifest_id: Option<String>,
+    pub chunks: Vec<ChunkLoc>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FsError {
     #[error("not found")]
@@ -147,9 +168,11 @@ impl SqliteProvider {
                 kind        TEXT NOT NULL,
                 size        INTEGER NOT NULL DEFAULT 0,
                 mtime       INTEGER NOT NULL DEFAULT 0,
-                manifest_id TEXT
+                manifest_id TEXT,
+                node_id     TEXT
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_ino, name);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_node_id ON nodes(node_id);
             CREATE TABLE IF NOT EXISTS manifest_chunks (
                 manifest_id TEXT NOT NULL,
                 seq         INTEGER NOT NULL,
@@ -161,7 +184,7 @@ impl SqliteProvider {
         )?;
         // Ensure the root directory (ino 1) exists.
         conn.execute(
-            "INSERT OR IGNORE INTO nodes(ino, parent_ino, name, kind) VALUES (?1, NULL, '', 'dir')",
+            "INSERT OR IGNORE INTO nodes(ino, parent_ino, name, kind, node_id) VALUES (?1, NULL, '', 'dir', 'root')",
             params![ROOT_INO as i64],
         )?;
         Ok(Self {
@@ -242,9 +265,10 @@ impl SqliteProvider {
         if Kind::from_str(&pkind) != Kind::Dir {
             return Err(FsError::NotADirectory);
         }
+        let node_id = uuid::Uuid::new_v4().to_string();
         let res = conn.execute(
-            "INSERT INTO nodes(parent_ino, name, kind) VALUES (?1, ?2, ?3)",
-            params![parent as i64, name, kind.as_str()],
+            "INSERT INTO nodes(parent_ino, name, kind, node_id) VALUES (?1, ?2, ?3, ?4)",
+            params![parent as i64, name, kind.as_str(), node_id],
         );
         match res {
             Ok(_) => {}
@@ -260,6 +284,67 @@ impl SqliteProvider {
             size: 0,
             mtime: 0,
         })
+    }
+
+    /// The stable server id for a local inode (`None` if the inode is gone).
+    pub fn node_id_for(&self, ino: u64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Export the whole tree as sync-ready descriptors for pushing to the server.
+    /// Excludes the root; a top-level node's `parent_node_id` is `None`.
+    pub fn export_tree(&self) -> Result<Vec<SyncNode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT n.node_id, n.name, n.kind, n.manifest_id,
+                    CASE WHEN n.parent_ino = ?1 THEN NULL ELSE p.node_id END
+             FROM nodes n LEFT JOIN nodes p ON p.ino = n.parent_ino
+             WHERE n.ino != ?1
+             ORDER BY n.ino",
+        )?;
+        let rows = stmt.query_map(params![ROOT_INO as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (node_id, name, kind_s, manifest_id, parent_node_id) = row?;
+            let chunks = match &manifest_id {
+                Some(m) => Self::manifest_rows(&conn, m)?,
+                None => Vec::new(),
+            };
+            out.push(SyncNode {
+                node_id,
+                parent_node_id,
+                name,
+                kind: Kind::from_str(&kind_s),
+                manifest_id,
+                chunks,
+            });
+        }
+        Ok(out)
+    }
+
+    fn manifest_rows(conn: &Connection, manifest_id: &str) -> Result<Vec<ChunkLoc>> {
+        let mut stmt = conn.prepare(
+            "SELECT chunk_hash, offset, length FROM manifest_chunks WHERE manifest_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![manifest_id], |r| {
+            Ok(ChunkLoc {
+                hash: r.get::<_, String>(0)?,
+                offset: r.get::<_, i64>(1)? as u64,
+                length: r.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 }
 
@@ -509,6 +594,39 @@ mod tests {
         assert_eq!(&out[500..510], &[9u8; 10]);
         assert_eq!(out[0], 1);
         assert_eq!(out[1999], 1);
+    }
+
+    #[test]
+    fn export_tree_yields_sync_nodes() {
+        let p = provider();
+        let dir = p.mkdir(ROOT_INO, "proj").unwrap();
+        let f = p.create(dir.ino, "part.bin").unwrap();
+        p.write(f.ino, 0, &vec![5u8; 1500]).unwrap();
+        p.flush(f.ino).unwrap();
+
+        let nodes = p.export_tree().unwrap();
+        assert_eq!(nodes.len(), 2);
+
+        let dir_n = nodes.iter().find(|n| n.name == "proj").unwrap();
+        assert!(dir_n.parent_node_id.is_none(), "top-level dir has no parent");
+        assert_eq!(dir_n.kind, Kind::Dir);
+
+        let file_n = nodes.iter().find(|n| n.name == "part.bin").unwrap();
+        assert_eq!(file_n.parent_node_id.as_ref(), Some(&dir_n.node_id),
+                   "file's parent_node_id is the dir's node_id");
+        assert!(file_n.manifest_id.is_some());
+        assert!(!file_n.chunks.is_empty(), "file carries its manifest chunks");
+    }
+
+    #[test]
+    fn node_ids_are_unique_and_stable() {
+        let p = provider();
+        let a = p.mkdir(ROOT_INO, "a").unwrap();
+        let b = p.mkdir(ROOT_INO, "b").unwrap();
+        let ida = p.node_id_for(a.ino).unwrap().unwrap();
+        let idb = p.node_id_for(b.ino).unwrap().unwrap();
+        assert_ne!(ida, idb);
+        assert_eq!(p.node_id_for(a.ino).unwrap().unwrap(), ida, "stable across calls");
     }
 
     #[test]
