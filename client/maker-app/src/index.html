@@ -25,8 +25,7 @@
     <label for="email">Account email (same email = same library)</label>
     <input id="email" value="maker@example.com" />
 
-    <label for="mount">Mount point — macOS/Linux: a directory (e.g. <code>~/Maker</code>);
-      Windows: a free drive letter (e.g. <code>Z:</code>)</label>
+    <label id="mountLabel" for="mount">Mount point</label>
     <input id="mount" value="/tmp/MakerDrive" />
 
     <div class="row">
@@ -69,6 +68,21 @@
       };
 
       document.getElementById("refreshBtn").onclick = refresh;
+
+      // Default the mount point per-OS: a free drive letter on Windows, a directory else.
+      (async () => {
+        try {
+          const os = await invoke("platform");
+          const label = document.getElementById("mountLabel");
+          const input = document.getElementById("mount");
+          if (os === "windows") {
+            input.value = "Z:";
+            label.innerHTML = "Mount point — a free <b>drive letter</b> (e.g. <code>Z:</code>)";
+          } else {
+            label.innerHTML = "Mount point — a directory (e.g. <code>~/Maker</code>)";
+          }
+        } catch (_) { /* leave the default */ }
+      })();
 
       refresh();
       setInterval(refresh, 3000);

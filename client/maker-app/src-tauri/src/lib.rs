@@ -83,11 +83,18 @@ fn sync_status(state: State<AppState>) -> String {
     }
 }
 
+/// The OS (`"windows"`/`"macos"`/`"linux"`), so the frontend can default the mount point
+/// sensibly — a drive letter on Windows, a directory elsewhere.
+#[tauri::command]
+fn platform() -> &'static str {
+    std::env::consts::OS
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![sync_start, sync_stop, sync_status])
+        .invoke_handler(tauri::generate_handler![sync_start, sync_stop, sync_status, platform])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
