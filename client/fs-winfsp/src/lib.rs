@@ -375,7 +375,11 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
 /// Mount `provider` at `mountpoint` (e.g. `"Z:"` or a directory) and serve until the
 /// process exits (WinFsp auto-unmounts on exit). Blocking.
 pub fn mount_blocking<P: Provider + 'static>(provider: P, mountpoint: &str) -> Result<()> {
-    let _init = winfsp::winfsp_init_or_die(); // must stay alive for the mount's lifetime
+    eprintln!("initializing WinFsp…");
+    // `winfsp_init()` (vs `_or_die`) so a load/version failure surfaces as an error
+    // instead of silently exiting the process. Must stay alive for the mount's lifetime.
+    let _init = winfsp::winfsp_init()?;
+    eprintln!("WinFsp initialized; mounting at {mountpoint}…");
 
     let mut params = VolumeParams::new();
     params
