@@ -1,0 +1,27 @@
+[package]
+name = "fs-winfsp"
+version = "0.1.0"
+edition = "2021"
+description = "WinFsp adapter for fs-provider (the Windows counterpart to fs-fuse). Maps WinFsp's FileSystemContext onto the platform-agnostic Provider. Windows-only."
+license = "Apache-2.0"
+
+[dependencies]
+fs-provider = { path = "../fs-provider" }
+
+# Windows-only: the WinFsp binding + helpers. On other platforms the crate compiles to
+# an empty lib (everything real is behind `#[cfg(windows)]`), so it never breaks the
+# macOS/Linux builds.
+[target.'cfg(windows)'.dependencies]
+winfsp = "0.13"
+widestring = "1"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = "0.13"
+
+[[bin]]
+name = "maker-mount-win"
+path = "src/bin/maker-mount-win.rs"
