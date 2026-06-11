@@ -2,13 +2,24 @@
 
 The app registers a device, mounts the local-first filesystem, and runs the sync
 daemon (push on save, pull on a `{head_seq}` nudge / poll, hydrate on read) — all
-in one process. Mounting uses **FUSE** (`fuser`): **macOS and Linux today**.
-**Windows mounting is not wired yet** (it needs the winfsp-rs adapter, CLAUDE.md
-§12 step 4) — the app still builds and launches on Windows, but the mount button
-returns a clear "not supported yet" message. See [§Windows](#windows) below.
+in one process. The mount backend is chosen per platform:
 
-The backend lives in `src-tauri/src/lib.rs` (commands `sync_start` / `sync_stop` /
-`sync_status`), driving `sync_engine::Daemon`.
+- **macOS:** **WebDAV** — the app serves the tree over localhost and mounts it with the
+  built-in `/sbin/mount_webdav`. **No FUSE, no kext, no FSKit** (FUSE-T can't mount on
+  macOS 26). The drive shows in Finder under *Locations* as "Maker". This is the default
+  and it just works.
+- **Linux:** **FUSE** (`fuser`) — mounts natively.
+- **Windows:** not wired yet (needs the winfsp-rs adapter, CLAUDE.md §12 step 4); the app
+  builds + launches but the mount button returns a clear message. See [§Windows](#windows).
+
+The backend lives in `src-tauri/src/lib.rs` (commands `sync_start`/`sync_stop`/
+`sync_status`) via a per-OS `Mount` alias — `sync_engine::WebdavMount` on macOS,
+`sync_engine::Daemon` (FUSE) on Linux.
+
+> **macOS build note:** at runtime macOS needs nothing FUSE-related (WebDAV is native).
+> But `cargo tauri dev` currently still *compiles* the FUSE `fuser` crate (used on Linux,
+> pulled in unconditionally), so the FUSE-T pkg-config alias below is needed to **build**
+> on macOS — not to run. (Follow-up: gate `fuser` out of macOS builds.)
 
 ---
 
@@ -61,19 +72,14 @@ The backend lives in `src-tauri/src/lib.rs` (commands `sync_start` / `sync_stop`
   export PKG_CONFIG_PATH=/tmp/fuse-pc:/usr/local/lib/pkgconfig
   ```
   (The FUSE-T runtime rpath is baked in by `src-tauri/.cargo/config.toml`.)
-- **macOS only — use the NFS-based FUSE-T, not the FSKit build.** FUSE-T ≥1.1 ships an
-  experimental **FSKit** backend and makes it the default on macOS 26+. The library
-  loads and the app runs, but the mount silently never establishes — the symptom is the
-  app flips back to "unmounted" and the console loops `sync loop started / sync loop
-  stopped`. FSKit modules are third-party extensions that must be enabled in System
-  Settings → General → Login Items & Extensions → File System Extensions, and that
-  toggle is frequently greyed/broken on current macOS. Install the **standard
-  (NFS-based) FUSE-T** installer from https://github.com/macos-fuse-t/fuse-t/releases
-  (the plain `fuse-t` pkg, **not** the `*-fskit` one) — it mounts via a local NFS
-  loopback with no extension approval. If you're stuck on the FSKit build, build the
-  **Linux** client instead (`maker-app/Dockerfile.linux-build`); libfuse on Linux has
-  none of this. (Verified the known-good `maker-mount` fails identically with the FSKit
-  build, so this is FUSE-T-vs-macOS, not the app.)
+- **macOS — FUSE-T is no longer needed to run** (the app mounts via WebDAV). This note
+  only matters if you specifically want the `fs-fuse`/`maker-mount` path on macOS: FUSE-T
+  ≥1.1 defaults to an experimental **FSKit** backend on macOS 26+ that silently never
+  mounts (the third-party FSKit extension toggle in System Settings → Login Items &
+  Extensions → File System Extensions is frequently greyed/broken). For raw FUSE on
+  macOS, install the **NFS-based** FUSE-T (the plain `fuse-t` pkg from
+  https://github.com/macos-fuse-t/fuse-t/releases, **not** the `*-fskit` one). The app
+  itself sidesteps all of this with WebDAV, so you can ignore it.
 
 ### 2. Start the sync server (from the repo root, separate terminal)
 
