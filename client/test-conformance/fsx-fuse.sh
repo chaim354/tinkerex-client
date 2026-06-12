@@ -45,9 +45,10 @@ mountpoint -q "$MNT" || { echo "FAIL: mount didn't come up"; cat "$WORK/mount.lo
 echo "==> fetching + building fsx (Apple/FreeBSD, APSL-2.0, fetched not vendored)"
 FSX_URL="https://raw.githubusercontent.com/freebsd/freebsd-src/main/tools/regression/fsx/fsx.c"
 curl -fsSL "$FSX_URL" -o "$WORK/fsx.c" || { echo "FAIL: couldn't fetch fsx from $FSX_URL"; exit 1; }
-# -include time.h: the source uses clock_gettime without including <time.h>; -lrt covers
-# clock_gettime on older glibc (a harmless no-op on newer).
-cc -O2 -D_GNU_SOURCE -include time.h -o "$WORK/fsx" "$WORK/fsx.c" -lrt 2>"$WORK/cc.log" \
+# The source omits a couple of headers that macOS pulls in transitively but strict Linux
+# gcc does not: <time.h> (clock_gettime) and <stdint.h> (uintptr_t). Force-include both;
+# -lrt covers clock_gettime on older glibc (a harmless no-op on newer).
+cc -O2 -D_GNU_SOURCE -include stdint.h -include time.h -o "$WORK/fsx" "$WORK/fsx.c" -lrt 2>"$WORK/cc.log" \
   || { echo "FAIL: fsx didn't compile"; cat "$WORK/cc.log"; exit 1; }
 
 # -W / -R disable mmap writes/reads (FUSE mmap is out of scope); the rest is plain
