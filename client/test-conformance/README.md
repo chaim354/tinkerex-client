@@ -37,3 +37,6 @@ Ubuntu runner: `webdav-rclone` and `fsx-fuse` gate the build; `pjdfstest-fuse` r
 - pjdfstest will report failures in chmod/chown/symlink/hardlink/xattr tests — **expected**:
   our sync mount intentionally doesn't expose POSIX permissions or links.
 - fsx runs with mmap disabled (`-W -R`) — FUSE mmap is out of scope for now.
+- fsx (Apple's exerciser) is **APSL-2.0** — copyleft, so we **fetch it at test time** from
+  FreeBSD's standalone copy rather than vendoring it, keeping our repo/artifacts permissive
+  (§9). Downloading + running a tool in CI is not redistribution.

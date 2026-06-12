@@ -38,9 +38,16 @@ MOUNT_PID=$!
 for _ in $(seq 1 50); do mountpoint -q "$MNT" && break; sleep 0.2; done
 mountpoint -q "$MNT" || { echo "FAIL: mount didn't come up"; cat "$WORK/mount.log"; exit 1; }
 
-echo "==> fetching + building fsx (xfstests/ltp)"
-curl -fsSL "https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git/plain/ltp/fsx.c" -o "$WORK/fsx.c"
-cc -O2 -D_GNU_SOURCE -o "$WORK/fsx" "$WORK/fsx.c" -lm 2>"$WORK/cc.log" \
+# fsx is Apple's filesystem exerciser (APSL-2.0). We FETCH it at test time rather than
+# vendoring — APSL is copyleft, and §9 keeps our repo/artifacts permissive; downloading
+# and running a tool in CI is not redistribution. FreeBSD carries a clean standalone copy.
+# (The xfstests ltp/fsx.c is NOT standalone — it needs xfstests' global.h.)
+echo "==> fetching + building fsx (Apple/FreeBSD, APSL-2.0, fetched not vendored)"
+FSX_URL="https://raw.githubusercontent.com/freebsd/freebsd-src/main/tools/regression/fsx/fsx.c"
+curl -fsSL "$FSX_URL" -o "$WORK/fsx.c" || { echo "FAIL: couldn't fetch fsx from $FSX_URL"; exit 1; }
+# -include time.h: the source uses clock_gettime without including <time.h>; -lrt covers
+# clock_gettime on older glibc (a harmless no-op on newer).
+cc -O2 -D_GNU_SOURCE -include time.h -o "$WORK/fsx" "$WORK/fsx.c" -lrt 2>"$WORK/cc.log" \
   || { echo "FAIL: fsx didn't compile"; cat "$WORK/cc.log"; exit 1; }
 
 # -W / -R disable mmap writes/reads (FUSE mmap is out of scope); the rest is plain
