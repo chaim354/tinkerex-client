@@ -721,9 +721,18 @@ impl Provider for SqliteProvider {
                 return Ok(());
             }
         }
-        // Not open for write (e.g. a bare `truncate(2)` syscall): seed from the
-        // committed content, resize, and commit immediately so the new length — and its
-        // outbox entry — is durable even when no write follows.
+        // Truncating to empty discards everything, so it must NOT read the old content
+        // first — that would assemble the committed chunks and fail on a pulled-but-
+        // unhydrated placeholder (the `O_TRUNC` overwrite of a not-yet-downloaded file,
+        // a routine mount operation). Short-circuit to an empty buffer.
+        if size == 0 {
+            self.staging.lock().unwrap().insert(ino, Vec::new());
+            return self.flush(ino);
+        }
+        // Otherwise (a bare `truncate(n)` to a non-zero size): seed from the committed
+        // content, resize, and commit immediately so the new length — and its outbox
+        // entry — is durable even when no write follows. Growing/partial-shrink needs
+        // the prefix bytes [0, n), so this path does require the file to be hydrated.
         let mut content = self.current_content(ino)?;
         content.resize(size as usize, 0);
         self.staging.lock().unwrap().insert(ino, content);
@@ -780,24 +789,53 @@ impl Provider for SqliteProvider {
     }
 
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let node_id: Option<String> = conn
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Source must exist.
+        let src: Option<(i64, String)> = tx
             .query_row(
-                "SELECT node_id FROM nodes WHERE parent_ino = ?1 AND name = ?2",
+                "SELECT ino, node_id FROM nodes WHERE parent_ino = ?1 AND name = ?2",
                 params![parent as i64, name],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let n = conn.execute(
-            "UPDATE nodes SET parent_ino = ?1, name = ?2 WHERE parent_ino = ?3 AND name = ?4",
-            params![newparent as i64, newname, parent as i64, name],
+        let (src_ino, src_id) = src.ok_or(FsError::NotFound)?;
+
+        // POSIX rename atomically *replaces* an occupied destination (the atomic-save
+        // pattern: write `f.tmp`, rename `f.tmp` → `f`). Without this the unique
+        // (parent, name) index turns every such save into a constraint error.
+        let dst: Option<(i64, String, String)> = tx
+            .query_row(
+                "SELECT ino, node_id, kind FROM nodes WHERE parent_ino = ?1 AND name = ?2",
+                params![newparent as i64, newname],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((dst_ino, dst_id, dst_kind)) = dst {
+            if dst_ino == src_ino {
+                return Ok(()); // rename onto itself — no-op
+            }
+            // A directory destination must be empty (ENOTEMPTY otherwise); a file is
+            // simply displaced. The displaced node is tombstoned so the deletion
+            // propagates on push (otherwise other devices keep a duplicate).
+            if Kind::from_str(&dst_kind) == Kind::Dir {
+                let kids: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM nodes WHERE parent_ino = ?1", params![dst_ino], |r| r.get(0))?;
+                if kids > 0 {
+                    return Err(FsError::NotEmpty);
+                }
+            }
+            tx.execute("DELETE FROM nodes WHERE ino = ?1", params![dst_ino])?;
+            Self::enqueue(&tx, &dst_id, "delete")?;
+        }
+
+        tx.execute(
+            "UPDATE nodes SET parent_ino = ?1, name = ?2 WHERE ino = ?3",
+            params![newparent as i64, newname, src_ino],
         )?;
-        if n == 0 {
-            return Err(FsError::NotFound);
-        }
-        if let Some(id) = node_id {
-            Self::enqueue(&conn, &id, "upsert")?;
-        }
+        Self::enqueue(&tx, &src_id, "upsert")?;
+        tx.commit()?;
         Ok(())
     }
 }

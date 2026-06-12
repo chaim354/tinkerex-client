@@ -12,3 +12,8 @@ sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# Property-based testing (MIT/Apache, dev-only — not shipped, so no §9 concern).
+# Used by the chunking + convergence suites for shrinking to minimal reproducers.
+proptest = "1"
