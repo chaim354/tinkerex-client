@@ -126,6 +126,11 @@ pub struct VersionView {
 pub struct ChangesResponse {
     pub changes: Vec<Change>,
     pub head_seq: i64,
+    /// The oldest changelog seq the server still retains. If a client's cursor is below
+    /// `oldest_seq - 1`, the entries it needs were pruned and it must full-resync.
+    /// Defaults to 0 for back-compat with servers that don't report it.
+    #[serde(default)]
+    pub oldest_seq: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,9 +260,17 @@ impl ServerClient {
     }
 
     pub fn changes(&self, since: i64) -> Result<ChangesResponse> {
+        self.changes_paged(since, 500)
+    }
+
+    /// Like [`changes`](Self::changes) but with an explicit page size. The server caps a
+    /// single delta to this many entries, so a caller that's far behind must page until
+    /// caught up (see `SyncEngine::pull_changes`). Exposed so tests can force multi-page
+    /// pulls with a small `limit` instead of fabricating hundreds of entries.
+    pub fn changes_paged(&self, since: i64, limit: i64) -> Result<ChangesResponse> {
         let resp = self
             .authed(self.http.get(self.url("/v1/changes")))?
-            .query(&[("since", since.to_string())])
+            .query(&[("since", since.to_string()), ("limit", limit.to_string())])
             .send()?;
         Self::json(resp)
     }

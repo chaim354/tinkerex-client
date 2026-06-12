@@ -139,7 +139,7 @@ impl SyncEngine {
     /// Initial sync: apply the full-tree snapshot (paginated) to the local provider.
     pub fn pull_snapshot(provider: &SqliteProvider, client: &ServerClient) -> Result<i64> {
         let mut after = 0;
-        let mut head = 0;
+        let mut head;
         loop {
             let tree = client.tree(after)?;
             head = tree.head_seq;
@@ -155,23 +155,48 @@ impl SyncEngine {
     }
 
     /// Incremental: apply changelog entries since `cursor`. Returns the new cursor.
+    /// Pages through the delta — the server caps each response, so a device that's many
+    /// changes behind (the offline-reconnect case) **must** loop or it silently skips
+    /// every entry past the first page. Uses the default page size.
     pub fn pull_changes(provider: &SqliteProvider, client: &ServerClient, cursor: i64) -> Result<i64> {
-        let resp = client.changes(cursor)?;
-        for ch in &resp.changes {
-            // The server soft-deletes, so a `delete` change still carries the node
-            // (with `deleted: true`). Treat either signal as a delete and remove the
-            // node — and any descendants — locally. A *move* is not a delete: the
-            // server models it as op `move` on the same stable node_id with a new
-            // parent/name, so it falls through to `apply_remote` below and updates the
-            // existing row in place (no delete, no duplicate).
-            let deleted = ch.node.as_ref().is_some_and(|n| n.deleted);
-            if ch.op == "delete" || deleted {
-                provider.apply_remote_delete(&ch.node_id)?;
-            } else if let Some(sn) = change_to_sync(ch) {
-                provider.apply_remote(&sn)?;
+        Self::pull_changes_paged(provider, client, cursor, 500)
+    }
+
+    /// [`pull_changes`](Self::pull_changes) with an explicit page size (for tests that
+    /// want to force multi-page pulls cheaply). Loops `changes(cursor, page)` until the
+    /// device is caught up, advancing the cursor to the **last applied entry's seq** each
+    /// round — never to the global `head_seq`, which would jump past un-applied entries.
+    pub fn pull_changes_paged(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        mut cursor: i64,
+        page: i64,
+    ) -> Result<i64> {
+        let mut checked_floor = false;
+        loop {
+            let resp = client.changes_paged(cursor, page)?;
+
+            // Full-resync backstop: if the changelog was pruned past our cursor, the
+            // delta has a hole (we'd silently skip the pruned entries). Detect it on the
+            // first round via `oldest_seq` and fall back to a full snapshot instead. A
+            // fresh device (cursor 0, nothing pruned → oldest_seq ≤ 1) never trips this.
+            if !checked_floor {
+                checked_floor = true;
+                if resp.oldest_seq > cursor + 1 {
+                    return Self::pull_snapshot(provider, client);
+                }
             }
+
+            if resp.changes.is_empty() {
+                // Caught up: no more entries beyond `cursor`. head_seq is the new floor.
+                return Ok(resp.head_seq.max(cursor));
+            }
+            for ch in &resp.changes {
+                apply_change(provider, ch)?;
+            }
+            // Advance only as far as we actually applied; loop for the next page.
+            cursor = resp.changes.last().map(|c| c.seq).unwrap_or(cursor);
         }
-        Ok(resp.head_seq)
     }
 
     /// Hydrate a file's chunks from the cloud into the local cache.
@@ -310,6 +335,21 @@ fn tree_node_to_sync(n: &TreeNode) -> SyncNode {
         manifest_id,
         chunks,
     }
+}
+
+/// Apply one changelog entry to the local tree. The server soft-deletes, so a `delete`
+/// change still carries the node (with `deleted: true`); treat either signal as a delete
+/// and remove the node — and any descendants — locally. A *move* is not a delete: the
+/// server models it as op `move` on the same stable node_id with a new parent/name, so it
+/// falls through to `apply_remote` and updates the existing row in place (no duplicate).
+fn apply_change(provider: &SqliteProvider, ch: &Change) -> Result<()> {
+    let deleted = ch.node.as_ref().is_some_and(|n| n.deleted);
+    if ch.op == "delete" || deleted {
+        provider.apply_remote_delete(&ch.node_id)?;
+    } else if let Some(sn) = change_to_sync(ch) {
+        provider.apply_remote(&sn)?;
+    }
+    Ok(())
 }
 
 fn change_to_sync(ch: &Change) -> Option<SyncNode> {
