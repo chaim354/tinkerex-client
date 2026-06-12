@@ -44,20 +44,24 @@ git clone --depth 1 https://github.com/pjd/pjdfstest "$WORK/pjd" >/dev/null 2>&1
 ( cd "$WORK/pjd" && autoreconf -ifs >/dev/null 2>&1 && ./configure >/dev/null 2>&1 && make pjdfstest >/dev/null 2>&1 ) \
   || { echo "FAIL: pjdfstest didn't build"; exit 1; }
 
-echo "==> running the supported subset (informational)"
-echo "    op        result"
+echo "==> running the supported subset (informational conformance map)"
+echo "    op        passed / total subtests"
 echo "    --------  -----------------------------------------"
-overall_ok=0 overall_total=0
 cd "$MNT"
 for op in "${SUBSET[@]}"; do
   dir="$WORK/pjd/tests/$op"
   [ -d "$dir" ] || { printf "    %-8s  (no tests)\n" "$op"; continue; }
   # Each .t locates the pjdfstest binary relative to itself (../../pjdfstest), and the
-  # filesystem under test is the CWD ($MNT). prove emits a TAP summary; capture it
-  # without aborting.
+  # filesystem under test is the CWD ($MNT). Parse the TAP totals so this is a real
+  # pass/total map, not just FAIL — perms/owner tests are expected to fail (see below).
   out=$(prove -Qr "$dir" 2>&1) || true
-  summary=$(printf '%s\n' "$out" | grep -Ei 'Result:|Failed|All tests' | tail -1)
-  printf "    %-8s  %s\n" "$op" "${summary:-ran (see TAP output)}"
+  total=$(printf '%s\n' "$out" | grep -oE 'Tests=[0-9]+' | head -1 | grep -oE '[0-9]+')
+  failed=$(printf '%s\n' "$out" | grep -oE 'Failed: [0-9]+' | awk '{s+=$2} END{print s+0}')
+  if [ -n "${total:-}" ]; then
+    printf "    %-8s  %s / %s passed\n" "$op" "$((total - ${failed:-0}))" "$total"
+  else
+    printf "    %-8s  %s\n" "$op" "$(printf '%s\n' "$out" | grep -Ei 'All tests|Result' | tail -1)"
+  fi
 done
 
 echo
