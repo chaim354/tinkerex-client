@@ -108,6 +108,10 @@ pub struct CfApiMountHandle {
     /// pattern OneDrive uses. The handle holds the watch dir HANDLE (closed on Drop to unblock
     /// the synchronous read) + the thread to join.
     watcher: Option<NewFileWatcher>,
+    /// B6.2: set true by [`remove_library`](CfApiMountHandle::remove_library) once it has
+    /// disconnected + unregistered the sync root. Drop then skips its own disconnect (the
+    /// connection is already gone) so we never double-disconnect or touch a stale key.
+    torn_down: bool,
 }
 
 // The raw `*mut CfState` is only ever touched behind the connection (single owner); the
@@ -258,6 +262,7 @@ pub fn mount_full(
         stop: Arc::new(AtomicBool::new(false)),
         shutting_down,
         watcher,
+        torn_down: false,
     })
 }
 
@@ -1296,10 +1301,70 @@ impl CfApiMountHandle {
     pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
         self.shutting_down.clone()
     }
+
+    /// **B6.2 — fully remove this library** (the opposite of the offline-by-default `Drop`). Use
+    /// this for an explicit "Stop syncing / remove this library" action, NOT on every unmount:
+    /// it tears the connection down AND **unregisters the sync root** (`CfUnregisterSyncRoot`), so
+    /// no orphaned sync root is left behind (a re-register at the same path would otherwise hit a
+    /// stale registration). When `delete_folder` is true it also removes the now-plain folder and
+    /// its contents — choose that when the user wants the local copies gone too; pass false to keep
+    /// the (now ordinary, fully-hydrated) files on disk.
+    ///
+    /// Consumes the handle so it can't be used afterward and Drop won't double-disconnect.
+    /// Ordering matches the safe teardown: enter shutdown → stop+join the watcher → disconnect →
+    /// unregister → (optional) delete. Each step is best-effort + logged; a failure in one doesn't
+    /// abort the rest (we still want to unregister even if the folder delete fails, etc.).
+    pub fn remove_library(mut self, delete_folder: bool) -> std::io::Result<()> {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        if let Some(mut w) = self.watcher.take() {
+            w.shutdown();
+        }
+        unsafe {
+            // Disconnect first (drops the callback connection) so the unregister can't race a
+            // callback. Reclaim the leaked CfState box.
+            if let Some(key) = (*self.state).connection_key.lock().unwrap().take() {
+                let _ = CfDisconnectSyncRoot(key);
+            }
+        }
+        // Unregister the sync root so nothing orphaned remains. This is the whole point of the
+        // "remove" path vs the offline-keeping Drop.
+        let root_w = path_wide(&self.root);
+        let unregister = unsafe { CfUnregisterSyncRoot(PCWSTR(root_w.as_ptr())) };
+        if let Err(e) = &unregister {
+            eprintln!("cfapi: CfUnregisterSyncRoot({}) failed: {e}", self.root.display());
+        } else {
+            eprintln!("cfapi: unregistered sync root {}", self.root.display());
+        }
+        // Optionally remove the now-plain folder + contents.
+        let mut folder_err = None;
+        if delete_folder {
+            if let Err(e) = std::fs::remove_dir_all(&self.root) {
+                eprintln!("cfapi: remove_dir_all({}) failed: {e}", self.root.display());
+                folder_err = Some(e);
+            } else {
+                eprintln!("cfapi: removed library folder {}", self.root.display());
+            }
+        }
+        // Mark torn down + reclaim the state box, so Drop is a no-op.
+        self.torn_down = true;
+        unsafe { drop(Box::from_raw(self.state)); }
+        // Surface a failure (unregister first, then folder delete) so a caller/UI can report it.
+        unregister.map_err(win_err)?;
+        if let Some(e) = folder_err {
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CfApiMountHandle {
     fn drop(&mut self) {
+        // B6.2: if `remove_library` already tore everything down (disconnected, unregistered, and
+        // reclaimed the CfState box), Drop must do nothing — the connection is gone and `state` is
+        // a dangling pointer we must not touch or free again.
+        if self.torn_down {
+            return;
+        }
         // Enter teardown (idempotent — the owner usually called begin_shutdown already): from here
         // callbacks still mirror changes into the provider/outbox but skip re-entrant CfAPI calls
         // (convert/set-in-sync/ACK/invalidate), which can deadlock the runtime while the connection

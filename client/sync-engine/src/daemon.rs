@@ -585,6 +585,36 @@ impl CfApiMount {
         self.handle.as_ref().is_some_and(|h| h.is_running())
     }
 
+    /// **B6.2 — fully remove this library** (explicit "Stop syncing / remove this library" action,
+    /// NOT the offline-keeping `stop`/`Drop`). Stops the sync threads, drains the outbox so a
+    /// just-made local change still pushes, then unregisters the CfAPI sync root via
+    /// [`CfApiMountHandle::remove_library`] (leaving no orphaned sync root). `delete_folder` also
+    /// removes the local folder + its (now plain) files. Consumes the mount.
+    pub fn remove_library(mut self, delete_folder: bool) -> crate::Result<()> {
+        // Same ordered, deadlock-free teardown as `stop`, but the handle is *removed* not dropped.
+        if let Some(h) = &self.handle {
+            h.begin_shutdown();
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        let handle = self.handle.take();
+        // Drain the outbox (push the final captured change) before we unregister, mirroring `stop`.
+        self.shutdown_drain();
+        if let Some(h) = self.sync_handle.take() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
+        if let Some(h) = handle {
+            h.remove_library(delete_folder)?; // std::io::Error → crate::Error::Io via #[from]
+        }
+        eprintln!("cfapi: library removed (sync root unregistered{})", if delete_folder { " + folder deleted" } else { "" });
+        Ok(())
+    }
+
     pub fn stop(&mut self) {
         // Ordered teardown that's deadlock-free AND can't drop the captured edit/delete/rename,
         // even though CfAPI delivers its batched NOTIFY callbacks at unmount and the sync thread's
