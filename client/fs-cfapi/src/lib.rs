@@ -217,7 +217,7 @@ pub fn plan_transfer_chunks(
     // Round req_end UP to a page so a non-final chunk stays page-aligned; the chunk that
     // actually reaches EOF is then clamped to file_size below (its short length is the one
     // CfAPI permits).
-    let req_end_ceil = ((req_end + TRANSFER_BLOCK - 1) / TRANSFER_BLOCK) * TRANSFER_BLOCK;
+    let req_end_ceil = req_end.div_ceil(TRANSFER_BLOCK) * TRANSFER_BLOCK;
 
     let mut chunks = Vec::new();
     let mut off = start;
