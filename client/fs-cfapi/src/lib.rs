@@ -282,6 +282,66 @@ pub fn pin_hydration_action(pin: PinState, kind: Kind) -> HydrationAction {
     }
 }
 
+/// An **ino → absolute-path** index for O(1) placeholder-path resolution.
+///
+/// `CfApiInvalidate` (and the close/rename callbacks) need a node's on-disk path to open it for
+/// `CfUpdatePlaceholder` / dehydrate / create. Walking the provider tree per lookup is O(tree).
+/// Instead we populate this index incrementally **during `FETCH_PLACEHOLDERS`**: every time we
+/// enumerate a directory's children we already know the dir's path and each child's name, so we
+/// can record `child_ino → dir_path/child_name` for free. Later resolution is then a hash lookup.
+///
+/// It's a *cache*, not the source of truth, so it's correct to be lossy:
+/// - A **rename** moves a node; its cached path goes stale. We expose [`invalidate`](Self::invalidate)
+///   so the rename path drops the entry (and the subtree under a moved dir is re-learned on the
+///   next enumeration). A caller that can't prove the cache is fresh should fall back to a tree
+///   walk on a miss (the Windows layer does).
+/// - A **delete** removes the node; [`invalidate`](Self::invalidate) drops it.
+///
+/// Pure + cross-platform (just `u64 → PathBuf`), so the indexing logic is unit-tested on any host.
+#[derive(Debug, Default)]
+pub struct PathIndex {
+    map: std::sync::Mutex<std::collections::HashMap<u64, std::path::PathBuf>>,
+}
+
+impl PathIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a node's absolute path (learned during enumeration). Overwrites any stale entry —
+    /// the most recent enumeration is authoritative for a given ino.
+    pub fn insert(&self, ino: u64, path: std::path::PathBuf) {
+        self.map.lock().unwrap().insert(ino, path);
+    }
+
+    /// Record every child of a just-enumerated directory: `dir_path.join(name)` per `(ino, name)`.
+    /// Called from `FETCH_PLACEHOLDERS`, where we hold the dir's path and its children's names.
+    pub fn insert_children<'a, I>(&self, dir_path: &std::path::Path, children: I)
+    where
+        I: IntoIterator<Item = (u64, &'a str)>,
+    {
+        let mut map = self.map.lock().unwrap();
+        for (ino, name) in children {
+            map.insert(ino, dir_path.join(name));
+        }
+    }
+
+    /// O(1) lookup. `None` on a miss (caller falls back to a tree walk).
+    pub fn get(&self, ino: u64) -> Option<std::path::PathBuf> {
+        self.map.lock().unwrap().get(&ino).cloned()
+    }
+
+    /// Drop a node's cached path (after a rename/delete made it stale). Idempotent.
+    pub fn invalidate(&self, ino: u64) {
+        self.map.lock().unwrap().remove(&ino);
+    }
+
+    /// Drop every cached entry (e.g. a library rebind wiped the tree).
+    pub fn clear(&self) {
+        self.map.lock().unwrap().clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +588,52 @@ mod tests {
         for pin in [PinState::Pinned, PinState::Unpinned, PinState::Other] {
             assert_eq!(pin_hydration_action(pin, Kind::Dir), HydrationAction::None);
         }
+    }
+
+    // --- B6.4: ino → path index ---------------------------------------------------------
+
+    #[test]
+    fn path_index_inserts_children_under_their_dir() {
+        use std::path::{Path, PathBuf};
+        // Use a platform-agnostic dir so `join` (which uses the host separator) is deterministic
+        // on the macOS test host; on Windows the same code joins with `\`. The logic is identical.
+        let idx = PathIndex::new();
+        let dir = Path::new("root").join("proj");
+        idx.insert_children(&dir, [(10u64, "a.stl"), (11u64, "sub")]);
+        assert_eq!(idx.get(10), Some(PathBuf::from("root").join("proj").join("a.stl")));
+        assert_eq!(idx.get(11), Some(PathBuf::from("root").join("proj").join("sub")));
+        assert_eq!(idx.get(99), None, "unknown ino → miss");
+    }
+
+    #[test]
+    fn path_index_invalidate_drops_a_stale_entry() {
+        use std::path::PathBuf;
+        let idx = PathIndex::new();
+        idx.insert(5, PathBuf::from(r"C:\x\old.txt"));
+        assert!(idx.get(5).is_some());
+        idx.invalidate(5);
+        assert_eq!(idx.get(5), None, "invalidated entry is gone");
+        idx.invalidate(5); // idempotent
+    }
+
+    #[test]
+    fn path_index_latest_enumeration_wins() {
+        use std::path::PathBuf;
+        // A re-enumeration after a move records the new path, overwriting the stale one.
+        let idx = PathIndex::new();
+        idx.insert(7, PathBuf::from(r"C:\x\here.txt"));
+        idx.insert(7, PathBuf::from(r"C:\x\moved\here.txt"));
+        assert_eq!(idx.get(7), Some(PathBuf::from(r"C:\x\moved\here.txt")));
+    }
+
+    #[test]
+    fn path_index_clear_empties_it() {
+        use std::path::PathBuf;
+        let idx = PathIndex::new();
+        idx.insert(1, PathBuf::from("/a"));
+        idx.insert(2, PathBuf::from("/b"));
+        idx.clear();
+        assert_eq!(idx.get(1), None);
+        assert_eq!(idx.get(2), None);
     }
 }

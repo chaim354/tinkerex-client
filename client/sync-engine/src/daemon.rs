@@ -507,10 +507,20 @@ impl CfApiMount {
         // it here, hand it to both the invalidator and the mount, and flip it in stop().
         let shutting_down = Arc::new(AtomicBool::new(false));
 
+        // B6.4: one ino→path index shared by the mount's FETCH_PLACEHOLDERS (populates it) and the
+        // invalidator (reads it for O(1) path resolution; drops stale entries on rename/delete).
+        let path_index = Arc::new(fs_cfapi::PathIndex::new());
+
         // Cache-invalidation hook over CfUpdatePlaceholder (no construction cycle here — CfAPI
-        // resolves paths + opens handles itself, so it needs no post-mount notifier).
+        // resolves paths + opens handles itself, so it needs no post-mount notifier). Share the
+        // path index so it benefits from enumeration-time path knowledge.
         let inval: Arc<dyn crate::Invalidate> = Arc::new(EngineCfInvalidate(
-            fs_cfapi::CfApiInvalidate::new(provider.clone(), cfg.mountpoint.clone(), shutting_down.clone()),
+            fs_cfapi::CfApiInvalidate::with_index(
+                provider.clone(),
+                cfg.mountpoint.clone(),
+                shutting_down.clone(),
+                path_index.clone(),
+            ),
         ));
 
         // Serialize the sync loop's push against the shutdown drain (see `push_gate` field).
@@ -545,12 +555,14 @@ impl CfApiMount {
         };
 
         // Register + connect (on-demand population via FETCH_PLACEHOLDERS). The handle keeps
-        // the sync root alive. Share the SAME teardown flag the invalidator holds.
-        let handle = fs_cfapi::win::mount_with_shutdown(
+        // the sync root alive. Share the SAME teardown flag the invalidator holds AND the same
+        // ino→path index it populates from FETCH_PLACEHOLDERS (B6.4).
+        let handle = fs_cfapi::win::mount_full(
             provider.clone(),
             &cfg.mountpoint,
             Some(hydrate),
             shutting_down.clone(),
+            path_index,
         )?;
         println!("CfAPI sync root at {}", cfg.mountpoint.display());
 

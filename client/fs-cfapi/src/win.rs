@@ -80,6 +80,11 @@ struct CfState {
     /// Shared (`Arc`) with the mount handle + the `CfApiInvalidate` so one flip covers EVERY
     /// re-entrant CfAPI path (callbacks AND the sync-loop pull's invalidate/create).
     shutting_down: Arc<AtomicBool>,
+    /// B6.4: ino→path index, populated as `FETCH_PLACEHOLDERS` enumerates each directory (we hold
+    /// the dir path + the children's names there), so `CfApiInvalidate::path_for` is O(1) on a hit
+    /// instead of an O(tree) DFS. Shared (`Arc`) with the invalidator, which reads it + drops stale
+    /// entries on rename/delete. A miss falls back to the tree walk, so it's always correct.
+    path_index: Arc<crate::PathIndex>,
 }
 
 /// A live CfAPI sync root: registered, connected, populated. Drop disconnects + unregisters.
@@ -172,6 +177,20 @@ pub fn mount_with_shutdown(
     hydrate: Option<Hydrate>,
     shutting_down: Arc<AtomicBool>,
 ) -> std::io::Result<CfApiMountHandle> {
+    mount_full(provider, root, hydrate, shutting_down, Arc::new(crate::PathIndex::new()))
+}
+
+/// [`mount_with_shutdown`] plus a caller-supplied [`PathIndex`] (B6.4). Pass the SAME `Arc` to the
+/// engine's `CfApiInvalidate` so the index populated by `FETCH_PLACEHOLDERS` here is the one the
+/// invalidator reads for O(1) path resolution. The engine wires this; the simpler entry points make
+/// their own index (harmless — the invalidator they don't have wouldn't share it anyway).
+pub fn mount_full(
+    provider: Arc<SqliteProvider>,
+    root: &Path,
+    hydrate: Option<Hydrate>,
+    shutting_down: Arc<AtomicBool>,
+    path_index: Arc<crate::PathIndex>,
+) -> std::io::Result<CfApiMountHandle> {
     std::fs::create_dir_all(root)?;
     register_sync_root(root)?;
 
@@ -182,6 +201,7 @@ pub fn mount_with_shutdown(
         root: root.to_path_buf(),
         self_writes: Mutex::new(HashMap::new()),
         shutting_down: shutting_down.clone(),
+        path_index,
     }));
 
     // The callback table must outlive the connection, so leak it (one small leak per mount).
@@ -431,18 +451,15 @@ fn register_sync_root(root: &Path) -> std::io::Result<()> {
 /// current tree. Each carries the child's `node_id` as `FileIdentity` and its real mtime.
 /// The returned holders own the name/identity backing storage the `CF_PLACEHOLDER_CREATE_INFO`
 /// pointers reference, so they must outlive the CfAPI call that consumes them.
-fn placeholders_for_dir(provider: &SqliteProvider, dir_ino: u64) -> Vec<PlaceholderHolder> {
-    let children = match provider.readdir(dir_ino) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("cfapi: readdir(ino {dir_ino}) failed: {e}");
-            return Vec::new();
-        }
-    };
+fn placeholders_for_children(
+    provider: &SqliteProvider,
+    children: &[fs_provider::DirEntry],
+) -> Vec<PlaceholderHolder> {
     let mut holders = Vec::new();
-    for c in &children {
-        let size = provider.getattr(c.ino).map(|a| a.size).unwrap_or(0);
-        let mtime = provider.getattr(c.ino).map(|a| a.mtime).unwrap_or(0);
+    for c in children {
+        let attr = provider.getattr(c.ino).ok();
+        let size = attr.map(|a| a.size).unwrap_or(0);
+        let mtime = attr.map(|a| a.mtime).unwrap_or(0);
         let node_id = provider.node_id_for(c.ino).ok().flatten().unwrap_or_default();
         holders.push(PlaceholderHolder::new(&c.name, &node_id, size, mtime, c.kind == Kind::Dir));
     }
@@ -614,7 +631,22 @@ unsafe extern "system" fn fetch_placeholders_callback(
         .and_then(|nid| state.provider.ino_for_node_id(&nid).ok().flatten())
         .unwrap_or(ROOT_INO);
 
-    let holders = placeholders_for_dir(&state.provider, dir_ino);
+    // B6.4: record this dir's children in the ino→path index (O(1) path resolution later). The
+    // dir's own path is the sync root for ROOT_INO, else its cached index entry; if we don't know
+    // the dir path yet we just skip indexing (the invalidator falls back to a tree walk).
+    let dir_path = if dir_ino == ROOT_INO {
+        Some(state.root.clone())
+    } else {
+        state.path_index.get(dir_ino)
+    };
+
+    let children = state.provider.readdir(dir_ino).unwrap_or_default();
+    if let Some(dp) = &dir_path {
+        state
+            .path_index
+            .insert_children(dp, children.iter().map(|c| (c.ino, c.name.as_str())));
+    }
+    let holders = placeholders_for_children(&state.provider, &children);
     let mut infos: Vec<CF_PLACEHOLDER_CREATE_INFO> = holders.iter().map(|h| h.info()).collect();
     eprintln!("cfapi: FETCH_PLACEHOLDERS dir_ino={dir_ino} → {} entries", infos.len());
 
@@ -920,6 +952,11 @@ unsafe extern "system" fn notify_delete_callback(
 
     if let Some(node_id) = callback_node_id(info) {
         eprintln!("cfapi: delete captured node={node_id}");
+        // B6.4: drop the node's stale ino→path index entry (resolve the ino BEFORE the delete
+        // removes the row). Best-effort — a miss just leaves the entry to be overwritten later.
+        if let Ok(Some(ino)) = state.provider.ino_for_node_id(&node_id) {
+            state.path_index.invalidate(ino);
+        }
         if let Err(e) = state.provider.delete_by_node_id(&node_id) {
             // Log + still ACK — a failed mirror must not block the OS delete.
             eprintln!("cfapi: delete_by_node_id(node={node_id}) failed: {e}");
@@ -984,6 +1021,12 @@ unsafe extern "system" fn notify_rename_callback(
             match library_relative(&root_str, &target) {
                 Some(rel) if !rel.is_empty() => match state.provider.resolve_path(&rel) {
                     Ok((new_parent, new_name)) => {
+                        // B6.4: the node's cached path (and, for a moved dir, its whole subtree)
+                        // is now stale. Drop the node's entry; subtree children are re-learned on
+                        // the next enumeration (a miss falls back to the tree walk meanwhile).
+                        if let Ok(Some(ino)) = state.provider.ino_for_node_id(&node_id) {
+                            state.path_index.invalidate(ino);
+                        }
                         if let Err(e) = state.provider.rename_by_node_id(&node_id, new_parent, &new_name) {
                             eprintln!("cfapi: rename_by_node_id(node={node_id}) failed: {e}");
                         } else {
@@ -1091,7 +1134,11 @@ impl Drop for CfApiMountHandle {
 pub struct CfApiInvalidate {
     provider: Arc<SqliteProvider>,
     root: PathBuf,
-    paths: Mutex<HashMap<u64, PathBuf>>, // ino → absolute path cache (best-effort)
+    /// B6.4: the ino→path index shared with the mount's `CfState`, populated during
+    /// `FETCH_PLACEHOLDERS`. O(1) on a hit; a miss falls back to the [`path_for`](Self::path_for)
+    /// tree walk (which then back-fills the index). Replaces the old per-invalidator `paths`
+    /// cache so enumeration-time knowledge is reused.
+    path_index: Arc<crate::PathIndex>,
     /// Shared with the mount's teardown flag (see [`CfApiMountHandle::shutdown_flag`]). Once set,
     /// `invalidate`/`created` skip their re-entrant CfAPI calls (`CfUpdatePlaceholder` /
     /// `CfDehydratePlaceholder` / `CfCreatePlaceholders`) — issuing those while the connection is
@@ -1103,24 +1150,39 @@ pub struct CfApiInvalidate {
 impl CfApiInvalidate {
     /// `shutdown` should be the mount's teardown flag ([`CfApiMountHandle::shutdown_flag`]) so a
     /// pull that lands during unmount doesn't re-enter the closing connection. A standalone caller
-    /// with no mount can pass a fresh `Arc::new(AtomicBool::new(false))`.
+    /// with no mount can pass a fresh `Arc::new(AtomicBool::new(false))`. Makes its own
+    /// [`PathIndex`](crate::PathIndex); use [`with_index`](Self::with_index) to share the mount's.
     pub fn new(provider: Arc<SqliteProvider>, root: PathBuf, shutdown: Arc<AtomicBool>) -> Self {
-        Self { provider, root, paths: Mutex::new(HashMap::new()), shutdown }
+        Self::with_index(provider, root, shutdown, Arc::new(crate::PathIndex::new()))
     }
 
-    /// Resolve an ino to its absolute path under the sync root by walking the name chain.
+    /// Like [`new`](Self::new) but shares the SAME `path_index` the mount's `CfState` populates from
+    /// `FETCH_PLACEHOLDERS` — so the invalidator gets O(1) path resolution for any node Explorer has
+    /// enumerated. The engine wires this; pass the index it also handed to [`mount_full`].
+    pub fn with_index(
+        provider: Arc<SqliteProvider>,
+        root: PathBuf,
+        shutdown: Arc<AtomicBool>,
+        path_index: Arc<crate::PathIndex>,
+    ) -> Self {
+        Self { provider, root, path_index, shutdown }
+    }
+
+    /// Resolve an ino to its absolute path under the sync root. **O(1)** on an index hit (the
+    /// `FETCH_PLACEHOLDERS` enumeration recorded it); on a miss, fall back to a DFS over the
+    /// provider tree and back-fill the index so the next lookup is O(1).
     fn path_for(&self, ino: u64) -> Option<PathBuf> {
-        if let Some(p) = self.paths.lock().unwrap().get(&ino) {
-            return Some(p.clone());
+        if let Some(p) = self.path_index.get(ino) {
+            return Some(p);
         }
-        // DFS from root building paths until we hit `target`. O(tree) — fine for invalidation,
-        // which is rare. PHASE 2: maintain an ino→path index during populate for O(1).
+        // Index miss: DFS from root building paths until we hit `target`. O(tree), but rare now
+        // (only for a node never enumerated). Back-fill the index with what we learn.
         let mut stack = vec![(ROOT_INO, self.root.clone())];
         while let Some((dir_ino, path)) = stack.pop() {
             for e in self.provider.readdir(dir_ino).ok()? {
                 let child = path.join(&e.name);
+                self.path_index.insert(e.ino, child.clone());
                 if e.ino == ino {
-                    self.paths.lock().unwrap().insert(ino, child.clone());
                     return Some(child);
                 }
                 if e.kind == Kind::Dir {
