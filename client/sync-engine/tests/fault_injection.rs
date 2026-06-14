@@ -352,51 +352,13 @@ impl MockCloud {
 // build, conflict base, per-node error isolation, mid-pull resume) is identical logic.
 // ----------------------------------------------------------------------------------------
 
-/// The outbox entries, re-sorted parents-before-children so an `upsert` is never pushed
-/// before the parent it references. Deletes keep their relative order at the end of their
-/// dependency group (a child delete must precede its parent's, but the cloud delete is
-/// recursive so ordering among deletes is harmless). This is the ordering the production
-/// engine *should* use; see BUG #1.
+/// The outbox entries, parents-before-children (so an `upsert` is never pushed before the
+/// parent it references). This is now the **production** engine's drain order — the fix for
+/// BUG #1 — so the harness calls the real `SqliteProvider::outbox_list_topo` rather than a
+/// local reimplementation. (Before the fix, `push_outbox` drained raw `outbox_list`
+/// insertion order, which left a moved child ahead of its newer parent.)
 fn topo_ordered_outbox(provider: &SqliteProvider) -> Vec<(String, String)> {
-    let entries = provider.outbox_list().unwrap();
-    // Map node_id -> parent_node_id for upserts still present in the tree.
-    let mut parent_of: HashMap<String, Option<String>> = HashMap::new();
-    for (nid, op) in &entries {
-        if op != "delete" {
-            if let Ok(Some(n)) = provider.sync_node(nid) {
-                parent_of.insert(nid.clone(), n.parent_node_id.clone());
-            }
-        }
-    }
-    let queued: std::collections::HashSet<&String> = entries.iter().map(|(n, _)| n).collect();
-    let mut ordered: Vec<(String, String)> = Vec::new();
-    let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Repeatedly place any entry whose parent is not a still-unplaced queued node.
-    let mut progress = true;
-    while ordered.len() < entries.len() && progress {
-        progress = false;
-        for (nid, op) in &entries {
-            if placed.contains(nid) {
-                continue;
-            }
-            let ready = match parent_of.get(nid) {
-                Some(Some(pid)) => !queued.contains(pid) || placed.contains(pid),
-                _ => true, // root-parented, a delete, or vanished
-            };
-            if ready {
-                ordered.push((nid.clone(), op.clone()));
-                placed.insert(nid.clone());
-                progress = true;
-            }
-        }
-    }
-    // Any leftover (cycle — shouldn't happen) appended in original order.
-    for (nid, op) in &entries {
-        if !placed.contains(nid) {
-            ordered.push((nid.clone(), op.clone()));
-        }
-    }
-    ordered
+    provider.outbox_list_topo().unwrap()
 }
 
 struct HermeticEngine;
@@ -559,8 +521,21 @@ fn retry_deferred(provider: &SqliteProvider, deferred: &mut Vec<SyncNode>) {
 
 thread_local! {
     /// How many randomized runs needed the full-tree reconcile backstop because the
-    /// changelog-only delta did not converge (BUG #2's convergence face). Reported by the
-    /// sweep so the finding is visible even when the backstop heals it.
+    /// changelog-only delta did not converge. Reported by the sweep so the residual is visible
+    /// even when the backstop heals it.
+    ///
+    /// AFTER the BUG #1 (topological outbox drain) + BUG #2 (defer-and-retry parentless pull
+    /// upserts) fixes, the genuine engine races are gone. The residual (~36/1000 seeds at 200
+    /// ops) was diagnosed (see the investigation notes in the PR / HANDOFF) to the documented
+    /// **MockCloud-fidelity boundary**: under a cross-device replace-rename interleaving the
+    /// in-process [`MockCloud`]'s name-collision adjudication can leave a node live in its
+    /// authoritative `nodes` map with **no corresponding changelog entry** (the lost node's
+    /// `node_id`/parent appear nowhere in `cloud.log`). No device can learn of such a node via
+    /// the delta — but no real (atomic node-row + changelog) Rails server can produce it
+    /// either. The full-tree reconcile backstop (`pull_snapshot`) correctly heals it, which is
+    /// exactly its job as the protocol's correctness floor. So this counter is now an
+    /// indicator of harness-model divergence, not of an engine defect; closing it belongs in
+    /// the server-backed `tests/integration.rs` (see `move_*` regressions there).
     static BACKSTOP_NEEDED: std::cell::RefCell<u64> = const { std::cell::RefCell::new(0) };
 }
 
@@ -913,9 +888,12 @@ fn transient_put_failure_eventually_pushes() {
 // `pull_changes_paged` propagates that via `?` → the ENTIRE pull aborts and the device can
 // never advance past that changelog seq (a sync-stall / data-availability defect).
 //
-// Repro is deterministic (no RNG). This test asserts the CURRENT (buggy) behavior so the
-// defect is pinned; flip the `should_panic`/assert when the engine is fixed (the fix is to
-// drain the outbox in topological parents-first order — what `topo_ordered_outbox` does).
+// Repro is deterministic (no RNG). This test originally pinned the BUGGY behavior (raw
+// insertion-order drain → child-before-parent changelog → apply_remote NotFound → pull
+// abort). It is now FLIPPED to assert the FIX: with `SqliteProvider::outbox_list_topo`,
+// `push_outbox` drains parents-before-children, so the dir's create is committed before the
+// moved child's upsert and a fresh device pulls the delta cleanly (no NotFound), with F
+// landing under D — full convergence WITHOUT the reconcile backstop.
 // ========================================================================================
 
 #[test]
@@ -935,50 +913,44 @@ fn bug_move_into_newer_dir_reorders_outbox_child_before_parent() {
     let f_id = writer.node_id_for(f.ino).unwrap().unwrap();
     let d_id = writer.node_id_for(d.ino).unwrap().unwrap();
 
-    // The raw outbox order (what production drains) is child-before-parent — the defect.
+    // PRECONDITION (the underlying defect that the fix compensates for): the RAW outbox still
+    // lists the moved child F before its new parent D — the move re-`upsert`s F but keeps its
+    // older insertion id (the `ON CONFLICT(node_id) DO UPDATE` coalesce). The fix is in the
+    // *drain order*, not the outbox id.
     let raw: Vec<String> = writer.outbox_list().unwrap().into_iter().map(|(n, _)| n).collect();
     let f_pos = raw.iter().position(|n| n == &f_id).unwrap();
     let d_pos = raw.iter().position(|n| n == &d_id).unwrap();
-    assert!(f_pos < d_pos, "precondition: outbox lists the moved child F before its new parent D");
+    assert!(f_pos < d_pos, "precondition: raw outbox still lists moved child F before its new parent D");
 
-    // Drain in RAW (production) order into the cloud — F committed before D.
-    for (node_id, op) in writer.outbox_list().unwrap() {
-        if op == "delete" {
-            cloud.delete(&node_id);
-        } else if let Some(node) = writer.sync_node(&node_id).unwrap() {
-            let _ = HermeticEngine::push_node(&writer, &mut cloud, &io, &node);
-        }
-        writer.outbox_clear(&node_id).unwrap();
-    }
+    // THE FIX: `outbox_list_topo` reorders parents-first, so D precedes F.
+    let topo: Vec<String> = writer.outbox_list_topo().unwrap().into_iter().map(|(n, _)| n).collect();
+    let f_topo = topo.iter().position(|n| n == &f_id).unwrap();
+    let d_topo = topo.iter().position(|n| n == &d_id).unwrap();
+    assert!(d_topo < f_topo, "FIX: outbox_list_topo orders parent D before moved child F");
 
-    // A fresh device pulls the delta. `apply_remote(F)` runs before D exists locally →
-    // NotFound, which production `pull_changes_paged` propagates (aborting the pull). We
-    // demonstrate the underlying provider error directly (the harness's own pull sorts, so
-    // we call apply_remote in the cloud's raw changelog order, exactly as the server feed
-    // would deliver it).
+    // Drain in the production order (`push_outbox` → `outbox_list_topo`) into the cloud.
+    HermeticEngine::push_outbox(&writer, &mut cloud, &io);
+    assert!(writer.outbox_list().unwrap().is_empty(), "outbox fully drained");
+
+    // A fresh device applies the changelog in raw seq order — exactly as the real server feed
+    // delivers it. Because D's create now precedes F's upsert in the log, `apply_remote(F)`
+    // resolves its parent: NO NotFound, NO pull abort, full convergence with NO backstop.
     let (reader, _rd) = device();
-    let mut hit_not_found = false;
     for e in &cloud.log {
         if e.op == "delete" {
             reader.apply_remote_delete(&e.node_id).unwrap();
         } else if let Some(n) = &e.node {
-            match reader.apply_remote(n) {
-                Ok(_) => {}
-                Err(fs_provider::FsError::NotFound) => {
-                    hit_not_found = true;
-                    break;
-                }
-                Err(other) => panic!("unexpected error applying changelog: {other}"),
-            }
+            reader
+                .apply_remote(n)
+                .expect("FIX: changelog applies cleanly in seq order (parent D before child F)");
         }
     }
-    assert!(
-        hit_not_found,
-        "BUG #1 regression: expected apply_remote to hit NotFound on the child-before-parent \
-         changelog order. If this assert now FAILS, the engine likely orders the outbox \
-         topologically — update this test to assert clean convergence and remove the \
-         topo_ordered_outbox workaround."
-    );
+
+    // F is live under D on the fresh device — the move converged via the changelog delta alone.
+    let d_ino = reader.lookup(ROOT_INO, "D").unwrap().ino;
+    let rf = reader.lookup(d_ino, "F.txt").expect("F resolved under D");
+    assert_eq!(reader.node_id_for(rf.ino).unwrap().unwrap(), f_id, "the same node F moved into D");
+    assert!(reader.lookup(ROOT_INO, "F.txt").is_err(), "F no longer at root");
 }
 
 // ========================================================================================
@@ -995,10 +967,14 @@ fn bug_move_into_newer_dir_reorders_outbox_child_before_parent() {
 //       the documented full-tree reconcile backstop (`reconcile_full` / `pull_snapshot`)
 //       heals it.
 //
-// The robust fix is two-fold: (1) `apply_remote` during a pull should DEFER a parentless
-// upsert and retry at end-of-pull rather than abort (what `HermeticEngine::pull_changes`
-// now does); (2) keep the reconcile backstop as the correctness floor. This deterministic
-// test pins face (a): applying the changelog in raw seq order hits NotFound.
+// The robust fix is two-fold: (1) during a pull, a parentless upsert is DEFERRED and retried
+// (within the page + at end-of-pull) rather than aborting via `?` — implemented in
+// `SyncEngine::pull_changes_paged_inval` and mirrored by `HermeticEngine::pull_changes`;
+// (2) the reconcile backstop is KEPT as the correctness floor. This test is now FLIPPED to
+// assert the fix: the defer-and-retry pull converges the replica (C alive under Q, leaf
+// intact) from the changelog delta ALONE — no reconcile backstop needed for this race — and
+// we additionally show the raw-seq-order apply (what the OLD `?` path walked) would have hit
+// NotFound, demonstrating exactly what the defer-and-retry now absorbs.
 // ========================================================================================
 
 #[test]
@@ -1032,41 +1008,52 @@ fn bug_move_out_then_delete_parent_aborts_changelog_pull() {
     src.rmdir(ROOT_INO, "P").unwrap();
     HermeticEngine::push_outbox(&src, &mut cloud, &io);
 
-    // Now apply the new changelog entries in RAW SEQ ORDER to the replica (what the real
-    // server feed delivers and what production `pull_changes_paged` walks), recording whether
-    // a parentless upsert (NotFound) occurs — the abort face. We feed entries directly
-    // (NOT via HermeticEngine::pull_changes, which defers-and-retries — that's the fix).
-    let mut aborted_on_not_found = false;
+    // DEMONSTRATE THE OLD ABORT FACE on a SCRATCH replica: applying the new entries in raw
+    // seq order (what the OLD `pull_changes_paged` `?` path walked) can hit NotFound when a
+    // child upsert references a parent the device swept via the recursive delete. We probe it
+    // on a clone so the real assertion below runs on a clean replica.
+    let (scratch, _scd) = device();
+    HermeticEngine::pull_changes(&scratch, &cloud, 0, 500, None); // same initial tree as `rep`
+    let mut old_path_would_abort = false;
     for e in cloud.log.iter().filter(|e| e.seq > rep_cursor_before) {
         if e.op == "delete" {
-            rep.apply_remote_delete(&e.node_id).unwrap();
+            scratch.apply_remote_delete(&e.node_id).unwrap();
         } else if let Some(n) = &e.node {
-            match rep.apply_remote(n) {
+            match scratch.apply_remote(n) {
                 Ok(_) => {}
                 Err(fs_provider::FsError::NotFound) => {
-                    aborted_on_not_found = true;
-                    break; // production `?` would abort the whole pull here
+                    old_path_would_abort = true;
+                    break; // the OLD production `?` aborted the whole pull here
                 }
                 Err(other) => panic!("unexpected: {other}"),
             }
         }
     }
 
-    // Whether or not the abort face triggers for this exact interleaving, the convergence
-    // face is the real guarantee: after a full-tree reconcile backstop the replica MUST match
-    // the cloud, with C alive under Q and its leaf intact (no data loss).
-    reconcile_full(&rep, &cloud);
+    // THE FIX: the real defer-and-retry pull (mirroring `pull_changes_paged_inval`) applies
+    // the SAME delta and CONVERGES the replica from the changelog ALONE — no reconcile
+    // backstop. A parentless upsert is buffered and re-applied once its parent arrives.
+    let rep_cursor = HermeticEngine::pull_changes(&rep, &cloud, rep_cursor_before, 500, None);
+    assert_eq!(rep_cursor, cloud.head_seq, "replica caught up to head via the delta");
+
     let c_id = src.node_id_for(c.ino).unwrap().unwrap();
     let q_id = src.node_id_for(q.ino).unwrap().unwrap();
-    let rc = rep.sync_node(&c_id).unwrap().expect("C must survive the move-out + parent delete");
+    let rc = rep
+        .sync_node(&c_id)
+        .unwrap()
+        .expect("FIX: C survives the move-out + parent delete via defer-and-retry (no backstop)");
     assert_eq!(rc.parent_node_id.as_deref(), Some(q_id.as_str()), "C re-parented to Q, not lost");
     let gc_id = src.node_id_for(gc.ino).unwrap().unwrap();
     assert!(rep.sync_node(&gc_id).unwrap().is_some(), "the grandchild leaf survived (no data loss)");
+    assert!(rep.lookup(ROOT_INO, "P").is_err(), "P is gone on the replica");
 
-    // Document the abort face for the record (informational — the exact interleaving that
-    // trips it is seed-dependent; the randomized sweep's BACKSTOP_NEEDED counter is the
-    // statistical evidence). We don't hard-assert it here so the regression stays stable.
-    eprintln!("BUG #2 abort-face triggered in this fixed interleaving: {aborted_on_not_found}");
+    // The defer-and-retry result already matches the cloud's reachable live set; the reconcile
+    // backstop (kept as the correctness floor) must be a NO-OP here — idempotent, no change.
+    let before = snapshot(&rep);
+    reconcile_full(&rep, &cloud);
+    assert_eq!(snapshot(&rep), before, "backstop is a no-op: the delta already converged");
+
+    eprintln!("BUG #2: old raw-seq-order path would have aborted on NotFound: {old_path_would_abort}");
 }
 
 // ========================================================================================
