@@ -270,8 +270,8 @@ pub fn mount_full(
 /// close callback — is harmless.
 fn spawn_new_file_watcher(root: &Path, state: *mut CfState) -> std::io::Result<NewFileWatcher> {
     use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME,
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
     };
     use windows::Win32::System::Threading::CreateEventW;
 
@@ -299,7 +299,13 @@ fn spawn_new_file_watcher(root: &Path, state: *mut CfState) -> std::io::Result<N
     })?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+    // B6.1: also watch ATTRIBUTES — Explorer's "Always keep on this device" / "Free up space"
+    // toggles the file's pinned/unpinned attribute, surfacing here as a FILE_ACTION_MODIFIED so we
+    // can drive hydrate/dehydrate (CfAPI has no dedicated pin-change callback).
+    let filter = FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_SIZE
+        | FILE_NOTIFY_CHANGE_ATTRIBUTES;
     let state_addr = state as usize; // make the raw ptr Send for the thread
     let dir_addr = dir.0 as usize;
     let stop_event_addr = stop_event.0 as usize;
@@ -402,6 +408,11 @@ fn new_file_watch_loop(
                     let st = unsafe { &*state };
                     let abs = st.root.join(rel.replace('\\', "/").trim_start_matches('/'));
                     let abs_str = abs.to_string_lossy().to_string();
+                    // B6.1: a MODIFIED event can be a pin-state toggle (ATTRIBUTES) rather than a
+                    // content edit. Reconcile the placeholder's pin state first (hydrate if pinned,
+                    // dehydrate if unpinned); it's a no-op for a non-placeholder / unchanged pin.
+                    // Then run the content-capture path (idempotent — skips when bytes are equal).
+                    unsafe { reconcile_pin_state(st, &abs_str) };
                     unsafe { capture_new_file(st, &abs_str) };
                 }
             }
@@ -714,6 +725,84 @@ unsafe extern "system" fn cancel_fetch_data_callback(
     let state = &*state;
     eprintln!("cfapi: CANCEL_FETCH_DATA transfer_key={}", info.TransferKey);
     state.cancelled_transfers.lock().unwrap().insert(info.TransferKey);
+}
+
+/// B6.1 — reconcile a placeholder's **pin state** to its local bytes ("Always keep on this device"
+/// → hydrate; "Free up space" → dehydrate). Driven by the watcher's ATTRIBUTES events (CfAPI has
+/// no dedicated pin-change callback). Reads the placeholder's `CF_PLACEHOLDER_STANDARD_INFO.PinState`,
+/// maps it through the pure [`crate::pin_hydration_action`], and calls `CfHydratePlaceholder` /
+/// `CfDehydratePlaceholder` accordingly. Best-effort + idempotent:
+/// - A non-placeholder / non-cloud file (`CfGetPlaceholderInfo` fails) is silently skipped.
+/// - Hydrate raises FETCH_DATA → our streaming callback (which runs the hydrate hook), so a pinned
+///   file ends up fully local. Dehydrate drops the on-disk bytes; the next read re-fetches.
+/// - During teardown we skip (re-entrant CfAPI on a closing connection can deadlock).
+unsafe fn reconcile_pin_state(state: &CfState, path: &str) {
+    if state.shutting_down.load(Ordering::Relaxed) {
+        return;
+    }
+    // Only placeholders we track have a node_id; resolve the kind so we no-op on directories.
+    let rel = match library_relative(&state.root.to_string_lossy(), path) {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+    let kind = match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => Kind::Dir,
+        Ok(_) => Kind::File,
+        Err(_) => return, // gone/unreadable
+    };
+    let _ = rel;
+
+    // Open with BACKUP_SEMANTICS so we can open either a file or a dehydrated placeholder without
+    // triggering hydration just by opening (no data read here).
+    let path_w = path_wide(Path::new(path));
+    let handle = match CreateFileW(
+        PCWSTR(path_w.as_ptr()),
+        (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_ATTRIBUTE_NORMAL.0),
+        None,
+    ) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    // Read the placeholder's standard info to get its current pin state. If this fails the file
+    // isn't a cloud placeholder (a plain file) — nothing to reconcile.
+    let mut info = CF_PLACEHOLDER_STANDARD_INFO::default();
+    let mut returned: u32 = 0;
+    let got = CfGetPlaceholderInfo(
+        handle,
+        CF_PLACEHOLDER_INFO_STANDARD,
+        &mut info as *mut _ as *mut c_void,
+        std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() as u32,
+        Some(&mut returned),
+    );
+    if got.is_err() {
+        let _ = CloseHandle(handle);
+        return;
+    }
+
+    let pin = crate::PinState::from_raw(info.PinState.0);
+    match crate::pin_hydration_action(pin, kind) {
+        crate::HydrationAction::Hydrate => {
+            eprintln!("cfapi: pin → hydrate {path}");
+            // Hydrate the whole file (offset 0, length -1 = to EOF). FETCH_DATA does the actual
+            // chunk fetch via the hydrate hook.
+            if let Err(e) = CfHydratePlaceholder(handle, 0, -1, CF_HYDRATE_FLAG_NONE, None) {
+                eprintln!("cfapi: CfHydratePlaceholder({path}) failed: {e}");
+            }
+        }
+        crate::HydrationAction::Dehydrate => {
+            eprintln!("cfapi: unpin → dehydrate {path}");
+            if let Err(e) = CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) {
+                eprintln!("cfapi: CfDehydratePlaceholder({path}) failed: {e}");
+            }
+        }
+        crate::HydrationAction::None => {}
+    }
+    let _ = CloseHandle(handle);
 }
 
 /// FETCH_PLACEHOLDERS: Explorer opened a directory — enumerate its children from the
