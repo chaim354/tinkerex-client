@@ -9,8 +9,12 @@ in one process. The mount backend is chosen per platform:
   macOS 26). The drive shows in Finder under *Locations* as "Maker". This is the default
   and it just works.
 - **Linux:** **FUSE** (`fuser`) — mounts natively.
-- **Windows:** not wired yet (needs the winfsp-rs adapter, CLAUDE.md §12 step 4); the app
-  builds + launches but the mount button returns a clear message. See [§Windows](#windows).
+- **Windows:** **CfAPI** (driverless Cloud Filter — the default; no WinFsp/GPL driver, no
+  `winfsp-x64.dll`). The mount point is a **folder** (e.g. `%USERPROFILE%\MakerCF`), not a drive
+  letter. The legacy WinFsp (drive-letter) backend is still available with
+  `--features winfsp-backend`. (Live smoke + byte-for-byte conformance green — Phase 2b B5.)
+  NOTE: the rest of this doc predates this flip and still describes Windows as unwired — it needs
+  a fuller refresh.
 
 The backend lives in `src-tauri/src/lib.rs` (commands `sync_start`/`sync_stop`/
 `sync_status`) via a per-OS `Mount` alias — `sync_engine::WebdavMount` on macOS,

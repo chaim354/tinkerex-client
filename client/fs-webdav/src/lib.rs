@@ -208,8 +208,15 @@ impl<P: Provider + 'static> DavFile for WebdavFile<P> {
             let data = match self.provider.read(self.ino, self.pos, count as u32) {
                 Ok(d) => d,
                 // Chunk-cache miss on a known file: hydrate from the cloud, then retry.
+                // The hydrate hook does **blocking** HTTP (reqwest::blocking spins up — and
+                // drops — its own tokio runtime). Calling it directly here, inside this
+                // async WebDAV worker, panics: "Cannot drop a runtime in a context where
+                // blocking is not allowed." Run it on a blocking thread instead. Regression:
+                // `hydrate_does_not_panic_when_it_drops_a_runtime`.
                 Err(ProvError::ChunkMissing(_)) if self.hydrate.is_some() => {
-                    (self.hydrate.as_ref().unwrap())(self.ino);
+                    let hydrate = self.hydrate.as_ref().unwrap().clone();
+                    let ino = self.ino;
+                    let _ = tokio::task::spawn_blocking(move || hydrate(ino)).await;
                     self.provider.read(self.ino, self.pos, count as u32).map_err(map_err)?
                 }
                 Err(e) => return Err(map_err(e)),
@@ -278,8 +285,11 @@ impl DavMetaData for WebdavMeta {
         self.is_dir
     }
     fn modified(&self) -> FsResult<SystemTime> {
+        // `Attr.mtime` is the real modification time in unix **nanoseconds** (preserved +
+        // synced). Using `from_secs` here treated ~1.78e18 nanos as seconds, which
+        // `dav-server` then overflowed building an HTTP date (panic → dropped connection).
         Ok(if self.mtime > 0 {
-            UNIX_EPOCH + Duration::from_secs(self.mtime as u64)
+            UNIX_EPOCH + Duration::from_nanos(self.mtime as u64)
         } else {
             UNIX_EPOCH
         })
@@ -344,5 +354,70 @@ pub async fn serve<P: Provider + 'static>(
                 )
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs_provider::{ChunkConfig, LocalChunkStore, SqliteProvider};
+
+    /// Regression for the macOS "Cannot drop a runtime in a context where blocking is not
+    /// allowed" panic: a WebDAV read on a not-yet-hydrated file invokes the hydrate hook,
+    /// which — like `reqwest::blocking` — creates and drops its own tokio runtime. If that
+    /// runs inside the async read worker it panics. `read_bytes` must run it on a blocking
+    /// thread (`spawn_blocking`). Here the hook drops a (multi-thread) runtime to reproduce
+    /// the exact trigger, then provisions the missing chunks so the retry succeeds; with the
+    /// bug the read panics/fails, with the fix it returns the bytes.
+    #[test]
+    fn hydrate_does_not_panic_when_it_drops_a_runtime() {
+        let base = std::env::temp_dir().join(format!("fswebdav-hydrate-{}", std::process::id()));
+        let store_a = base.join("a");
+        let store_b = base.join("b");
+        std::fs::create_dir_all(&store_a).unwrap();
+        std::fs::create_dir_all(&store_b).unwrap();
+        let cfg = ChunkConfig { min: 64, avg: 256, max: 1024 };
+
+        // A writes a file (its chunks live in store A).
+        let a = Arc::new(SqliteProvider::in_memory(Box::new(LocalChunkStore::new(&store_a).unwrap()), cfg).unwrap());
+        let body = vec![7u8; 2000];
+        let fa = a.create(ROOT_INO, "f.bin").unwrap();
+        a.write(fa.ino, 0, &body).unwrap();
+        a.flush(fa.ino).unwrap();
+        let nodes = a.export_tree().unwrap();
+        let node_id = nodes.iter().find(|n| n.name == "f.bin").unwrap().node_id.clone();
+
+        // B has the tree (manifest) but an EMPTY store → a read misses → hydrate fires.
+        let b = Arc::new(SqliteProvider::in_memory(Box::new(LocalChunkStore::new(&store_b).unwrap()), cfg).unwrap());
+        for n in &nodes {
+            b.apply_remote(n).unwrap();
+        }
+        let ino = b.ino_for_node_id(&node_id).unwrap().unwrap();
+
+        // The hook: mimic reqwest::blocking (build + drop a runtime — the panic trigger),
+        // then copy the missing chunks from A into B's cache so the retry reads cleanly.
+        let hashes = b.node_manifest_hashes(&node_id).unwrap();
+        let (ac, bc) = (a.clone(), b.clone());
+        let hydrate: Hydrate = Arc::new(move |_ino| {
+            let inner = tokio::runtime::Runtime::new().unwrap();
+            drop(inner); // panics here if we're on an async worker (the bug)
+            for h in &hashes {
+                let bytes = ac.chunk_get(h).expect("source chunk");
+                bc.chunk_put(h, &bytes).expect("cache chunk");
+            }
+        });
+
+        // Drive the real async read path on a multi-thread runtime, exactly like `serve`.
+        let n = body.len();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let got = rt
+            .block_on(async move {
+                let mut file = WebdavFile { provider: b.clone(), hydrate: Some(hydrate), ino, pos: 0 };
+                file.read_bytes(n).await
+            })
+            .expect("read should succeed after hydrate (no runtime-drop panic)");
+
+        assert_eq!(&got[..], &body[..], "hydrated content matches the source");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

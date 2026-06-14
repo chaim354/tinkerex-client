@@ -36,7 +36,7 @@ fn main() {
 
     // Trigger a server-side change → the server broadcasts {head_seq}.
     let started = Instant::now();
-    let resp = client.mkdir(&uniq(), None, &format!("nudge-{}", uniq())).expect("mkdir");
+    let resp = client.mkdir(&uniq(), None, &format!("nudge-{}", uniq()), 0o755, 0).expect("mkdir");
     println!("✓ committed a mkdir (server head_seq {})", resp.seq);
 
     // The nudge should arrive within a beat (not the 2s poll interval).

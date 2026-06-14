@@ -68,6 +68,11 @@ pub struct CommitBegin {
     pub base_version_id: Option<String>,
     pub size: u64,
     pub manifest: Vec<ChunkRef>,
+    /// POSIX permission bits to persist on the node (preserves the executable bit).
+    pub mode: u32,
+    /// Real modification time, unix nanoseconds (a `bigint` on the server). Preserves the
+    /// true mtime end-to-end instead of stamping the sync time.
+    pub mtime: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +100,69 @@ pub struct DeviceResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PairingResponse {
+    /// The human-enterable code to type on the new device (shown once).
+    pub code: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NodeVersion {
+    pub version_id: String,
+    pub manifest_id: String,
+    pub size: u64,
+    pub parent_version_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VersionsResponse {
+    pub versions: Vec<NodeVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConflictSide {
+    pub version_id: String,
+    pub size: u64,
+    pub created_at: String,
+    pub device_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConflictInfo {
+    pub node_id: String,
+    pub name: Option<String>,
+    pub current: Option<ConflictSide>,
+    pub incoming: Option<ConflictSide>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConflictsResponse {
+    pub conflicts: Vec<ConflictInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SplitResponse {
+    pub split_node_id: String,
+    pub seq: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LockStatus {
+    pub node_id: String,
+    pub held: bool,
+    #[serde(default)]
+    pub by_me: bool,
+    #[serde(default)]
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocksResponse {
+    pub locks: Vec<LockStatus>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct NodeView {
     pub node_id: String,
     pub parent_node_id: Option<String>,
@@ -102,6 +170,12 @@ pub struct NodeView {
     pub kind: String,
     #[serde(default)]
     pub deleted: bool,
+    #[serde(default)]
+    pub mode: Option<u32>,
+    /// Real modification time, unix nanoseconds. `None` from a server that predates mtime
+    /// sync (the engine falls back to `now` so freshness still works).
+    #[serde(default)]
+    pub mtime: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +217,11 @@ pub struct TreeNode {
     pub size: Option<u64>,
     #[serde(default)]
     pub manifest: Option<Vec<ChunkRef>>,
+    #[serde(default)]
+    pub mode: Option<u32>,
+    /// Real modification time, unix nanoseconds. `None` from a pre-mtime server.
+    #[serde(default)]
+    pub mtime: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,10 +249,20 @@ pub struct ServerClient {
 
 impl ServerClient {
     pub fn new(base: impl Into<String>) -> Self {
+        // A default request timeout so a stalled connection can't wedge the caller forever — a
+        // hung push on the sync thread would otherwise block graceful shutdown (join never
+        // returns). 30s is ample for a chunk upload/download yet bounds the worst case so an
+        // unmount can't stall on a dead connection; short-deadline ops (locks) set their own
+        // tighter per-request timeout.
+        let http = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             token: None,
-            http: reqwest::blocking::Client::new(),
+            http,
         }
     }
 
@@ -226,6 +315,27 @@ impl ServerClient {
         Self::json(resp)
     }
 
+    /// Issue a short-lived pairing code (this device must be authenticated). A *new*
+    /// device redeems it via [`pair`](Self::pair) to join this library — without ever
+    /// seeing this device's token.
+    pub fn create_pairing(&self) -> Result<PairingResponse> {
+        let resp = self.authed(self.http.post(self.url("/v1/devices/pairing")))?.send()?;
+        Self::json(resp)
+    }
+
+    /// Redeem a pairing code on a new device to join an existing library. Stores the
+    /// returned token on the client (like `register`).
+    pub fn pair(&mut self, email: &str, code: &str, device_name: &str) -> Result<RegisterResponse> {
+        let resp = self
+            .http
+            .post(self.url("/v1/auth/pair"))
+            .json(&serde_json::json!({ "email": email, "code": code, "device_name": device_name }))
+            .send()?;
+        let reg: RegisterResponse = Self::json(resp)?;
+        self.token = Some(reg.device_token.clone());
+        Ok(reg)
+    }
+
     pub fn commit_begin(&self, req: &CommitBegin) -> Result<CommitBeginResponse> {
         let resp = self.authed(self.http.post(self.url("/v1/commit")))?.json(req).send()?;
         Self::json(resp)
@@ -238,10 +348,10 @@ impl ServerClient {
         Self::json(resp)
     }
 
-    pub fn mkdir(&self, node_id: &str, parent_node_id: Option<&str>, name: &str) -> Result<SeqResponse> {
+    pub fn mkdir(&self, node_id: &str, parent_node_id: Option<&str>, name: &str, mode: u32, mtime: i64) -> Result<SeqResponse> {
         let resp = self
             .authed(self.http.post(self.url("/v1/nodes")))?
-            .json(&serde_json::json!({ "node_id": node_id, "parent_node_id": parent_node_id, "name": name }))
+            .json(&serde_json::json!({ "node_id": node_id, "parent_node_id": parent_node_id, "name": name, "mode": mode, "mtime": mtime }))
             .send()?;
         Self::json(resp)
     }
@@ -255,6 +365,64 @@ impl ServerClient {
         let resp = self
             .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/restore"))))?
             .json(&serde_json::json!({ "version_id": version_id }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// The version history of a node (newest first) — for the file browser's
+    /// versions/restore UI.
+    pub fn versions(&self, node_id: &str) -> Result<VersionsResponse> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!("/v1/nodes/{node_id}/versions"))))?
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Best-effort acquire/refresh the advisory edit lock on a node. Short timeout: if we
+    /// can't reach the server the caller proceeds locally (offline just opens the cached
+    /// copy — conflict detection is the safety net). Returns the lock status.
+    pub fn lock(&self, node_id: &str) -> Result<LockStatus> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/lock"))))?
+            .timeout(std::time::Duration::from_secs(2))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Release the advisory lock on a node (no-op if this device isn't the holder).
+    pub fn unlock(&self, node_id: &str) -> Result<()> {
+        self.authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/unlock"))))?
+            .timeout(std::time::Duration::from_secs(2))
+            .send()?;
+        Ok(())
+    }
+
+    /// All active edit locks (for the file browser's lock indicators).
+    pub fn locks(&self) -> Result<LocksResponse> {
+        let resp = self.authed(self.http.get(self.url("/v1/locks")))?.send()?;
+        Self::json(resp)
+    }
+
+    /// Unresolved conflicts (divergent offline edits) with both sides' device + time.
+    pub fn conflicts(&self) -> Result<ConflictsResponse> {
+        let resp = self.authed(self.http.get(self.url("/v1/conflicts")))?.send()?;
+        Self::json(resp)
+    }
+
+    /// Resolve a conflict by keeping one side as current.
+    pub fn resolve_conflict_keep(&self, node_id: &str, keep_version_id: &str) -> Result<SeqResponse> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/resolve_conflict"))))?
+            .json(&serde_json::json!({ "keep_version_id": keep_version_id }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Resolve a conflict by keeping both — the incoming side becomes a new sibling file.
+    pub fn resolve_conflict_split(&self, node_id: &str) -> Result<SplitResponse> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/resolve_conflict"))))?
+            .json(&serde_json::json!({ "split": true }))
             .send()?;
         Self::json(resp)
     }

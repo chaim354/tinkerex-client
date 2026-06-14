@@ -17,6 +17,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Windows mount backend is CfAPI (driverless) by default; opt back into the legacy WinFsp
+# (drive-letter) backend with `--features winfsp-backend`. Kept for one release post-B5 flip.
+winfsp-backend = []
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
@@ -24,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # The native sync daemon (mount + sync loop + nudge). The mount backend is chosen
-# per-OS inside sync-engine: Linux = FUSE, macOS = WebDAV, Windows = WinFsp.
+# per-OS inside sync-engine: Linux = FUSE, macOS = WebDAV, Windows = CfAPI (driverless;
+# WinFsp behind the `winfsp-backend` feature).
 sync-engine = { path = "../../sync-engine" }
 sync-client = { path = "../../sync-client" }

@@ -11,9 +11,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::HashMap;
+
 use fs_provider::{ChunkConfig, LocalChunkStore, Provider, SqliteProvider, ROOT_INO};
 use sync_client::ServerClient;
-use sync_engine::{SharedDirIO, SyncEngine};
+use sync_engine::{ChunkIO, SharedDirIO, SyncEngine};
 
 /// `Some(url)` if a test server is configured, else `None` → the test prints a skip
 /// notice and returns. (Macro so the early-return lands in the test body.)
@@ -122,47 +124,33 @@ fn delete_and_move_converge_via_delta() {
     assert!(b.lookup(b_inbox, "note.txt").is_err(), "no duplicate at old path");
 }
 
-// ---- last-writer-wins ---------------------------------------------------------------
+// ---- sequential edits fast-forward (no false conflict) -----------------------------
 
 #[test]
-fn concurrent_edits_resolve_last_writer_wins() {
+fn sequential_edits_fast_forward_without_a_conflict() {
+    // The non-conflict path now that the client tracks base versions: an edit whose base
+    // IS current is a clean put (no conflict). Conflicts only fire on a *stale* base
+    // (see offline_divergent_edit_raises_a_conflict). This guards against false positives.
     let url = server_url!();
     let (ca, cb, cloud) = two_devices(&url);
 
-    // A creates a file and both devices sync to it.
     let a = dev();
-    let f = a.create(ROOT_INO, "shared.txt").unwrap();
-    a.write(f.ino, 0, b"original").unwrap();
+    let f = a.create(ROOT_INO, "notes.txt").unwrap();
+    a.write(f.ino, 0, b"v1").unwrap();
     a.flush(f.ino).unwrap();
-    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push");
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
 
-    let b = dev();
-    let b_cur = SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
-    let bf = b.lookup(ROOT_INO, "shared.txt").unwrap();
-
-    // Both edit the *same* node, A first then B → B is the last writer.
+    // Edit again on the SAME device (base is current after set_node_version) → clean.
     a.truncate(f.ino, 0).unwrap();
-    a.write(f.ino, 0, b"edited by A").unwrap();
+    a.write(f.ino, 0, b"v2 sequential").unwrap();
     a.flush(f.ino).unwrap();
-    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push edit");
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
 
-    b.truncate(bf.ino, 0).unwrap();
-    b.write(bf.ino, 0, b"edited by B is the winner").unwrap();
-    b.flush(bf.ino).unwrap();
-    SyncEngine::push_outbox(&b, &cb, &cloud).expect("B push edit");
-
-    // A pulls the changelog delta since its snapshot point. The delta carries A's own
-    // edit then B's (later) edit in seq order, so the node converges onto B's version.
-    // LWW is a *metadata* property — assert A's manifest now equals B's winning
-    // manifest (content-addressed, so equal manifest_id ⇒ identical bytes). The
-    // data-plane (hydrate→read) is covered separately by the roundtrip/hydrate tests.
-    SyncEngine::pull_changes(&a, &ca, b_cur).expect("A pulls B's edit");
-    let a_node = a.node_id_for(f.ino).unwrap().unwrap();
-    let a_manifest = a.sync_node(&a_node).unwrap().unwrap().manifest_id;
-    let b_manifest = b.sync_node(&a_node).unwrap().unwrap().manifest_id;
-    assert_eq!(a_manifest, b_manifest, "LWW: A converged onto B's later (winning) version");
-    // Sanity: B (the winner) can read its own content directly.
-    assert_eq!(read_all(&b, bf.ino), b"edited by B is the winner");
+    assert!(cb.conflicts().unwrap().conflicts.is_empty(), "sequential edits don't conflict");
+    // A second device sees the latest, no conflict.
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).unwrap();
+    assert!(b.lookup(ROOT_INO, "notes.txt").is_ok());
 }
 
 // ---- hydration: only-missing + idempotent ------------------------------------------
@@ -224,6 +212,244 @@ fn re_push_of_identical_content_dedups_and_stays_consistent() {
     let node_id = b.node_id_for(bf.ino).unwrap().unwrap();
     SyncEngine::hydrate(&b, &cb, &cloud, &node_id).expect("hydrate");
     assert_eq!(read_all(&b, bf.ino), body);
+}
+
+// ---- auth: pairing a second device into an existing library ------------------------
+
+#[test]
+fn pairing_adds_a_device_to_an_existing_library() {
+    let url = server_url!();
+    let email = format!("pair-{}@example.com", uniq());
+
+    // Device A registers (creates the account) and pushes a file.
+    let mut ca = ServerClient::new(&url);
+    ca.register(&email, "device-A").expect("register A");
+    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("pair-cloud-{}", uniq()))).unwrap();
+    let a = dev();
+    let f = a.create(ROOT_INO, "paired.txt").unwrap();
+    a.write(f.ino, 0, b"hello from A").unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push(&a, &ca, &cloud).expect("A push");
+
+    // A issues a pairing code; a brand-new device B redeems it (never sees A's token).
+    let code = ca.create_pairing().expect("A issues code").code;
+    let mut cb = ServerClient::new(&url);
+    cb.pair(&email, &code, "device-B").expect("B pairs in");
+
+    // B is now a real device on the same library — it sees A's file.
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    assert!(b.lookup(ROOT_INO, "paired.txt").is_ok(), "paired device B sees A's library");
+
+    // A reused code can't pair again (single-use).
+    assert!(ServerClient::new(&url).pair(&email, &code, "device-C").is_err(), "code is single-use");
+}
+
+// ---- file mode (executable bit) propagation ----------------------------------------
+
+#[test]
+fn executable_bit_propagates_across_devices() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A creates a script and chmod +x it.
+    let a = dev();
+    let f = a.create(ROOT_INO, "flash.sh").unwrap();
+    a.write(f.ino, 0, b"#!/bin/sh\necho flashing").unwrap();
+    a.flush(f.ino).unwrap();
+    a.set_mode(f.ino, 0o755).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // B pulls → the executable bit came across.
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).unwrap();
+    let bf = b.lookup(ROOT_INO, "flash.sh").unwrap();
+    assert_eq!(b.getattr(bf.ino).unwrap().mode, 0o755, "chmod +x on A is visible on B");
+}
+
+// ---- offline availability after hydration (cross-platform) --------------------------
+
+/// A chunk transport that's "offline": every fetch fails. Used to prove a read after
+/// hydration never touches the network — the bytes come from the local cache.
+struct OfflineIO;
+impl ChunkIO for OfflineIO {
+    fn put(&self, hash: &str, _urls: &HashMap<String, String>, _bytes: Vec<u8>) -> sync_engine::Result<()> {
+        Err(sync_engine::Error::NoUrl(format!("offline: {hash}")))
+    }
+    fn get(&self, hash: &str, _url: Option<&str>) -> sync_engine::Result<Vec<u8>> {
+        Err(sync_engine::Error::NoUrl(format!("offline: {hash}")))
+    }
+}
+
+#[test]
+fn hydrated_file_stays_readable_offline() {
+    // The offline guarantee (same on macOS/Windows/Linux — it's all the shared Provider +
+    // engine): once a file is hydrated, its chunks live in the local content-addressed cache,
+    // so the user can "download what they need, then go offline" and still read it. We hydrate
+    // online, then point the engine at a DEAD server + a chunk source that errors, and confirm
+    // a re-hydrate fetches nothing (everything's cached) and the read serves from the cache.
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A pushes a multi-chunk file.
+    let a = dev();
+    let f = a.create(ROOT_INO, "offline.bin").unwrap();
+    let body: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+    a.write(f.ino, 0, &body).unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // B pulls the tree and hydrates the file ONLINE (chunks land in B's local cache).
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).unwrap();
+    let bf = b.lookup(ROOT_INO, "offline.bin").unwrap();
+    let node_id = b.node_id_for(bf.ino).unwrap().unwrap();
+    SyncEngine::hydrate(&b, &cb, &cloud, &node_id).unwrap();
+    assert_eq!(read_all(&b, bf.ino), body, "online read OK after hydrate");
+
+    // Now go OFFLINE: an unreachable server + a chunk source that errors on every fetch.
+    let dead = ServerClient::new("http://127.0.0.1:9"); // nothing listening
+    // A re-hydrate must NOT contact the network — all chunks are already cached, so it finds
+    // nothing missing and never calls the (failing) transport or the (dead) server.
+    SyncEngine::hydrate(&b, &dead, &OfflineIO, &node_id).expect("offline re-hydrate is a no-op");
+    // And the file still reads byte-for-byte, served entirely from the local cache.
+    assert_eq!(read_all(&b, bf.ino), body, "hydrated file reads OFFLINE from the local cache");
+}
+
+// ---- real mtime preservation across devices ----------------------------------------
+
+#[test]
+fn real_mtime_propagates_across_devices() {
+    // Option B: A's real modification time rides the commit to the server and lands on B
+    // verbatim — B sees A's edit time, never B's sync time. (Models
+    // `executable_bit_propagates_across_devices`; the wire carries mtime as a bigint.)
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A writes a file and stamps an obviously-old mtime (2001) via setattr/`cp -p`.
+    let a = dev();
+    let f = a.create(ROOT_INO, "old.txt").unwrap();
+    a.write(f.ino, 0, b"authored long ago").unwrap();
+    a.flush(f.ino).unwrap();
+    let old_mtime: i64 = 1_000_000_000 * 1_000_000_000;
+    a.set_mtime(f.ino, old_mtime).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // B pulls the snapshot → A's real mtime came across (not the sync time).
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).unwrap();
+    let bf = b.lookup(ROOT_INO, "old.txt").unwrap();
+    assert_eq!(b.getattr(bf.ino).unwrap().mtime, old_mtime, "A's real mtime is visible on B, verbatim");
+}
+
+// ---- best-effort cross-device advisory lock ----------------------------------------
+
+#[test]
+fn best_effort_lock_coordinates_connected_devices() {
+    let url = server_url!();
+    let (ca, cb, _cloud) = two_devices(&url); // A = "device-A", B = "device-B"
+    let node = format!("lock-{}", uniq());
+
+    // A acquires the lock.
+    let a = ca.lock(&node).expect("A lock");
+    assert!(a.held && a.by_me, "A holds its own lock");
+
+    // B, while connected, sees it held by A — not stolen.
+    let b = cb.lock(&node).expect("B lock attempt");
+    assert!(b.held && !b.by_me, "B sees A's live lock");
+    assert_eq!(b.device_name.as_deref(), Some("device-A"));
+
+    // It shows up in the active-locks list (for the browser's indicators).
+    assert!(ca.locks().unwrap().locks.iter().any(|l| l.node_id == node && l.held));
+
+    // A releases → B can now acquire.
+    ca.unlock(&node).expect("A unlock");
+    let b2 = cb.lock(&node).expect("B re-attempt");
+    assert!(b2.by_me, "B acquires after A releases");
+}
+
+// ---- conflict: a divergent offline edit is flagged, not silently dropped ----------
+
+#[test]
+fn offline_divergent_edit_raises_a_conflict() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A creates a file and pushes (its local node now tracks version V1).
+    let a = dev();
+    let f = a.create(ROOT_INO, "design.scad").unwrap();
+    a.write(f.ino, 0, b"base design").unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // B (second device) pulls the snapshot — its local node also tracks V1.
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).unwrap();
+    let bf = b.lookup(ROOT_INO, "design.scad").unwrap();
+
+    // A edits + pushes → server's current is now V2.
+    a.truncate(f.ino, 0).unwrap();
+    a.write(f.ino, 0, b"A's online change").unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // B edits its copy — still based on V1 (it never saw V2) — and pushes.
+    b.truncate(bf.ino, 0).unwrap();
+    b.write(bf.ino, 0, b"B's offline change").unwrap();
+    b.flush(bf.ino).unwrap();
+    SyncEngine::push_outbox(&b, &cb, &cloud).unwrap();
+
+    // The server flagged a conflict (base V1 != current V2) instead of LWW-dropping a edit.
+    let conflicts = cb.conflicts().unwrap().conflicts;
+    assert_eq!(conflicts.len(), 1, "B's stale-based edit raised a conflict");
+    let c = &conflicts[0];
+    assert_eq!(c.name.as_deref(), Some("design.scad"));
+    assert!(c.current.is_some() && c.incoming.is_some(), "both sides reported (device + time)");
+
+    // Resolve by splitting → a new sibling conflicted-copy node, conflict cleared.
+    let split = cb.resolve_conflict_split(&c.node_id).unwrap();
+    assert!(!split.split_node_id.is_empty());
+    assert!(cb.conflicts().unwrap().conflicts.is_empty(), "resolved after split");
+}
+
+// ---- freshness-on-access (the on-open catch-up pull) -------------------------------
+
+#[test]
+fn freshness_check_on_access_serves_latest_after_remote_change() {
+    // Red-green: this is exactly what the adapter's open-hook freshness check does
+    // (EngineFreshness::refresh → pull_changes). RED = a reader that hasn't synced
+    // serves a stale copy of a file another device just changed; GREEN = the catch-up
+    // pull brings it current before the read.
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A publishes v1; B snapshots, hydrates, reads v1.
+    let a = dev();
+    let f = a.create(ROOT_INO, "live.txt").unwrap();
+    a.write(f.ino, 0, b"version one").unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    let b = dev();
+    let cursor = SyncEngine::pull_snapshot(&b, &cb).unwrap();
+    let bf = b.lookup(ROOT_INO, "live.txt").unwrap();
+    let node = b.node_id_for(bf.ino).unwrap().unwrap();
+    SyncEngine::hydrate(&b, &cb, &cloud, &node).unwrap();
+    assert_eq!(read_all(&b, bf.ino), b"version one");
+
+    // A overwrites to v2 and pushes; B's cursor is now behind.
+    a.truncate(f.ino, 0).unwrap();
+    a.write(f.ino, 0, b"version two is newer").unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // RED: with no freshness check, B keeps serving the stale local copy.
+    assert_eq!(read_all(&b, bf.ino), b"version one", "stale until B catches up (the gap freshness-on-open closes)");
+
+    // GREEN: the on-access catch-up pull (+ lazy re-hydrate of the new manifest) → latest.
+    SyncEngine::pull_changes(&b, &cb, cursor).expect("freshness catch-up pull");
+    SyncEngine::hydrate(&b, &cb, &cloud, &node).expect("hydrate the new manifest");
+    assert_eq!(read_all(&b, bf.ino), b"version two is newer", "fresh after the on-access pull");
 }
 
 // ---- offline reconnect: paging through a large backlog -----------------------------

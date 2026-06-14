@@ -18,8 +18,19 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # unused on macOS, so it's strictly Linux here.
 [target.'cfg(target_os = "linux")'.dependencies]
 fs-fuse = { path = "../fs-fuse" }
-fuser = "0.14"
+# abi-7-12 enables BackgroundSession::notifier() + Notifier::inval_inode (active cache
+# invalidation on a content-changing pull — see EngineInvalidate).
+fuser = { version = "0.14", features = ["abi-7-12"] }
 libc = "0.2"
+
+[dev-dependencies]
+# Used by the verify_tree example (content-hash oracle for the CfAPI conformance harness).
+sha2 = "0.10"
+hex = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 fs-winfsp = { path = "../fs-winfsp" }
+# CfAPI is the driverless successor to WinFsp (the OneDrive model). Both compile on
+# Windows; the active backend is chosen at the call site (WinfspMount stays the default
+# until CfApiMount is proven on real hardware — see docs/plan-windows-cfapi-migration.md).
+fs-cfapi = { path = "../fs-cfapi" }

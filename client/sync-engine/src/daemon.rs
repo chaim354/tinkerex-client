@@ -26,6 +26,8 @@ use crate::{PresignedIO, SyncEngine};
 
 // FUSE bits — Linux only (macOS → WebDAV, Windows → WinFsp).
 #[cfg(target_os = "linux")]
+use crate::{EngineInvalidate, Invalidate};
+#[cfg(target_os = "linux")]
 use crate::EngineHydrator;
 #[cfg(target_os = "linux")]
 use fs_fuse::FuseAdapter;
@@ -94,16 +96,30 @@ impl Daemon {
     pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
         let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
         let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
+        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
+        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
+        // cache is kept — content-addressed, so hydrated files stay available offline).
+        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
+        }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
         let stop = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
+
+        // Active cache-invalidation hook. Shared by the sync loop + the freshness adapter so
+        // whichever pull applies a content change is the one that drops the kernel cache.
+        // Its FUSE notifier is injected after the mount is up (set_notifier below) — see
+        // EngineInvalidate's docs for the construction-cycle break.
+        let invalidate = EngineInvalidate::new();
+        let inval_dyn: Arc<dyn Invalidate> = Arc::new(invalidate.clone());
 
         let sync_handle = {
             let provider = provider.clone();
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll))
+            let inval = inval_dyn.clone();
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), None))
         };
         {
             let client = client.clone();
@@ -112,7 +128,11 @@ impl Daemon {
         }
 
         let hydrator = Arc::new(EngineHydrator::new(provider.clone(), client.clone()));
-        let fs = FuseAdapter::with_hydrator(provider.clone(), hydrator);
+        let freshness = Arc::new(crate::EngineFreshness::new(provider.clone(), client.clone(), Some(inval_dyn.clone())));
+        let remote_lock = Arc::new(crate::EngineRemoteLock::new(provider.clone(), client.clone()));
+        let fs = FuseAdapter::with_hydrator(provider.clone(), hydrator)
+            .with_freshness(freshness)
+            .with_remote_lock(remote_lock);
         let opts = [
             MountOption::FSName("maker".into()),
             MountOption::AutoUnmount,
@@ -121,6 +141,9 @@ impl Daemon {
         // spawn_mount2 runs the FUSE session loop on its own thread and returns a handle
         // that unmounts on drop — the non-blocking counterpart to mount2.
         let session = fuser::spawn_mount2(fs, &cfg.mountpoint, &opts)?;
+        // Now the session exists, hand its notifier to the invalidation hook (both the sync
+        // loop and the freshness adapter share it; before this they no-op harmlessly).
+        invalidate.set_notifier(session.notifier());
 
         Ok(Self {
             stop,
@@ -186,6 +209,12 @@ impl WebdavMount {
     pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
         let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
         let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
+        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
+        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
+        // cache is kept — content-addressed, so hydrated files stay available offline).
+        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
+        }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
         let stop = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
@@ -196,7 +225,7 @@ impl WebdavMount {
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll))
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None))
         };
         {
             let client = client.clone();
@@ -295,6 +324,12 @@ impl WinfspMount {
     pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
         let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
         let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
+        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
+        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
+        // cache is kept — content-addressed, so hydrated files stay available offline).
+        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
+        }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
         let stop = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
@@ -305,7 +340,7 @@ impl WinfspMount {
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll))
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None))
         };
         {
             let client = client.clone();
@@ -394,19 +429,297 @@ impl Drop for WinfspMount {
     }
 }
 
-/// Push the outbox + pull the changelog delta on each nudge or poll-timeout.
+/// Adapts `fs_cfapi::CfApiInvalidate` to the engine's [`crate::Invalidate`] seam: a pulled
+/// content change → `CfUpdatePlaceholder` + dehydrate, so the next read re-fetches (the CfAPI
+/// analogue of FUSE `notify_inval_inode`). (The trait lives in the engine, so the adapter
+/// crate can't implement it directly — this newtype bridges them.)
+#[cfg(target_os = "windows")]
+struct EngineCfInvalidate(fs_cfapi::CfApiInvalidate);
+
+#[cfg(target_os = "windows")]
+impl crate::Invalidate for EngineCfInvalidate {
+    fn invalidate(&self, ino: u64) {
+        self.0.invalidate(ino);
+    }
+    fn created(&self, ino: u64) {
+        self.0.created(ino);
+    }
+}
+
+/// The **CfAPI** mount path (Windows) — the driverless successor to [`WinfspMount`] (the
+/// OneDrive model: a registered sync-root folder, on-demand hydration, native Explorer
+/// integration; no GPL driver). Same `start`/`stop`/`is_running`/`mountpoint` shape so a host
+/// can alias it in place of WinFsp. Phase 1: populate + hydrate + invalidate (the download
+/// half); local-edit capture is Phase 2 (see `docs/plan-windows-cfapi-migration.md`).
+///
+/// Unlike WinFsp, the CfAPI callbacks run on the OS's own threads against a registered root,
+/// so there's no FUSE-style session thread — we hold the `CfApiMountHandle` (Drop disconnects
+/// + unregisters). The sync + nudge loops are identical to the other backends.
+#[cfg(target_os = "windows")]
+pub struct CfApiMount {
+    stop: Arc<AtomicBool>,
+    handle: Option<fs_cfapi::CfApiMountHandle>,
+    sync_handle: Option<JoinHandle<()>>,
+    mountpoint: PathBuf,
+    // Kept for the post-disconnect shutdown drain (see `stop`): after the sync thread is
+    // joined and the sync root disconnected (which flushes CfAPI's NOTIFY callbacks into the
+    // outbox), we push whatever those callbacks captured — on the main thread, lock-contention-free.
+    provider: Arc<SqliteProvider>,
+    client: ServerClient,
+    // Serializes the sync loop's push against the shutdown drain so they never push the same
+    // outbox node concurrently (which would self-conflict on the second push's stale base version).
+    push_gate: Arc<std::sync::Mutex<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl CfApiMount {
+    pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
+        let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
+        let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
+        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
+        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
+        // cache is kept — content-addressed, so hydrated files stay available offline).
+        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
+        }
+        let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
+
+        // Pull the current tree before mounting (so the first enumeration shows the library)
+        // and **reset the cursor to the snapshot head**. This must happen before the sync
+        // thread starts (it reads the cursor once). A reused DB can carry a cursor from a
+        // *different/larger* library that's ahead of this one's head_seq — then the delta pull
+        // ("changes after <stale cursor>") returns nothing and remote edits never apply.
+        // Snapshotting + resetting the cursor reconciles that.
+        match SyncEngine::pull_snapshot(&provider, &client) {
+            Ok(head) => {
+                let _ = provider.set_cursor(head);
+                println!("cfapi: initial pull complete (head_seq {head}, cursor reset)");
+            }
+            Err(e) => eprintln!("cfapi: initial pull failed (will populate as the loop catches up): {e}"),
+        }
+
+        // ONE teardown flag shared by the mount's callbacks AND the invalidator. The sync loop's
+        // pull calls `invalidate`/`created` (which re-enter CfAPI: CfUpdatePlaceholder /
+        // CfCreatePlaceholders) right up to unmount; without a shared flag a pull landing during
+        // disconnect would deadlock the closing connection and wedge the shutdown join. We create
+        // it here, hand it to both the invalidator and the mount, and flip it in stop().
+        let shutting_down = Arc::new(AtomicBool::new(false));
+
+        // Cache-invalidation hook over CfUpdatePlaceholder (no construction cycle here — CfAPI
+        // resolves paths + opens handles itself, so it needs no post-mount notifier).
+        let inval: Arc<dyn crate::Invalidate> = Arc::new(EngineCfInvalidate(
+            fs_cfapi::CfApiInvalidate::new(provider.clone(), cfg.mountpoint.clone(), shutting_down.clone()),
+        ));
+
+        // Serialize the sync loop's push against the shutdown drain (see `push_gate` field).
+        let push_gate = Arc::new(std::sync::Mutex::new(()));
+
+        let sync_handle = {
+            let provider = provider.clone();
+            let client = client.clone();
+            let stop = stop.clone();
+            let poll = cfg.poll;
+            let inval = inval.clone();
+            let push_gate = push_gate.clone();
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), Some(push_gate)))
+        };
+        {
+            let client = client.clone();
+            let stop = stop.clone();
+            thread::spawn(move || nudge_loop(client, stop, nudge_tx));
+        }
+
+        // Hydrate-on-FETCH_DATA: CfAPI hands us the node_id (placeholder FileIdentity); pull
+        // its missing chunks via presigned GET into the local cache.
+        let hydrate: fs_cfapi::Hydrate = {
+            let p = provider.clone();
+            let c = client.clone();
+            Arc::new(move |node_id: &str| {
+                let io = PresignedIO::new(&c);
+                if let Err(e) = SyncEngine::hydrate(&p, &c, &io, node_id) {
+                    eprintln!("cfapi hydrate {node_id}: {e}");
+                }
+            })
+        };
+
+        // Register + connect (on-demand population via FETCH_PLACEHOLDERS). The handle keeps
+        // the sync root alive. Share the SAME teardown flag the invalidator holds.
+        let handle = fs_cfapi::win::mount_with_shutdown(
+            provider.clone(),
+            &cfg.mountpoint,
+            Some(hydrate),
+            shutting_down.clone(),
+        )?;
+        println!("CfAPI sync root at {}", cfg.mountpoint.display());
+
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+            sync_handle: Some(sync_handle),
+            mountpoint: cfg.mountpoint,
+            provider,
+            client,
+            push_gate,
+        })
+    }
+
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| h.is_running())
+    }
+
+    pub fn stop(&mut self) {
+        // Ordered teardown that's deadlock-free AND can't drop the captured edit/delete/rename,
+        // even though CfAPI delivers its batched NOTIFY callbacks at unmount and the sync thread's
+        // push can be mid-HTTP at that moment:
+        //
+        // 1. Enter teardown mode (begin_shutdown) so EVERY re-entrant CfAPI path bails: the NOTIFY
+        //    callbacks (convert/set-in-sync/ACK) AND the sync-loop pull's invalidate/created
+        //    (CfUpdatePlaceholder/CfCreatePlaceholders). Without this a callback or invalidate
+        //    landing during disconnect deadlocks the closing connection.
+        // 2. Signal stop. The sync thread will wind down, but it may be stuck mid-push on a slow
+        //    HTTP call (observed: the join hung in the push phase). We do NOT block teardown on it.
+        // 3. Disconnect the sync root NOW. Safe even with the sync thread still running: with
+        //    `shutting_down` set it makes no re-entrant CfAPI calls, so the only contention is the
+        //    brief SQLite lock. Disconnect flushes the pending NOTIFY callbacks into the outbox.
+        // 4. Drain the outbox on the main thread — this is the authoritative final push. It pushes
+        //    the full outbox (so the rename can't be lost behind a stuck sync-thread push) and
+        //    settles for callbacks that land just after disconnect. A redundant double-push with
+        //    the (possibly still-running) sync thread is harmless (idempotent commit).
+        // 5. Finally join the sync thread with a bounded wait so its in-flight push (bounded by the
+        //    30s HTTP timeout) finishes cleanly; detach if it somehow outlasts that.
+        if let Some(h) = &self.handle {
+            h.begin_shutdown();
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.take(); // Drop disconnects (flushes callbacks → outbox) + stops the watcher
+        eprintln!("cfapi: shutdown — disconnected; draining outbox");
+        self.shutdown_drain();
+        if let Some(h) = self.sync_handle.take() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                eprintln!("cfapi: sync thread still busy post-drain — detaching");
+            }
+        }
+        eprintln!("cfapi: shutdown — done");
+    }
+
+    /// Push whatever the disconnect's NOTIFY callbacks captured into the outbox. Runs on the
+    /// caller's thread after the sync thread is joined + the root disconnected. Requires the
+    /// outbox to stay empty for a few consecutive polls before declaring done (CfAPI can deliver
+    /// a callback a moment after `CfDisconnectSyncRoot` returns), bounded by a deadline.
+    fn shutdown_drain(&self) {
+        let io = PresignedIO::new(&self.client);
+        let start = std::time::Instant::now();
+        // CfAPI flushes its batched NOTIFY callbacks (delete/rename/edit) at disconnect, so the
+        // outbox can keep growing for a moment AFTER the drain starts, and a slow multi-chunk edit
+        // push can take seconds. The deadline is therefore IDLE-based (measured from the last time
+        // the outbox had work), never a fixed wall-clock budget that a single slow push could eat,
+        // and we never declare done while entries remain — so a late straggler (the B3 rename) is
+        // always pushed. A hard cap is the only absolute backstop against a true hang.
+        const STABLE: Duration = Duration::from_secs(3); // outbox empty this long → likely done
+        const MAX_IDLE: Duration = Duration::from_secs(6); // give up this long after the last work
+        const HARD_CAP: Duration = Duration::from_secs(120); // absolute backstop against a true hang
+        let mut last_work = start;
+        let mut empty_since: Option<std::time::Instant> = None;
+        loop {
+            let before;
+            {
+                // Hold the push gate so we never push concurrently with the (possibly still
+                // winding-down) sync thread — that would self-conflict on a shared node. The gate
+                // also makes us wait out the sync thread's in-flight push before our first attempt.
+                let _gate = self.push_gate.lock().unwrap_or_else(|e| e.into_inner());
+                before = self.provider.outbox_list().unwrap_or_default();
+                if !before.is_empty() {
+                    let ops: Vec<String> = before.iter().map(|(id, op)| format!("{op}:{}", &id[..8.min(id.len())])).collect();
+                    eprintln!("cfapi: drain round — outbox [{}]", ops.join(", "));
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                if let Err(e) = SyncEngine::push_outbox(&self.provider, &self.client, &io) {
+                    eprintln!("cfapi: shutdown drain failed: {e}");
+                }
+            }
+            let now = std::time::Instant::now();
+            let remaining = self.provider.outbox_list().map(|v| v.len()).unwrap_or(0);
+            if !before.is_empty() || remaining > 0 {
+                last_work = now;
+                empty_since = None;
+            } else if empty_since.is_none() {
+                empty_since = Some(now);
+            }
+            // Done only when the outbox is EMPTY and has stayed empty for STABLE and nothing has
+            // happened for MAX_IDLE — so a straggler that lands seconds after a slow push is caught.
+            if remaining == 0 {
+                if let Some(since) = empty_since {
+                    if now.duration_since(since) >= STABLE && now.duration_since(last_work) >= MAX_IDLE {
+                        break;
+                    }
+                }
+            }
+            if now.duration_since(start) >= HARD_CAP {
+                eprintln!("cfapi: shutdown drain hard-cap hit with {remaining} still queued");
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        eprintln!("cfapi: shutdown drain done");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for CfApiMount {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A stable id for "the library this (server, token) points at", used to bind a local DB to
+/// one library so a reused DB path can't mix two. (Keyed by token, so each device's cache is
+/// its own — which is correct; cross-device sharing of a local cache is never wanted.)
+fn library_id_for(server: &str, token: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    server.hash(&mut h);
+    token.hash(&mut h);
+    h.finish() as i64
+}
+
+/// Push the outbox + pull the changelog delta on each nudge or poll-timeout. `inval`, when
+/// present (the FUSE `Daemon`), drops the kernel cache for any inode a pull repoints at new
+/// content; the WebDAV/WinFsp mounts pass `None` (no strong push-invalidation yet).
 fn sync_loop(
     provider: Arc<SqliteProvider>,
     client: ServerClient,
     stop: Arc<AtomicBool>,
     nudge_rx: mpsc::Receiver<i64>,
     poll: Duration,
+    inval: Option<Arc<dyn crate::Invalidate>>,
+    push_gate: Option<Arc<std::sync::Mutex<()>>>,
 ) {
     let mut cursor = provider.cursor().unwrap_or(0);
     println!("sync loop started (cursor {cursor}, poll {poll:?})");
+    let mut tick: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
+        tick += 1;
         let io = PresignedIO::new(&client);
-        match SyncEngine::sync_tick(&provider, &client, &io, cursor) {
+        // Hold the push gate across the tick (CfAPI only) so the shutdown drain can't push the
+        // SAME outbox node concurrently — a concurrent double-push sends the same base_version_id
+        // twice and the server records a spurious self-conflict on the second.
+        let guard = push_gate.as_ref().map(|g| g.lock().unwrap_or_else(|e| e.into_inner()));
+        let r = SyncEngine::sync_tick_inval(&provider, &client, &io, cursor, inval.as_deref());
+        drop(guard);
+        match r {
             Ok(new_cursor) => {
                 if new_cursor != cursor {
                     if let Err(e) = provider.set_cursor(new_cursor) {
@@ -415,7 +728,7 @@ fn sync_loop(
                     cursor = new_cursor;
                 }
             }
-            Err(e) => eprintln!("sync tick error: {e}"),
+            Err(e) => eprintln!("sync tick #{tick} error: {e}"),
         }
         // Wait for a nudge (pull now) or the poll fallback; coalesce a burst.
         match nudge_rx.recv_timeout(poll) {
@@ -426,6 +739,15 @@ fn sync_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+    // Graceful shutdown: drain the outbox one final time so a local change captured between the
+    // last tick and `stop` (e.g. a FUSE write right before unmount) still reaches the server.
+    // (The CfAPI backend does NOT rely on this — its NOTIFY callbacks flush only at disconnect,
+    // *after* the sync thread is joined, so `CfApiMount::stop` runs its own post-disconnect drain.
+    // For FUSE/WebDAV/WinFsp the local change is already in the outbox here, so one pass suffices.)
+    let io = PresignedIO::new(&client);
+    if let Err(e) = SyncEngine::push_outbox(&provider, &client, &io) {
+        eprintln!("sync: final outbox drain failed: {e}");
     }
     println!("sync loop stopped");
 }

@@ -12,6 +12,8 @@ convergence stays the job of the model-based harness in `fs-provider/tests/conve
 | `webdav-rclone.sh` | **rclone** | `fs-webdav` (macOS path) | ✅ gating | Copy a tree in, `check --download` every file byte-for-byte, then modify/append/delete + `sync` + re-check. Exercises read+write through chunking + the content store with an independent client. Cross-platform. |
 | `fsx-fuse.sh` | **fsx** (xfstests) | `fs-fuse` (Linux path) | ✅ gating | A long randomized write/read/**truncate** stream verified against an in-memory model — the strongest adversarial check of the data plane. Linux only. |
 | `pjdfstest-fuse.sh` | **pjdfstest** | `fs-fuse` (Linux path) | ℹ️ informational | POSIX semantics for the ops we implement (rename/unlink/mkdir/rmdir/truncate/open). The suite's perms/owner/link tests are out of scope (we don't expose them), so this is a conformance *map*, not a gate. |
+| `cfapi-smoke.ps1` | self-authored | `fs-cfapi` (Windows path) | ℹ️ on-demand/nightly | Live CfAPI write-path proof: register → enumerate → hydrate → one each of new/edit/delete/rename, each asserted to round-trip to the deployed server via the `tree_names` oracle. Needs an interactive Windows session + the deployed server. |
+| `cfapi-conformance.ps1` | self-authored | `fs-cfapi` (Windows path) | ℹ️ on-demand/nightly | The rigorous CfAPI round-trip (the Windows analogue of `mount-conformance`): many files of varied sizes (incl. > chunk size → multi-chunk + dedup), nested dirs, and create/edit/delete/rename churn through the real Cloud Filter mount — asserted **byte-for-byte** by hydrating every file on a fresh device (`verify_tree`) and comparing SHA-256s. |
 
 ## Running locally
 
@@ -24,11 +26,23 @@ client/test-conformance/fsx-fuse.sh [numops]      # default 100000
 client/test-conformance/pjdfstest-fuse.sh         # needs autotools + git + prove
 ```
 
+```powershell
+# Windows only (self-hosted runner, interactive session) — needs the deployed server + chunk store:
+client/test-conformance/cfapi-smoke.ps1        [-Server http://192.168.1.95]
+client/test-conformance/cfapi-conformance.ps1  [-Server http://192.168.1.95] [-Files 24]
+```
+
 ## CI
 
-The `mount-conformance` job in `.github/workflows/rust-client.yml` runs all three on an
-Ubuntu runner: `webdav-rclone` and `fsx-fuse` gate the build; `pjdfstest-fuse` runs
+The `mount-conformance` job in `.github/workflows/rust-client.yml` runs the three FUSE/WebDAV
+suites on an Ubuntu runner: `webdav-rclone` and `fsx-fuse` gate the build; `pjdfstest-fuse` runs
 `continue-on-error` (informational map).
+
+The CfAPI suites run on the self-hosted Windows runner — `nightly.yml` (`windows-smoke` +
+`cfapi-conformance`), and on-demand from `rust-client.yml` (`gh workflow run rust-client.yml -f
+target=cfapi` for the smoke, `-f target=cfapi-conf` for the conformance). Both are
+`continue-on-error`: CfAPI needs an interactive Windows login session to enumerate, so they're a
+live regression net, not a build gate.
 
 ## Notes / caveats
 

@@ -1,0 +1,29 @@
+[package]
+name = "fs-cfapi"
+version = "0.1.0"
+edition = "2021"
+description = "Windows Cloud Filter API (CfAPI) adapter for fs-provider — the driverless, native-Explorer Windows mount (the OneDrive model). Replaces the GPL-WinFsp path. Windows-only FFI; pure logic is cross-platform."
+license = "Apache-2.0"
+
+[dependencies]
+fs-provider = { path = "../fs-provider" }
+
+# Windows-only: the Cloud Filter API bindings. cldapi.dll is part of Windows itself (no
+# driver, no SDK install, no copyleft — the whole point vs WinFsp). Everything that touches
+# it is behind `#[cfg(windows)]`, so on macOS/Linux this crate compiles to just the
+# cross-platform pure logic (FileIdentity / FILETIME / placeholder decisions) + its tests.
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",                  # SECURITY_ATTRIBUTES (CreateFileW)
+    "Win32_Storage_FileSystem",        # FILE_BASIC_INFO, CreateFileW, FILE_* flags
+    "Win32_Storage_CloudFilters",      # the CfAPI surface
+    "Win32_System_CorrelationVector",  # gates CF_CALLBACK_*/CF_OPERATION_INFO + CfConnectSyncRoot
+    "Win32_System_IO",                 # OVERLAPPED + CancelIoEx + GetOverlappedResult (watcher)
+    "Win32_System_Threading",          # CreateEventW/SetEvent/WaitForMultipleObjects (watcher stop)
+] }
+
+[[bin]]
+name = "maker-cfapi"
+path = "src/bin/maker-cfapi.rs"

@@ -54,7 +54,7 @@ for op in "${SUBSET[@]}"; do
   # Each .t locates the pjdfstest binary relative to itself (../../pjdfstest), and the
   # filesystem under test is the CWD ($MNT). Parse the TAP totals so this is a real
   # pass/total map, not just FAIL — perms/owner tests are expected to fail (see below).
-  out=$(prove -Qr "$dir" 2>&1) || true
+  out=$(prove -rv "$dir" 2>&1) || true
   total=$(printf '%s\n' "$out" | grep -oE 'Tests=[0-9]+' | head -1 | grep -oE '[0-9]+')
   failed=$(printf '%s\n' "$out" | grep -oE 'Failed: [0-9]+' | awk '{s+=$2} END{print s+0}')
   if [ -n "${total:-}" ]; then
@@ -62,6 +62,12 @@ for op in "${SUBSET[@]}"; do
   else
     printf "    %-8s  %s\n" "$op" "$(printf '%s\n' "$out" | grep -Ei 'All tests|Result' | tail -1)"
   fi
+  # Per-.t-file failure breakdown (each .t covers a known aspect: 00=basic, then
+  # perms/owner/errno/link cases). Shows WHERE the misses concentrate.
+  printf '%s\n' "$out" | grep -E "/${op}/[0-9]+\.t .*Failed: [1-9]" | sed -E 's/^/        /' || true
+  # A small sample of the actual failed assertions, so real bugs (wrong errno on a
+  # path we DO support) can be told apart from expected perms/owner gaps.
+  printf '%s\n' "$out" | grep -E "^not ok" | head -8 | sed -E "s#^#        ${op}: #" || true
 done
 
 echo

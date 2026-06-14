@@ -22,7 +22,7 @@ fn commit_file(c: &ServerClient, node_id: &str, parent: Option<&str>, name: &str
         name: name.into(),
         base_version_id: None,
         size,
-        manifest: vec![ChunkRef { hash: hash.into(), offset: 0, length: size }],
+        manifest: vec![ChunkRef { hash: hash.into(), offset: 0, length: size }], mode: 0o644, mtime: 0,
     })
     .expect("begin");
     c.commit_finalize(&commit_id).expect("finalize");
@@ -36,7 +36,7 @@ fn main() {
     a.register(&format!("multi-{}@example.com", uniq()), "device-A").expect("register A");
 
     let dir = format!("d-{}", uniq());
-    a.mkdir(&dir, None, "Projects").expect("mkdir");
+    a.mkdir(&dir, None, "Projects", 0o755, 0).expect("mkdir");
     let f1 = format!("f-{}", uniq());
     commit_file(&a, &f1, Some(&dir), "box.lbrn2", &"a".repeat(64), 12);
     let f2 = format!("f-{}", uniq());

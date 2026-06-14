@@ -343,6 +343,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-cfapi"
+version = "0.1.0"
+dependencies = [
+ "fs-provider",
+ "widestring",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "fs-fuse"
 version = "0.1.0"
 dependencies = [
@@ -1607,12 +1616,15 @@ dependencies = [
 name = "sync-engine"
 version = "0.1.0"
 dependencies = [
+ "fs-cfapi",
  "fs-fuse",
  "fs-provider",
  "fs-webdav",
  "fs-winfsp",
  "fuser",
+ "hex",
  "libc",
+ "sha2",
  "sync-client",
  "thiserror 2.0.18",
  "tokio",

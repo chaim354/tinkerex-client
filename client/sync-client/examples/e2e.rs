@@ -27,7 +27,7 @@ fn main() {
 
     // mkdir Projects
     let dir = format!("dir-{}", uniq());
-    let r = c.mkdir(&dir, None, "Projects").expect("mkdir");
+    let r = c.mkdir(&dir, None, "Projects", 0o755, 0).expect("mkdir");
     assert_eq!(r.seq, 1);
     println!("✓ mkdir Projects (seq {})", r.seq);
 
@@ -44,7 +44,7 @@ fn main() {
             name: "box.lbrn2".into(),
             base_version_id: None,
             size: 12,
-            manifest: manifest.clone(),
+            manifest: manifest.clone(), mode: 0o644, mtime: 0,
         })
         .expect("commit begin");
     assert_eq!(begin.missing, vec![hash.clone()], "the one chunk is missing");
@@ -68,7 +68,7 @@ fn main() {
         name: "box.lbrn2".into(),
         base_version_id: Some(fin1.version_id.clone()),
         size: 20,
-        manifest: manifest2,
+        manifest: manifest2, mode: 0o644, mtime: 0,
     })
     .expect("begin2");
     let fin2 = c.commit_finalize(&commit_id2).expect("finalize2");

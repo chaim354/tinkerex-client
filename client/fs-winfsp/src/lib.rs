@@ -53,12 +53,15 @@ fn to_fsp(e: FsError) -> winfsp::FspError {
     status.into()
 }
 
-/// Convert a Unix mtime (seconds) to a Windows FILETIME (100 ns ticks since 1601).
-fn unix_to_filetime(secs: i64) -> u64 {
-    if secs <= 0 {
+/// Convert a Unix mtime (**nanoseconds** — what `Attr.mtime` now carries) to a Windows
+/// FILETIME (100 ns ticks since 1601). Epoch offset is 11_644_473_600 s = that many *
+/// 1e9 ns; FILETIME ticks are 100 ns, so nanos / 100.
+fn unix_to_filetime(nanos: i64) -> u64 {
+    if nanos <= 0 {
         return 0;
     }
-    ((secs as u64) + 11_644_473_600) * 10_000_000
+    const EPOCH_OFFSET_NANOS: u64 = 11_644_473_600 * 1_000_000_000;
+    ((nanos as u64) + EPOCH_OFFSET_NANOS) / 100
 }
 
 /// Populate a WinFsp `FileInfo` from our provider `Attr`.
@@ -168,10 +171,20 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
         &self,
         file_name: &U16CStr,
         _create_options: u32,
-        _granted_access: u32,
+        granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> Result<Self::FileContext> {
         let (ino, parent, is_dir) = self.resolve(&file_name.to_string_lossy())?;
+        // Opening for write: pull the whole file local first so random writes (which seed
+        // the staging buffer from committed content) never hit a chunk-cache miss.
+        // Mirrors the fs-fuse open hook.
+        const FILE_WRITE_DATA: u32 = 0x0002;
+        const FILE_APPEND_DATA: u32 = 0x0004;
+        if !is_dir && granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0 {
+            if let Some(h) = &self.hydrate {
+                h(ino);
+            }
+        }
         let attr = self.provider.getattr(ino).map_err(to_fsp)?;
         fill_file_info(file_info.as_mut(), &attr);
         Ok(Context::new(ino, parent, is_dir))

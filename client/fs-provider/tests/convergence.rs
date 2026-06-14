@@ -179,6 +179,38 @@ fn apply_remote_is_idempotent() {
 }
 
 #[test]
+fn apply_remote_displaces_a_name_collision() {
+    // Robustness: a pulled snapshot/changelog can present a node whose (parent, name) is
+    // already occupied locally by a DIFFERENT node_id — e.g. one device created a file at a
+    // path another device just freed by delete+create, or two devices raced a rename to the
+    // same name. The remote is authoritative, so the incoming node must win and displace the
+    // stale local one, NOT trip the UNIQUE(parent_ino, name) index and abort the whole pull.
+    let a = provider();
+    write_file(&a, ROOT, "doc.txt", b"incoming wins");
+    let incoming = node_named(&a, "doc.txt");
+
+    // B independently holds a *different* node already named "doc.txt" at the root.
+    let b = provider();
+    write_file(&b, ROOT, "doc.txt", b"stale local");
+    let stale_id = node_named(&b, "doc.txt").node_id;
+    assert_ne!(stale_id, incoming.node_id, "the two doc.txt nodes are distinct");
+
+    // Applying the remote node must succeed (no UNIQUE error) and replace the stale one.
+    b.apply_remote(&incoming).expect("apply_remote must displace the colliding node, not error");
+
+    let after = node_named(&b, "doc.txt");
+    assert_eq!(after.node_id, incoming.node_id, "the incoming node_id now owns the name");
+    let ino = b.lookup(ROOT, "doc.txt").unwrap().ino;
+    assert_eq!(read_all(&b, ino), b"incoming wins", "content is the incoming node's");
+    // Exactly one node holds the name (the stale row is gone).
+    assert_eq!(
+        b.export_tree().unwrap().iter().filter(|n| n.name == "doc.txt").count(),
+        1,
+        "no duplicate (parent, name) rows remain"
+    );
+}
+
+#[test]
 fn state_persists_across_reopen() {
     // Durability: a provider backed by an on-disk DB + chunk dir must reconstruct its
     // tree and content after a process restart (drop + reopen the same paths).

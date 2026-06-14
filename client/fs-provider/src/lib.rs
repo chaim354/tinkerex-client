@@ -20,7 +20,35 @@ use sha2::{Digest, Sha256};
 pub mod chunkstore;
 pub use chunkstore::{ChunkStore, LocalChunkStore};
 
+pub mod locks;
+pub use locks::{LockManager, LockRange};
+
 pub const ROOT_INO: u64 = 1;
+
+/// The default permission bits for a freshly created node (no umask modeling — the
+/// mount runs as the user, who owns everything).
+fn default_mode(kind: Kind) -> u32 {
+    match kind {
+        Kind::Dir => 0o755,
+        Kind::File => 0o644,
+    }
+}
+
+/// Wall-clock **nanoseconds** since the epoch — the real `mtime` stamp for a *local*
+/// modification (a new write with no caller-supplied time). A pulled remote change carries
+/// the source device's real mtime instead (see [`SqliteProvider::apply_remote`]); we no
+/// longer stamp `now` on pull, which used to destroy the true modification time (breaking
+/// build tools that key on it). Cache freshness after a pull is handled by an explicit
+/// adapter `invalidate(ino)` (the `content_changed` flag [`apply_remote`] returns), not an
+/// mtime bump. Nanos resolution matches what build tools and the future CfAPI/File-Provider
+/// metadata want; stored as i64 (a `bigint` on the wire/server — unix-nanos in 2026
+/// overflow a 32-bit int).
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -50,7 +78,12 @@ pub struct Attr {
     pub ino: u64,
     pub kind: Kind,
     pub size: u64,
+    /// Real modification time, **unix nanoseconds** (see [`now_nanos`]). Preserved + synced
+    /// so a file's true mtime is stable across devices (not the sync time).
     pub mtime: i64,
+    /// POSIX permission bits (e.g. `0o644`, `0o755`). Preserved + synced so the
+    /// executable bit (and other mode bits) survive a chmod and propagate across devices.
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +112,33 @@ pub struct SyncNode {
     pub kind: Kind,
     pub manifest_id: Option<String>,
     pub chunks: Vec<ChunkLoc>,
+    /// The server version this node currently reflects. On **pull** it's the version the
+    /// server reports (stored locally); on **push** it's sent as the commit's
+    /// `base_version_id` so the server can detect a conflicting concurrent edit. `None`
+    /// for dirs and never-synced nodes.
+    pub version_id: Option<String>,
+    /// POSIX permission bits, synced so the executable bit survives across devices.
+    pub mode: u32,
+    /// Real modification time (unix nanoseconds). Synced so the true mtime — not the sync
+    /// time — is what every device sees. On **push** it's the local node's mtime; on
+    /// **pull** it's the source device's mtime, applied verbatim by [`SqliteProvider::apply_remote`].
+    pub mtime: i64,
+}
+
+/// What [`SqliteProvider::apply_remote`] did, so the caller can refresh the OS cache. A
+/// pull that **repointed an existing node at new content** must explicitly invalidate the
+/// kernel's data cache for that inode (we no longer bump mtime to force a re-read). A brand
+/// new node, or a metadata-only change, has nothing cached to invalidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    /// The local inode the node maps to (for the adapter's `invalidate(ino)`).
+    pub ino: u64,
+    /// The node already existed and its manifest (content) changed — invalidate its cache.
+    pub content_changed: bool,
+    /// The node did not exist locally before this pull (a fresh INSERT, not an UPDATE). The
+    /// adapter should *create* a fresh placeholder for it (e.g. CfAPI `CfCreatePlaceholders`)
+    /// rather than invalidate an existing one — there's nothing cached to invalidate yet.
+    pub inserted: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +155,8 @@ pub enum FsError {
     NotEmpty,
     #[error("chunk missing: {0}")]
     ChunkMissing(String),
+    #[error("locked (would block)")]
+    WouldBlock,
     #[error("db: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("io: {0}")]
@@ -133,6 +195,17 @@ pub trait Provider: Send + Sync {
     fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32>;
     /// Finalize writeback: chunk the staged content, store + dedup, update the tree.
     fn flush(&self, ino: u64) -> Result<()>;
+    /// Set permission bits (the kernel's `chmod`). Default no-op; `SqliteProvider`
+    /// persists + syncs it so the executable bit survives and propagates.
+    fn set_mode(&self, _ino: u64, _mode: u32) -> Result<()> {
+        Ok(())
+    }
+    /// Set the modification time (unix nanoseconds — the kernel's `setattr(mtime)`, e.g. a
+    /// `utimensat`/`cp -p`). Default no-op; `SqliteProvider` persists + syncs it so the real
+    /// mtime survives and propagates instead of being overwritten with the sync time.
+    fn set_mtime(&self, _ino: u64, _mtime: i64) -> Result<()> {
+        Ok(())
+    }
     /// Resize the file to exactly `size` bytes (the kernel's `setattr`/`O_TRUNC`).
     /// Shrinking drops any content past the new EOF (so an overwrite-with-shorter
     /// leaves no stale tail); growing zero-fills. The new length is what `flush`
@@ -141,6 +214,27 @@ pub trait Provider: Send + Sync {
     fn unlink(&self, parent: u64, name: &str) -> Result<()>;
     fn rmdir(&self, parent: u64, name: &str) -> Result<()>;
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()>;
+
+    // ---- advisory locking (POSIX byte-range; local to this device) -------------------
+    // Defaults are a no-op "always succeeds" — a provider without lock support behaves as
+    // if nothing is ever locked. `SqliteProvider` overrides with real tracking.
+
+    /// `F_SETLK`: acquire `lock`. `Err(WouldBlock)` if another owner holds a conflict.
+    fn set_lock(&self, _ino: u64, _lock: LockRange) -> Result<()> {
+        Ok(())
+    }
+    /// `F_GETLK`: the conflicting lock a `set_lock` would hit, or `None` if free.
+    fn test_lock(&self, _ino: u64, _probe: LockRange) -> Result<Option<LockRange>> {
+        Ok(None)
+    }
+    /// `F_UNLCK`: release the owner's locks over `[start, end]`.
+    fn unlock(&self, _ino: u64, _owner: u64, _start: u64, _end: u64) -> Result<()> {
+        Ok(())
+    }
+    /// Release every lock an owner holds on `ino` (on file close).
+    fn release_locks(&self, _ino: u64, _owner: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// SQLite-backed [`Provider`]. Tree in SQLite, bytes in a [`ChunkStore`].
@@ -151,6 +245,9 @@ pub struct SqliteProvider {
     /// staging file; in-memory keeps the foundation simple and fully testable.)
     staging: Mutex<HashMap<u64, Vec<u8>>>,
     chunk_cfg: ChunkConfig,
+    /// Local advisory file locks (POSIX byte-range), honored between processes on this
+    /// device. Lives in memory: locks are inherently per-mount and released on close.
+    locks: LockManager,
 }
 
 impl SqliteProvider {
@@ -172,9 +269,11 @@ impl SqliteProvider {
                 name        TEXT NOT NULL,
                 kind        TEXT NOT NULL,
                 size        INTEGER NOT NULL DEFAULT 0,
-                mtime       INTEGER NOT NULL DEFAULT 0,
+                mtime       INTEGER NOT NULL DEFAULT 0,  -- real mtime, unix NANOSECONDS (preserved + synced)
                 manifest_id TEXT,
-                node_id     TEXT
+                node_id     TEXT,
+                version_id  TEXT,         -- server version this node reflects (commit base)
+                mode        INTEGER       -- POSIX permission bits (preserved + synced)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_ino, name);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_node_id ON nodes(node_id);
@@ -200,6 +299,9 @@ impl SqliteProvider {
                 value INTEGER NOT NULL
             );",
         )?;
+        // Migrate older DBs that predate these columns (ignore "duplicate column").
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN version_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN mode INTEGER", []);
         // Ensure the root directory (ino 1) exists.
         conn.execute(
             "INSERT OR IGNORE INTO nodes(ino, parent_ino, name, kind, node_id) VALUES (?1, NULL, '', 'dir', 'root')",
@@ -210,19 +312,22 @@ impl SqliteProvider {
             store,
             staging: Mutex::new(HashMap::new()),
             chunk_cfg,
+            locks: LockManager::new(),
         })
     }
 
     fn attr_row(conn: &Connection, ino: u64) -> Result<Attr> {
         conn.query_row(
-            "SELECT ino, kind, size, mtime FROM nodes WHERE ino = ?1",
+            "SELECT ino, kind, size, mtime, mode FROM nodes WHERE ino = ?1",
             params![ino as i64],
             |r| {
+                let kind = Kind::from_str(&r.get::<_, String>(1)?);
                 Ok(Attr {
                     ino: r.get::<_, i64>(0)? as u64,
-                    kind: Kind::from_str(&r.get::<_, String>(1)?),
+                    kind,
                     size: r.get::<_, i64>(2)? as u64,
                     mtime: r.get::<_, i64>(3)?,
+                    mode: r.get::<_, Option<i64>>(4)?.map(|m| m as u32).unwrap_or_else(|| default_mode(kind)),
                 })
             },
         )
@@ -284,9 +389,11 @@ impl SqliteProvider {
             return Err(FsError::NotADirectory);
         }
         let node_id = uuid::Uuid::new_v4().to_string();
+        let mode = default_mode(kind);
+        let mtime = now_nanos();
         let res = conn.execute(
-            "INSERT INTO nodes(parent_ino, name, kind, node_id) VALUES (?1, ?2, ?3, ?4)",
-            params![parent as i64, name, kind.as_str(), node_id],
+            "INSERT INTO nodes(parent_ino, name, kind, node_id, mode, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![parent as i64, name, kind.as_str(), node_id, mode as i64, mtime],
         );
         match res {
             Ok(_) => {}
@@ -304,8 +411,21 @@ impl SqliteProvider {
             ino,
             kind,
             size: 0,
-            mtime: 0,
+            mtime,
+            mode,
         })
+    }
+
+    /// Record the server version a node now reflects — called after a successful push
+    /// (the finalize response's version_id) so the next edit's commit `base` is current
+    /// and the node doesn't conflict with its own just-pushed version.
+    pub fn set_node_version(&self, node_id: &str, version_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET version_id = ?1 WHERE node_id = ?2",
+            params![version_id, node_id],
+        )?;
+        Ok(())
     }
 
     /// The stable server id for a local inode (`None` if the inode is gone).
@@ -322,7 +442,7 @@ impl SqliteProvider {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT n.node_id, n.name, n.kind, n.manifest_id,
-                    CASE WHEN n.parent_ino = ?1 THEN NULL ELSE p.node_id END
+                    CASE WHEN n.parent_ino = ?1 THEN NULL ELSE p.node_id END, n.version_id, n.mode, n.mtime
              FROM nodes n LEFT JOIN nodes p ON p.ino = n.parent_ino
              WHERE n.ino != ?1
              ORDER BY n.ino",
@@ -334,11 +454,15 @@ impl SqliteProvider {
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (node_id, name, kind_s, manifest_id, parent_node_id) = row?;
+            let (node_id, name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime) = row?;
+            let kind = Kind::from_str(&kind_s);
             let chunks = match &manifest_id {
                 Some(m) => Self::manifest_rows(&conn, m)?,
                 None => Vec::new(),
@@ -347,9 +471,12 @@ impl SqliteProvider {
                 node_id,
                 parent_node_id,
                 name,
-                kind: Kind::from_str(&kind_s),
+                kind,
                 manifest_id,
                 chunks,
+                version_id,
+                mode: mode.map(|m| m as u32).unwrap_or_else(|| default_mode(kind)),
+                mtime,
             });
         }
         Ok(out)
@@ -373,7 +500,13 @@ impl SqliteProvider {
 
     /// Apply a node pulled from the server into the local tree (upsert by node_id).
     /// Parents must already be applied (the server returns them parent-first).
-    pub fn apply_remote(&self, node: &SyncNode) -> Result<()> {
+    ///
+    /// Writes the **source device's** `mtime` verbatim (not `now`) so a file's real
+    /// modification time is identical on every device. Returns an [`ApplyOutcome`] telling
+    /// the caller whether an *existing* node was repointed at new content — if so, the
+    /// adapter must `invalidate(ino)` to drop the OS data cache (we no longer rely on an
+    /// mtime bump to force the re-read).
+    pub fn apply_remote(&self, node: &SyncNode) -> Result<ApplyOutcome> {
         let conn = self.conn.lock().unwrap();
         let parent_ino: i64 = match &node.parent_node_id {
             None => ROOT_INO as i64,
@@ -399,24 +532,55 @@ impl SqliteProvider {
             }
         }
         let size: i64 = node.chunks.iter().map(|c| c.length as i64).sum();
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM nodes WHERE node_id = ?1)",
-            params![node.node_id],
-            |r| r.get(0),
+        // Look up the prior row (ino + manifest) so we can both reuse the inode on update
+        // and decide whether the content actually changed (→ cache invalidation).
+        let prior: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT ino, manifest_id FROM nodes WHERE node_id = ?1",
+                params![node.node_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        // Displace any *different* node already occupying this (parent, name): the remote
+        // snapshot/changelog is authoritative, so the incoming node wins. Without this, applying
+        // a snapshot in which a name was reused (e.g. a delete+create, or two devices racing a
+        // create/rename to the same path) hits the `UNIQUE(parent_ino, name)` index and the whole
+        // pull fails. Recursively sweeping the displaced subtree mirrors the local POSIX
+        // rename-replace path. (The displaced node's own changelog delete, if any, arrives
+        // separately and is then a no-op.)
+        conn.execute(
+            "DELETE FROM nodes WHERE ino IN (
+                 WITH RECURSIVE sub(ino) AS (
+                     SELECT ino FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND node_id != ?3
+                     UNION ALL
+                     SELECT n.ino FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                 )
+                 SELECT ino FROM sub
+             )",
+            params![parent_ino, node.name, node.node_id],
         )?;
-        if exists {
+        let ino = if let Some((ino, _)) = &prior {
             conn.execute(
-                "UPDATE nodes SET parent_ino=?1, name=?2, kind=?3, manifest_id=?4, size=?5 WHERE node_id=?6",
-                params![parent_ino, node.name, node.kind.as_str(), node.manifest_id, size, node.node_id],
+                "UPDATE nodes SET parent_ino=?1, name=?2, kind=?3, manifest_id=?4, size=?5, mtime=?6, version_id=?7, mode=?8 WHERE node_id=?9",
+                params![parent_ino, node.name, node.kind.as_str(), node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64, node.node_id],
             )?;
+            *ino as u64
         } else {
             conn.execute(
-                "INSERT INTO nodes(parent_ino, name, kind, node_id, manifest_id, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![parent_ino, node.name, node.kind.as_str(), node.node_id, node.manifest_id, size],
+                "INSERT INTO nodes(parent_ino, name, kind, node_id, manifest_id, size, mtime, version_id, mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![parent_ino, node.name, node.kind.as_str(), node.node_id, node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64],
             )?;
-        }
-        Ok(())
+            conn.last_insert_rowid() as u64
+        };
+        // Content changed iff the node already existed and its manifest moved (a same-size
+        // edit included — that's exactly the case the old mtime-bump heuristic could miss).
+        let content_changed = match &prior {
+            Some((_, old_manifest)) => *old_manifest != node.manifest_id,
+            None => false,
+        };
+        let inserted = prior.is_none();
+        Ok(ApplyOutcome { ino, content_changed, inserted })
     }
 
     /// Apply a delete pulled from the server: remove the node identified by its stable
@@ -525,6 +689,30 @@ impl SqliteProvider {
             .unwrap_or(0))
     }
 
+    /// Bind this local DB to a `library_id` (a stable per-library/account id). If the DB was
+    /// last used by a **different** library, its stale tree state — nodes, manifests, outbox,
+    /// and the cursor — is wiped so a reused DB path can't mix two libraries (which produced
+    /// duplicate/colliding placeholders + a stale cursor). The content-addressed chunk store
+    /// is left intact (safe to share — keyed by hash). Returns `true` if it wiped a different
+    /// library's state, `false` if the DB already belonged to this library (kept as-is).
+    pub fn bind_library(&self, library_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let current: Option<i64> = conn
+            .query_row("SELECT value FROM sync_state WHERE key = 'library'", [], |r| r.get(0))
+            .optional()?;
+        if current == Some(library_id) {
+            return Ok(false); // same library — keep the local cache + cursor
+        }
+        let had_nodes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM nodes WHERE parent_ino IS NOT NULL", [], |r| r.get(0))?;
+        conn.execute("DELETE FROM nodes WHERE parent_ino IS NOT NULL", [])?;
+        conn.execute("DELETE FROM manifest_chunks", [])?;
+        conn.execute("DELETE FROM outbox", [])?;
+        conn.execute("DELETE FROM sync_state", [])?; // clears the old cursor too
+        conn.execute("INSERT INTO sync_state(key, value) VALUES ('library', ?1)", params![library_id])?;
+        Ok(had_nodes > 0)
+    }
+
     pub fn set_cursor(&self, cursor: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -542,7 +730,7 @@ impl SqliteProvider {
         let row = conn
             .query_row(
                 "SELECT n.name, n.kind, n.manifest_id,
-                        CASE WHEN n.parent_ino = ?2 THEN NULL ELSE p.node_id END
+                        CASE WHEN n.parent_ino = ?2 THEN NULL ELSE p.node_id END, n.version_id, n.mode, n.mtime
                  FROM nodes n LEFT JOIN nodes p ON p.ino = n.parent_ino
                  WHERE n.node_id = ?1",
                 params![node_id, ROOT_INO as i64],
@@ -552,14 +740,18 @@ impl SqliteProvider {
                         r.get::<_, String>(1)?,
                         r.get::<_, Option<String>>(2)?,
                         r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, i64>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let (name, kind_s, manifest_id, parent_node_id) = match row {
+        let (name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime) = match row {
             Some(r) => r,
             None => return Ok(None),
         };
+        let kind = Kind::from_str(&kind_s);
         let chunks = match &manifest_id {
             Some(m) => Self::manifest_rows(&conn, m)?,
             None => Vec::new(),
@@ -568,10 +760,160 @@ impl SqliteProvider {
             node_id: node_id.to_string(),
             parent_node_id,
             name,
-            kind: Kind::from_str(&kind_s),
+            kind,
             manifest_id,
             chunks,
+            version_id,
+            mode: mode.map(|m| m as u32).unwrap_or_else(|| default_mode(kind)),
+            mtime,
         }))
+    }
+
+    // ---- CfAPI callback helpers (local-origin node-id operations) ---------------
+    //
+    // CfAPI callbacks receive a cloud root-relative path or a node identity, not the
+    // (parent_ino, name) pair the Provider trait uses. These three helpers bridge the
+    // gap and are usable cross-platform (no Windows-only code here).
+
+    /// Local-origin recursive delete: remove the node identified by `node_id` (and its
+    /// entire subtree) from the local tree, and enqueue a `"delete"` outbox entry so the
+    /// sync loop pushes the removal to the server. Idempotent: if the node does not exist
+    /// the call is a silent no-op and nothing is written to the outbox.
+    ///
+    /// Contrast with [`apply_remote_delete`]: that method is for *inbound* server deletes
+    /// and deliberately skips the outbox (to avoid echoing the change back). This method is
+    /// for *outbound* local deletes captured by a CfAPI callback.
+    pub fn delete_by_node_id(&self, node_id: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Recursive CTE delete of the entire subtree (same as apply_remote_delete).
+        // `changed` tells us whether anything was actually deleted — if zero the node
+        // wasn't present so we skip the outbox write (idempotent: no-op on missing ids).
+        let changed = tx.execute(
+            "DELETE FROM nodes WHERE ino IN (
+                 WITH RECURSIVE sub(ino) AS (
+                     SELECT ino FROM nodes WHERE node_id = ?1
+                     UNION ALL
+                     SELECT n.ino FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                 )
+                 SELECT ino FROM sub
+             )",
+            params![node_id],
+        )?;
+        if changed > 0 {
+            // Enqueue a delete for the sync loop — the subtree children are implicitly
+            // deleted on the server when the parent is deleted (the server also does a
+            // recursive sweep), so a single outbox entry for the root of the deleted
+            // subtree is sufficient.
+            Self::enqueue(&tx, node_id, "delete")?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Resolve a library-relative POSIX path (e.g. `"a/b/c.txt"`) to `(parent_ino,
+    /// leaf_name)`, creating any missing intermediate directories via `mkdir`. The **leaf
+    /// is not created** — the caller does that (e.g. via `create`). A top-level path
+    /// (`"foo.txt"`) returns `(ROOT_INO, "foo.txt")`. Empty input or a bare `"/"` returns
+    /// `Err(NotFound)`.
+    ///
+    /// Returns `Err(NotADirectory)` if an intermediate path component exists as a file
+    /// rather than a directory (e.g. `"foo.txt/bar.txt"` when `"foo.txt"` is a file).
+    ///
+    /// This function does **not** normalize `.` or `..` — the caller must pass a clean
+    /// POSIX path.
+    ///
+    /// This is the CfAPI bridge for new-file capture: a `NOTIFY_FILE_CLOSE` callback
+    /// delivers a root-relative OS path; `resolve_path` maps it to the tree location so
+    /// the adapter can call `create`/`ingest_bytes` with the correct `(parent_ino, name)`.
+    pub fn resolve_path(&self, rel: &str) -> Result<(u64, String)> {
+        // Split on '/' and drop empty components (leading slash, trailing slash, "//").
+        let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Err(FsError::NotFound);
+        }
+        // The leaf is the last component — we stop before creating it.
+        let (dirs, leaf) = parts.split_at(parts.len() - 1);
+        let leaf = leaf[0].to_string();
+        // Walk (and if necessary create) each intermediate directory.
+        let mut current_ino = ROOT_INO;
+        for &component in dirs {
+            current_ino = match self.lookup(current_ino, component) {
+                Ok(attr) => {
+                    if attr.kind != Kind::Dir {
+                        return Err(FsError::NotADirectory);
+                    }
+                    attr.ino
+                }
+                Err(FsError::NotFound) => self.mkdir(current_ino, component)?.ino,
+                Err(e) => return Err(e),
+            };
+        }
+        Ok((current_ino, leaf))
+    }
+
+    /// Look up the node's current `(parent_ino, name)` by `node_id`, then delegate to
+    /// the existing [`Provider::rename`] implementation (which handles POSIX replace,
+    /// enqueues an `"upsert"`, etc.). Returns `Err(NotFound)` if the `node_id` is
+    /// unknown.
+    ///
+    /// This is the CfAPI bridge for rename/move capture: a `NOTIFY_RENAME` callback
+    /// delivers both the source cloud-file identity (CF_PLACEHOLDER_BASIC_INFO →
+    /// `node_id`) and the new root-relative path (call `resolve_path` on it first).
+    pub fn rename_by_node_id(&self, node_id: &str, new_parent: u64, new_name: &str) -> Result<()> {
+        // Look up the current (parent_ino, name) for this node_id.
+        let (old_parent, old_name) = {
+            let conn = self.conn.lock().unwrap();
+            let row: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT parent_ino, name FROM nodes WHERE node_id = ?1",
+                    params![node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match row {
+                Some((p, n)) => (p as u64, n),
+                None => return Err(FsError::NotFound),
+            }
+        };
+        // Delegate to the existing rename implementation.
+        self.rename(old_parent, &old_name, new_parent, new_name)
+    }
+
+    /// Resolve an inode to its `(parent_ino, name)`. Returns `Ok(None)` for the root (which
+    /// has no parent) or an unknown inode. This is the inbound CfAPI bridge for **new remote
+    /// nodes**: when a pull inserts a node, the adapter needs its parent directory (to locate
+    /// the on-disk dir) and its leaf name (to build the placeholder) — both of which the
+    /// `Attr`/`DirEntry` surface omits. Cross-platform (no Windows-only code).
+    pub fn parent_and_name(&self, ino: u64) -> Result<Option<(u64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Option<i64>, String)> = conn
+            .query_row(
+                "SELECT parent_ino, name FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            // A NULL parent_ino is the root row — it has no parent directory.
+            Some((Some(p), name)) => Some((p as u64, name)),
+            _ => None,
+        })
+    }
+
+    /// Replace a node's entire content with `data`, then commit it (chunk + manifest +
+    /// outbox), as if the file had been written and flushed. This is the **CfAPI
+    /// local-edit capture** entry point: under Cloud Filter API the OS owns the on-disk
+    /// bytes, so when a watcher detects the user edited a (real) file, the adapter reads
+    /// those bytes off disk and re-ingests them here as the node's new version — the
+    /// counterpart to a FUSE `write`+`flush`, which CfAPI never routes through us. Stamps a
+    /// fresh real mtime and enqueues the outbox, so the normal push path uploads it.
+    pub fn ingest_bytes(&self, ino: u64, data: &[u8]) -> Result<()> {
+        // Validate the inode exists first — `flush` is a no-op on a missing stage entry, so
+        // a bad ino would otherwise silently do nothing.
+        self.getattr(ino)?;
+        self.staging.lock().unwrap().insert(ino, data.to_vec());
+        self.flush(ino)
     }
 }
 
@@ -691,8 +1033,8 @@ impl Provider for SqliteProvider {
             )?;
         }
         tx.execute(
-            "UPDATE nodes SET size = ?1, manifest_id = ?2 WHERE ino = ?3",
-            params![buf.len() as i64, manifest_id, ino as i64],
+            "UPDATE nodes SET size = ?1, manifest_id = ?2, mtime = ?4 WHERE ino = ?3",
+            params![buf.len() as i64, manifest_id, ino as i64, now_nanos()],
         )?;
         // Mark the file dirty for sync, atomically with its new manifest.
         if let Some(node_id) =
@@ -838,6 +1180,60 @@ impl Provider for SqliteProvider {
         tx.commit()?;
         Ok(())
     }
+
+    fn set_mode(&self, ino: u64, mode: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let node_id: Option<String> = conn
+            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .optional()?;
+        let n = conn.execute(
+            "UPDATE nodes SET mode = ?1 WHERE ino = ?2",
+            params![(mode & 0o7777) as i64, ino as i64],
+        )?;
+        if n == 0 {
+            return Err(FsError::NotFound);
+        }
+        // Propagate the metadata change (re-commit/re-mkdir carries the new mode).
+        if let Some(id) = node_id {
+            Self::enqueue(&conn, &id, "upsert")?;
+        }
+        Ok(())
+    }
+
+    fn set_mtime(&self, ino: u64, mtime: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let node_id: Option<String> = conn
+            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .optional()?;
+        let n = conn.execute(
+            "UPDATE nodes SET mtime = ?1 WHERE ino = ?2",
+            params![mtime, ino as i64],
+        )?;
+        if n == 0 {
+            return Err(FsError::NotFound);
+        }
+        // Propagate the metadata change so the real mtime (e.g. from `cp -p`) reaches the
+        // other devices — the re-commit carries the new mtime alongside the manifest.
+        if let Some(id) = node_id {
+            Self::enqueue(&conn, &id, "upsert")?;
+        }
+        Ok(())
+    }
+
+    fn set_lock(&self, ino: u64, lock: LockRange) -> Result<()> {
+        self.locks.set(ino, lock).map_err(|_| FsError::WouldBlock)
+    }
+    fn test_lock(&self, ino: u64, probe: LockRange) -> Result<Option<LockRange>> {
+        Ok(self.locks.test(ino, probe))
+    }
+    fn unlock(&self, ino: u64, owner: u64, start: u64, end: u64) -> Result<()> {
+        self.locks.unlock(ino, owner, start, end);
+        Ok(())
+    }
+    fn release_locks(&self, ino: u64, owner: u64) -> Result<()> {
+        self.locks.release_owner(ino, owner);
+        Ok(())
+    }
 }
 
 /// Shared ownership of a provider. The FUSE mount (`fuser::mount2` takes the adapter by
@@ -879,6 +1275,24 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     }
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()> {
         (**self).rename(parent, name, newparent, newname)
+    }
+    fn set_mode(&self, ino: u64, mode: u32) -> Result<()> {
+        (**self).set_mode(ino, mode)
+    }
+    fn set_mtime(&self, ino: u64, mtime: i64) -> Result<()> {
+        (**self).set_mtime(ino, mtime)
+    }
+    fn set_lock(&self, ino: u64, lock: LockRange) -> Result<()> {
+        (**self).set_lock(ino, lock)
+    }
+    fn test_lock(&self, ino: u64, probe: LockRange) -> Result<Option<LockRange>> {
+        (**self).test_lock(ino, probe)
+    }
+    fn unlock(&self, ino: u64, owner: u64, start: u64, end: u64) -> Result<()> {
+        (**self).unlock(ino, owner, start, end)
+    }
+    fn release_locks(&self, ino: u64, owner: u64) -> Result<()> {
+        (**self).release_locks(ino, owner)
     }
 }
 
