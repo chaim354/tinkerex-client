@@ -169,6 +169,119 @@ pub fn library_relative(root: &str, abs: &str) -> Option<String> {
     Some(rest.trim_start_matches('/').to_string())
 }
 
+/// CfAPI requires every `CfExecute(TRANSFER_DATA)` chunk to start and end on a **4096-byte
+/// page boundary**, with one exception: the final chunk of a file may end short (at EOF). A
+/// transfer whose offset or non-final length isn't page-aligned is rejected by the runtime
+/// (`STATUS_INVALID_PARAMETER`). [`TRANSFER_BLOCK`] is that alignment unit.
+pub const TRANSFER_BLOCK: u64 = 4096;
+
+/// One page-aligned slice of a FETCH_DATA hydration to transfer back to the kernel: read
+/// `[offset, offset+length)` from the `Provider` and hand it to `CfExecute(TRANSFER_DATA)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferChunk {
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// Plan a **streamed** FETCH_DATA response: split the kernel's required range
+/// `[required_offset, required_offset + required_length)` into page-aligned [`TransferChunk`]s
+/// of at most `max_chunk` bytes each, so a multi-GB file hydrates incrementally (bounded
+/// memory + progress reporting) instead of buffering the whole range.
+///
+/// CfAPI alignment rules, enforced here so the math is unit-tested without a live sync root:
+/// - Every chunk's `offset` is a multiple of [`TRANSFER_BLOCK`]. The kernel always asks on a
+///   page boundary, but we defensively floor `required_offset` to the page so a stray
+///   unaligned request can't produce an unaligned transfer.
+/// - Every chunk's `length` is a multiple of [`TRANSFER_BLOCK`] **except** a chunk that reaches
+///   `file_size` (EOF), which may be short — that's the only legal unaligned length.
+/// - `max_chunk` is floored to a whole number of pages (and at least one page) so a chunk
+///   boundary never lands mid-page.
+///
+/// Returns an empty plan when there's nothing to transfer (zero length, or the required range
+/// starts at/after EOF).
+pub fn plan_transfer_chunks(
+    required_offset: u64,
+    required_length: u64,
+    file_size: u64,
+    max_chunk: u64,
+) -> Vec<TransferChunk> {
+    if required_length == 0 || required_offset >= file_size {
+        return Vec::new();
+    }
+    // Floor the start to a page boundary (the kernel asks page-aligned; be defensive).
+    let start = (required_offset / TRANSFER_BLOCK) * TRANSFER_BLOCK;
+    // The end of the required range, clamped to EOF — we never transfer past the file.
+    let req_end = required_offset.saturating_add(required_length).min(file_size);
+    // Per-chunk step: floor max_chunk to whole pages, at least one page.
+    let step = (max_chunk / TRANSFER_BLOCK).max(1) * TRANSFER_BLOCK;
+    // Round req_end UP to a page so a non-final chunk stays page-aligned; the chunk that
+    // actually reaches EOF is then clamped to file_size below (its short length is the one
+    // CfAPI permits).
+    let req_end_ceil = ((req_end + TRANSFER_BLOCK - 1) / TRANSFER_BLOCK) * TRANSFER_BLOCK;
+
+    let mut chunks = Vec::new();
+    let mut off = start;
+    while off < req_end {
+        let aligned_end = (off + step).min(req_end_ceil);
+        // Clamp to file_size: the chunk that reaches EOF is the only one allowed a short length.
+        let end = aligned_end.min(file_size);
+        chunks.push(TransferChunk { offset: off, length: end - off });
+        off = aligned_end;
+    }
+    chunks
+}
+
+/// Windows Explorer pin state for a file ("Always keep on this device" / "Free up space"),
+/// mapped from `CF_PIN_STATE`. We act on the two the user drives; the rest are no-ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinState {
+    /// "Always keep on this device" → force-hydrate now and keep bytes (don't auto-dehydrate).
+    Pinned,
+    /// "Free up space" → dehydrate, dropping local bytes (next read re-fetches).
+    Unpinned,
+    /// Unspecified / inherit / excluded — leave hydration as-is.
+    Other,
+}
+
+impl PinState {
+    /// Map a raw `CF_PIN_STATE` integer (1 = PINNED, 2 = UNPINNED, others = Other) to [`PinState`].
+    /// Kept as `i32` so it's testable without the Windows `CF_PIN_STATE` newtype.
+    pub fn from_raw(raw: i32) -> PinState {
+        match raw {
+            1 => PinState::Pinned,   // CF_PIN_STATE_PINNED
+            2 => PinState::Unpinned, // CF_PIN_STATE_UNPINNED
+            _ => PinState::Other,    // UNSPECIFIED / INHERIT / EXCLUDED
+        }
+    }
+}
+
+/// What a pin-state change should do to a placeholder's local bytes. Pure decision so the
+/// hydrate/dehydrate side-effect is driven by unit-tested logic, not ad-hoc FFI branching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HydrationAction {
+    /// Force the file's bytes local now (the user pinned it).
+    Hydrate,
+    /// Drop the file's local bytes (the user freed up space).
+    Dehydrate,
+    /// Nothing to do.
+    None,
+}
+
+/// Decide the hydration side-effect for a pin-state transition on a node of `kind`. Directories
+/// carry no bytes, so a pinned/unpinned dir is a no-op here (CfAPI applies the pin recursively to
+/// the children, which each get their own callback). Files hydrate when pinned, dehydrate when
+/// unpinned; any other pin state leaves them alone.
+pub fn pin_hydration_action(pin: PinState, kind: Kind) -> HydrationAction {
+    if kind == Kind::Dir {
+        return HydrationAction::None;
+    }
+    match pin {
+        PinState::Pinned => HydrationAction::Hydrate,
+        PinState::Unpinned => HydrationAction::Dehydrate,
+        PinState::Other => HydrationAction::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +416,117 @@ mod tests {
         assert_eq!(decide_action(RemoteNodeEvent { existed: true, content_changed: false, deleted: false, kind: f }), PlaceholderAction::UpdateMetadata);
         // Existing dir → no-op
         assert_eq!(decide_action(RemoteNodeEvent { existed: true, content_changed: false, deleted: false, kind: d }), PlaceholderAction::None);
+    }
+
+    // --- B6.3: streamed FETCH_DATA chunk planning ---------------------------------------
+
+    #[test]
+    fn transfer_small_file_is_one_short_final_chunk() {
+        // A 1000-byte file, whole range requested: one chunk, short (EOF) length — legal.
+        let plan = plan_transfer_chunks(0, 1000, 1000, 1 << 20);
+        assert_eq!(plan, vec![TransferChunk { offset: 0, length: 1000 }]);
+    }
+
+    #[test]
+    fn transfer_splits_into_page_aligned_chunks_then_short_final() {
+        // 10 MiB file, whole range, 4 MiB max → 4 MiB + 4 MiB + 2 MiB. All page-aligned; the
+        // last reaches EOF exactly (also page-aligned here).
+        let mb = 1024 * 1024;
+        let plan = plan_transfer_chunks(0, 10 * mb, 10 * mb, 4 * mb);
+        assert_eq!(
+            plan,
+            vec![
+                TransferChunk { offset: 0, length: 4 * mb },
+                TransferChunk { offset: 4 * mb, length: 4 * mb },
+                TransferChunk { offset: 8 * mb, length: 2 * mb },
+            ]
+        );
+    }
+
+    #[test]
+    fn transfer_every_nonfinal_chunk_is_page_aligned_with_odd_size() {
+        // A file whose size is NOT a page multiple, with a max_chunk that's also not page-aligned:
+        // every non-final chunk must still be page-aligned in offset AND length; only the final
+        // chunk (reaching EOF) may be short.
+        let file = 100_000u64; // not a multiple of 4096
+        let max = 30_000u64; // floors to 7 pages = 28672
+        let plan = plan_transfer_chunks(0, file, file, max);
+        let step = (max / TRANSFER_BLOCK) * TRANSFER_BLOCK;
+        assert!(step % TRANSFER_BLOCK == 0 && step > 0);
+        let mut covered = 0u64;
+        for (i, c) in plan.iter().enumerate() {
+            assert_eq!(c.offset % TRANSFER_BLOCK, 0, "chunk {i} offset must be page-aligned");
+            assert_eq!(c.offset, covered, "chunks must be contiguous");
+            let is_final = i == plan.len() - 1;
+            if !is_final {
+                assert_eq!(c.length % TRANSFER_BLOCK, 0, "non-final chunk {i} length must be page-aligned");
+            }
+            covered += c.length;
+        }
+        assert_eq!(covered, file, "the plan must cover exactly the whole file");
+        // The final chunk reaches EOF and is short (file isn't page-aligned).
+        assert_ne!(plan.last().unwrap().length % TRANSFER_BLOCK, 0);
+    }
+
+    #[test]
+    fn transfer_floors_unaligned_required_offset_to_page() {
+        // A (defensive) unaligned required offset is floored to its page so the transfer offset
+        // is always page-aligned.
+        let plan = plan_transfer_chunks(5000, 1000, 100_000, 1 << 20);
+        assert_eq!(plan[0].offset, 4096, "offset floored to the containing page");
+    }
+
+    #[test]
+    fn transfer_partial_range_does_not_overrun_eof() {
+        // A range that runs past EOF is clamped: total covered never exceeds file_size.
+        let plan = plan_transfer_chunks(8000, 1_000_000, 10_000, 1 << 20);
+        let covered_end = plan.last().map(|c| c.offset + c.length).unwrap_or(0);
+        assert!(covered_end <= 10_000, "must not transfer past EOF");
+        assert_eq!(covered_end, 10_000, "covers up to EOF");
+    }
+
+    #[test]
+    fn transfer_empty_for_zero_length_or_past_eof() {
+        assert!(plan_transfer_chunks(0, 0, 1000, 1 << 20).is_empty(), "zero length → nothing");
+        assert!(plan_transfer_chunks(2000, 100, 1000, 1 << 20).is_empty(), "offset past EOF → nothing");
+        assert!(plan_transfer_chunks(0, 100, 0, 1 << 20).is_empty(), "empty file → nothing");
+    }
+
+    #[test]
+    fn transfer_zero_max_chunk_falls_back_to_one_page() {
+        // A degenerate max_chunk of 0 must not divide-by-zero or loop forever — it floors to one
+        // page step.
+        let plan = plan_transfer_chunks(0, 10_000, 10_000, 0);
+        assert!(!plan.is_empty());
+        // 10000 / 4096 → pages 0..4096, 4096..8192, 8192..10000 (short final).
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0], TransferChunk { offset: 0, length: 4096 });
+        assert_eq!(plan[2], TransferChunk { offset: 8192, length: 10_000 - 8192 });
+    }
+
+    // --- B6.1: pin/unpin → hydrate/dehydrate decision -----------------------------------
+
+    #[test]
+    fn pin_state_maps_raw_cf_pin_state() {
+        assert_eq!(PinState::from_raw(1), PinState::Pinned);
+        assert_eq!(PinState::from_raw(2), PinState::Unpinned);
+        for other in [0, 3, 4, -1, 99] {
+            assert_eq!(PinState::from_raw(other), PinState::Other, "raw {other} → Other");
+        }
+    }
+
+    #[test]
+    fn pin_hydration_action_files_hydrate_unpin_dehydrate() {
+        assert_eq!(pin_hydration_action(PinState::Pinned, Kind::File), HydrationAction::Hydrate);
+        assert_eq!(pin_hydration_action(PinState::Unpinned, Kind::File), HydrationAction::Dehydrate);
+        assert_eq!(pin_hydration_action(PinState::Other, Kind::File), HydrationAction::None);
+    }
+
+    #[test]
+    fn pin_hydration_action_dirs_are_always_noop() {
+        // Dirs carry no bytes; CfAPI recurses the pin to children, which get their own callbacks.
+        for pin in [PinState::Pinned, PinState::Unpinned, PinState::Other] {
+            assert_eq!(pin_hydration_action(pin, Kind::Dir), HydrationAction::None);
+        }
     }
 }
