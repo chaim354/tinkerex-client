@@ -2,110 +2,51 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Maker — Sync</title>
-    <style>
-      :root {
-        --bg: #fafafa; --card: #fff; --line: #e6e6e6; --ink: #1d1d1f; --muted: #6b6b70;
-        --accent: #2563eb; --accent-ink: #fff; --ok: #16a34a; --off: #9aa0a6; --err: #b00020;
-        --hover: #f4f6fb;
-      }
-      @media (prefers-color-scheme: dark) {
-        :root { --bg: #161618; --card: #1f1f22; --line: #2e2e32; --ink: #f2f2f4;
-                --muted: #9a9aa0; --hover: #26262b; }
-      }
-      * { box-sizing: border-box; }
-      body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background: var(--bg);
-             color: var(--ink); font-size: 14px; }
-      .wrap { max-width: 44rem; margin: 0 auto; padding: 1.5rem; }
-      header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem; }
-      h1 { font-size: 1.25rem; margin: 0; }
-      h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
-           margin: 0 0 0.75rem; }
-      .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-              padding: 1.1rem 1.2rem; margin-bottom: 1rem; }
-      label { display: block; margin: 0.6rem 0 0.25rem; font-weight: 600; font-size: 0.82rem; color: var(--muted); }
-      input { width: 100%; padding: 0.5rem 0.6rem; border: 1px solid var(--line); border-radius: 8px;
-              background: var(--bg); color: var(--ink); font-size: 0.9rem; }
-      .row { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
-      button { padding: 0.5rem 0.9rem; font-size: 0.88rem; border-radius: 8px; border: 1px solid var(--line);
-               background: var(--card); color: var(--ink); cursor: pointer; }
-      button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-      button:disabled { opacity: 0.5; cursor: default; }
-      button.link { border: none; background: none; color: var(--accent); padding: 0.2rem 0.3rem; }
-      .pill { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; font-weight: 600;
-              padding: 0.25rem 0.6rem; border-radius: 999px; background: var(--hover); color: var(--muted); }
-      .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--off); }
-      .pill.on .dot { background: var(--ok); }
-      .pill.on { color: var(--ok); }
-      .muted { color: var(--muted); font-size: 0.85rem; }
-      .err { color: var(--err); }
-      .code { font-family: ui-monospace, monospace; }
-      .hidden { display: none; }
-      .tabs { display: flex; gap: 0.4rem; margin-bottom: 0.8rem; }
-      .tabs button.active { background: var(--hover); border-color: var(--line); font-weight: 600; }
-      .files { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-      .file { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.7rem;
-              border-top: 1px solid var(--line); }
-      .file:first-child { border-top: none; }
-      .file:hover { background: var(--hover); }
-      .file .name { flex: 1; }
-      .file .size { color: var(--muted); font-size: 0.8rem; }
-      .file.dir .name { font-weight: 600; }
-      .versions { padding: 0.4rem 0.7rem 0.6rem; background: var(--hover); border-top: 1px solid var(--line); }
-      .version { display: flex; align-items: center; gap: 0.6rem; padding: 0.3rem 0; font-size: 0.85rem; }
-      .version .when { flex: 1; color: var(--muted); }
-      .codebox { font-family: ui-monospace, monospace; font-size: 1.5rem; letter-spacing: 0.15em;
-                 padding: 0.6rem 0.9rem; background: var(--hover); border-radius: 8px; text-align: center;
-                 margin-top: 0.6rem; }
-      .toast { margin-top: 0.8rem; padding: 0.55rem 0.75rem; border-radius: 8px; background: var(--hover);
-               font-size: 0.85rem; }
-      .toast.err { background: #fde8ea; color: var(--err); }
-      .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none;
-                 align-items: center; justify-content: center; padding: 1rem; z-index: 10; }
-      .overlay.show { display: flex; }
-      .modal { background: var(--card); border-radius: 14px; max-width: 34rem; width: 100%;
-               padding: 1.3rem 1.4rem; box-shadow: 0 12px 40px rgba(0,0,0,0.35); }
-      .modal h3 { margin: 0 0 0.3rem; font-size: 1.05rem; }
-      .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; margin: 1rem 0; }
-      .sidecard { border: 1px solid var(--line); border-radius: 10px; padding: 0.7rem 0.8rem; }
-      .sidecard .who { font-weight: 600; }
-      .sidecard .meta { color: var(--muted); font-size: 0.82rem; margin: 0.2rem 0 0.7rem; }
-      .sidecard button { width: 100%; }
-      .modal .split { width: 100%; margin-top: 0.2rem; }
-    </style>
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="wrap">
       <header>
         <h1>Maker</h1>
-        <span id="statusPill" class="pill"><span class="dot"></span><span id="statusText">disconnected</span></span>
+        <span id="statusPill" class="pill" role="status" aria-live="polite">
+          <span class="dot"></span><span id="statusText">disconnected</span>
+        </span>
       </header>
 
       <!-- Connection -->
       <section class="card">
         <h2>Connection</h2>
-        <label for="server">Sync server URL</label>
-        <input id="server" value="http://localhost:3001" />
-        <label for="email">Account email</label>
-        <input id="email" value="maker@example.com" />
-        <label id="mountLabel" for="mount">Mount point</label>
-        <input id="mount" value="/tmp/MakerDrive" />
 
-        <div class="tabs">
-          <button id="tabNew" class="active">This is my device</button>
-          <button id="tabPair">Pair with a code</button>
+        <div class="tabs" role="tablist" aria-label="How this device joins the library">
+          <button id="tabNew" role="tab" aria-selected="true">This is my device</button>
+          <button id="tabPair" role="tab" aria-selected="false">Pair with a code</button>
         </div>
+
+        <label for="server">Sync server URL</label>
+        <input id="server" value="http://localhost:3001" autocomplete="off" spellcheck="false" />
+        <div class="field-err" id="serverErr"></div>
+
+        <label for="email">Account email</label>
+        <input id="email" value="maker@example.com" autocomplete="off" spellcheck="false" />
+        <div class="field-err" id="emailErr"></div>
 
         <div id="pairRow" class="hidden">
           <label for="code">Pairing code (from a signed-in device)</label>
-          <input id="code" class="code" placeholder="ABCD2345" />
+          <input id="code" class="code" placeholder="ABCD2345" autocomplete="off" spellcheck="false" />
+          <div class="field-err" id="codeErr"></div>
         </div>
+
+        <label id="mountLabel" for="mount">Mount point</label>
+        <input id="mount" value="/tmp/MakerDrive" autocomplete="off" spellcheck="false" />
+        <div class="field-err" id="mountErr"></div>
 
         <div class="row">
           <button id="mountBtn" class="primary">Mount &amp; sync</button>
-          <button id="unmountBtn">Unmount</button>
+          <button id="unmountBtn" disabled>Unmount</button>
         </div>
-        <div id="connToast" class="toast hidden"></div>
+        <div id="connToast" class="toast hidden" role="alert"></div>
       </section>
 
       <!-- Devices -->
@@ -113,10 +54,14 @@
         <h2>Add another device</h2>
         <p class="muted">Generate a one-time code, then enter it on the other device under
           “Pair with a code”. The code expires in 10 minutes.</p>
-        <div class="row">
+        <div class="row" style="margin-top:0.6rem">
           <button id="pairCodeBtn">Generate pairing code</button>
         </div>
-        <div id="codebox" class="codebox hidden"></div>
+        <div id="codeboxWrap" class="codebox-wrap hidden">
+          <div id="codebox" class="codebox" aria-label="Pairing code"></div>
+          <button id="copyCodeBtn" title="Copy code">Copy</button>
+        </div>
+        <div id="pairToast" class="toast hidden" role="alert"></div>
       </section>
 
       <!-- Files -->
@@ -126,236 +71,31 @@
           <button id="refreshFilesBtn">Refresh files</button>
           <span id="filesHint" class="muted" style="align-self:center"></span>
         </div>
-        <div id="files" class="files hidden"></div>
+        <div id="files" class="files hidden" role="tree" aria-label="Library files"></div>
       </section>
     </div>
 
     <!-- Conflict resolution -->
-    <div id="overlay" class="overlay">
+    <div id="overlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="conflictTitle">
       <div class="modal">
-        <h3>This file changed in two places</h3>
+        <div class="modal-head">
+          <div>
+            <h3 id="conflictTitle">This file changed in two places</h3>
+            <span id="conflictCount" class="conflict-count"></span>
+          </div>
+          <button id="conflictClose" class="modal-close" aria-label="Close — decide later">&times;</button>
+        </div>
         <p class="muted" id="conflictName"></p>
         <p class="muted">Two versions diverged (someone edited offline). Which is current?</p>
         <div class="sides">
-          <div class="sidecard" id="sideCurrent"></div>
-          <div class="sidecard" id="sideIncoming"></div>
+          <div class="sidecard server" id="sideCurrent"></div>
+          <div class="sidecard incoming" id="sideIncoming"></div>
         </div>
         <button class="split" id="splitBtn">Keep both — save the other as a separate copy</button>
+        <div id="conflictErr" class="modal-err"></div>
       </div>
     </div>
 
-    <script type="module">
-      const { invoke } = window.__TAURI__.core;
-      const $ = (id) => document.getElementById(id);
-      const val = (id) => $(id).value.trim();
-      let mode = "new"; // "new" | "pair"
-
-      // ---- status pill -------------------------------------------------------
-      const setStatus = (text) => {
-        const on = text.startsWith("mounted");
-        $("statusPill").classList.toggle("on", on);
-        $("statusText").textContent = on ? "connected" : "disconnected";
-      };
-      const refreshStatus = async () => {
-        try { setStatus(await invoke("sync_status")); } catch { setStatus("disconnected"); }
-      };
-
-      const toast = (el, text, isErr = false) => {
-        el.textContent = text; el.classList.remove("hidden"); el.classList.toggle("err", isErr);
-      };
-
-      // ---- connect tabs ------------------------------------------------------
-      const selectTab = (m) => {
-        mode = m;
-        $("tabNew").classList.toggle("active", m === "new");
-        $("tabPair").classList.toggle("active", m === "pair");
-        $("pairRow").classList.toggle("hidden", m !== "pair");
-        $("mountBtn").textContent = m === "pair" ? "Pair & sync" : "Mount & sync";
-      };
-      $("tabNew").onclick = () => selectTab("new");
-      $("tabPair").onclick = () => selectTab("pair");
-
-      // ---- mount / pair ------------------------------------------------------
-      $("mountBtn").onclick = async () => {
-        $("mountBtn").disabled = true;
-        toast($("connToast"), mode === "pair" ? "pairing…" : "mounting…");
-        try {
-          const args = { serverUrl: val("server"), email: val("email"), mountpoint: val("mount") };
-          const cmd = mode === "pair" ? "sync_pair" : "sync_start";
-          if (mode === "pair") args.code = val("code");
-          toast($("connToast"), await invoke(cmd, args));
-          await refreshStatus();
-          loadFiles();
-        } catch (e) { toast($("connToast"), String(e), true); }
-        finally { $("mountBtn").disabled = false; }
-      };
-      $("unmountBtn").onclick = async () => {
-        try { toast($("connToast"), await invoke("sync_stop")); }
-        catch (e) { toast($("connToast"), String(e), true); }
-        refreshStatus();
-      };
-
-      // ---- pairing code ------------------------------------------------------
-      $("pairCodeBtn").onclick = async () => {
-        try {
-          const code = await invoke("create_pairing", { serverUrl: val("server"), email: val("email") });
-          const box = $("codebox");
-          box.textContent = code; box.classList.remove("hidden");
-        } catch (e) { const box = $("codebox"); box.textContent = String(e); box.classList.remove("hidden"); }
-      };
-
-      // ---- file browser + versions ------------------------------------------
-      const fmtSize = (n) => n < 1024 ? `${n} B`
-        : n < 1048576 ? `${(n / 1024).toFixed(1)} KB`
-        : `${(n / 1048576).toFixed(1)} MB`;
-
-      const loadFiles = async () => {
-        $("filesHint").textContent = "loading…";
-        let entries;
-        try {
-          entries = await invoke("browse", { serverUrl: val("server"), email: val("email") });
-        } catch (e) { $("filesHint").textContent = String(e); return; }
-
-        const byParent = {};
-        for (const e of entries) (byParent[e.parent_node_id || "root"] ||= []).push(e);
-        const sortKids = (a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "dir" ? -1 : 1);
-
-        const host = $("files");
-        host.innerHTML = "";
-        host.classList.remove("hidden");
-        $("filesHint").textContent = `${entries.length} item${entries.length === 1 ? "" : "s"}`;
-
-        const render = (parentKey, depth) => {
-          for (const e of (byParent[parentKey] || []).sort(sortKids)) {
-            const row = document.createElement("div");
-            row.className = "file" + (e.kind === "dir" ? " dir" : "");
-            row.style.paddingLeft = `${0.7 + depth * 1.1}rem`;
-            row.innerHTML = `<span>${e.kind === "dir" ? "📁" : "📄"}</span>` +
-              `<span class="name"></span>` +
-              (e.locked_by ? `<span class="size" title="being edited">🔒 <span class="lockwho"></span></span>` : "") +
-              (e.kind === "file" ? `<span class="size">${fmtSize(e.size)}</span>` : "");
-            row.querySelector(".name").textContent = e.name;
-            if (e.locked_by) row.querySelector(".lockwho").textContent = e.locked_by;
-            if (e.kind === "file") {
-              const verBtn = document.createElement("button");
-              verBtn.className = "link"; verBtn.textContent = "versions";
-              verBtn.onclick = () => toggleVersions(row, e.node_id);
-              row.appendChild(verBtn);
-            }
-            host.appendChild(row);
-            if (e.kind === "dir") render(e.node_id, depth + 1);
-          }
-        };
-        render("root", 0);
-      };
-
-      const toggleVersions = async (afterRow, nodeId) => {
-        const existing = afterRow.nextElementSibling;
-        if (existing && existing.classList.contains("versions")) { existing.remove(); return; }
-        const panel = document.createElement("div");
-        panel.className = "versions"; panel.textContent = "loading versions…";
-        afterRow.after(panel);
-        let versions;
-        try {
-          versions = await invoke("file_versions",
-            { serverUrl: val("server"), email: val("email"), nodeId });
-        } catch (e) { panel.textContent = String(e); return; }
-        if (!versions.length) { panel.textContent = "no versions yet"; return; }
-        panel.innerHTML = "";
-        versions.forEach((v, i) => {
-          const r = document.createElement("div");
-          r.className = "version";
-          const when = new Date(v.created_at).toLocaleString();
-          r.innerHTML = `<span class="when">${i === 0 ? "● current — " : ""}${when} · ${fmtSize(v.size)}</span>`;
-          if (i !== 0) {
-            const b = document.createElement("button");
-            b.className = "link"; b.textContent = "restore";
-            b.onclick = async () => {
-              b.disabled = true; b.textContent = "restoring…";
-              try {
-                await invoke("restore_version",
-                  { serverUrl: val("server"), email: val("email"), nodeId, versionId: v.version_id });
-                panel.remove(); loadFiles();
-              } catch (e) { b.textContent = String(e); }
-            };
-            r.appendChild(b);
-          }
-          panel.appendChild(r);
-        });
-      };
-      $("refreshFilesBtn").onclick = loadFiles;
-
-      // ---- per-OS mount default ---------------------------------------------
-      (async () => {
-        try {
-          const os = await invoke("platform");
-          if (os === "windows") {
-            $("mount").value = "Z:";
-            $("mountLabel").innerHTML = "Mount point — a free <b>drive letter</b> (e.g. <code>Z:</code>)";
-          } else {
-            $("mountLabel").innerHTML = "Mount point — a directory (e.g. <code>~/Maker</code>)";
-          }
-        } catch { /* keep default */ }
-      })();
-
-      // ---- conflict resolution ----------------------------------------------
-      let activeConflict = null;
-      const fmtWhen = (s) => { try { return new Date(s).toLocaleString(); } catch { return s; } };
-
-      const renderSide = (el, side, label, nodeId) => {
-        if (!side) { el.innerHTML = `<div class="who">${label}</div><div class="meta">unavailable</div>`; return; }
-        el.innerHTML =
-          `<div class="who">${label}</div>` +
-          `<div class="meta">edited by <b></b><br>on <span></span> · <span></span></div>`;
-        el.querySelector("b").textContent = side.device_name;
-        const spans = el.querySelectorAll(".meta span");
-        spans[0].textContent = fmtWhen(side.created_at);
-        spans[1].textContent = fmtSize(side.size);
-        const btn = document.createElement("button");
-        btn.className = "primary"; btn.textContent = "Keep this version";
-        btn.onclick = async () => {
-          btn.disabled = true;
-          try {
-            await invoke("resolve_conflict_keep",
-              { serverUrl: val("server"), email: val("email"), nodeId, versionId: side.version_id });
-            closeConflict(); loadFiles();
-          } catch (e) { btn.textContent = String(e); }
-        };
-        el.appendChild(btn);
-      };
-
-      const closeConflict = () => { activeConflict = null; $("overlay").classList.remove("show"); };
-
-      const showConflict = (c) => {
-        activeConflict = c;
-        $("conflictName").textContent = c.name || c.node_id;
-        renderSide($("sideCurrent"), c.current, "Version on the server", c.node_id);
-        renderSide($("sideIncoming"), c.incoming, "Your other edit", c.node_id);
-        $("overlay").classList.add("show");
-      };
-
-      $("splitBtn").onclick = async () => {
-        if (!activeConflict) return;
-        $("splitBtn").disabled = true;
-        try {
-          await invoke("resolve_conflict_split",
-            { serverUrl: val("server"), email: val("email"), nodeId: activeConflict.node_id });
-          closeConflict(); loadFiles();
-        } catch (e) { $("splitBtn").textContent = String(e); }
-        finally { $("splitBtn").disabled = false; }
-      };
-
-      const pollConflicts = async () => {
-        if (activeConflict) return; // a prompt is already up
-        let list;
-        try { list = await invoke("conflicts", { serverUrl: val("server"), email: val("email") }); }
-        catch { return; } // not signed in yet, etc.
-        if (list && list.length) showConflict(list[0]);
-      };
-
-      refreshStatus();
-      setInterval(refreshStatus, 3000);
-      setInterval(pollConflicts, 5000);
-    </script>
+    <script type="module" src="/main.js"></script>
   </body>
 </html>
