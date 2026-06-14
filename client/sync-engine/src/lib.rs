@@ -131,9 +131,14 @@ impl SyncEngine {
     }
 
     /// Incremental push: drain the local outbox (dirty `node_id`s queued by FUSE
-    /// writes), sending only what changed. Order is parents-first (the outbox preserves
-    /// insertion order). The SQLite lock is **never held across WAN I/O** — each
-    /// provider call locks and releases on its own — so the metadata path stays local.
+    /// writes), sending only what changed. Order is **parents-first, topologically** (via
+    /// [`outbox_list_topo`](SqliteProvider::outbox_list_topo)) — NOT raw insertion order.
+    /// Insertion order is unsafe because a move re-`enqueue`s the child but keeps its older
+    /// outbox `id`, so a file moved into a dir created after it would otherwise be committed
+    /// before its new parent, making a pulling device's `apply_remote` hit `NotFound` and
+    /// abort the pull (the BUG #1 sync-stall). The SQLite lock is **never held across WAN
+    /// I/O** — each provider call locks and releases on its own — so the metadata path stays
+    /// local.
     ///
     /// **Per-node error isolation:** one node that fails to push (a transient server/network
     /// error, a conflict, a missing chunk) must NOT block the *other* queued nodes. A naive
@@ -144,7 +149,7 @@ impl SyncEngine {
     /// tick's retry. The drain returns `Ok` even with failures (they're transient + retried);
     /// only an outbox read/clear DB error — a local-state problem — propagates.
     pub fn push_outbox(provider: &SqliteProvider, client: &ServerClient, io: &dyn ChunkIO) -> Result<()> {
-        let entries = provider.outbox_list()?;
+        let entries = provider.outbox_list_topo()?;
         if !entries.is_empty() {
             eprintln!("push_outbox: {} queued entr{}", entries.len(), if entries.len() == 1 { "y" } else { "ies" });
         }
@@ -231,6 +236,17 @@ impl SyncEngine {
         inval: Option<&dyn Invalidate>,
     ) -> Result<i64> {
         let mut checked_floor = false;
+        // Upserts whose parent isn't present locally *yet* are buffered here and retried —
+        // NOT applied immediately (which would `NotFound` and, in the old code, abort the
+        // whole pull via `?`). Under a move-vs-recursive-delete interleaving a changelog
+        // upsert can transiently reference a parent the device just swept; the parent's own
+        // (re-establishing) upsert may arrive later in the same delta — possibly on a later
+        // page — so we retry after each page and again at end-of-pull. Any still-parentless
+        // node after the full delta is genuinely unreachable on the authoritative tree (its
+        // ancestor was deleted there too); we drop it and lean on the full-tree reconcile
+        // backstop as the correctness floor (BUG #2). Idempotent: a replayed upsert is an
+        // in-place update, never a duplicate.
+        let mut deferred: Vec<SyncNode> = Vec::new();
         loop {
             let resp = client.changes_paged(cursor, page)?;
 
@@ -246,12 +262,17 @@ impl SyncEngine {
             }
 
             if resp.changes.is_empty() {
-                // Caught up: no more entries beyond `cursor`. head_seq is the new floor.
+                // Caught up. Final retry of any still-buffered upserts (a parent may have
+                // landed in the last page), then drop the genuinely-unreachable remainder.
+                retry_deferred(provider, &mut deferred, inval);
                 return Ok(resp.head_seq.max(cursor));
             }
             for ch in &resp.changes {
-                apply_change(provider, ch, inval)?;
+                apply_change(provider, ch, inval, &mut deferred)?;
             }
+            // A parent applied this page may unblock a buffered child — retry now so the
+            // buffer doesn't grow unbounded across a long multi-page pull.
+            retry_deferred(provider, &mut deferred, inval);
             // Advance only as far as we actually applied; loop for the next page.
             cursor = resp.changes.last().map(|c| c.seq).unwrap_or(cursor);
         }
@@ -552,7 +573,12 @@ fn tree_node_to_sync(n: &TreeNode) -> SyncNode {
 /// and remove the node — and any descendants — locally. A *move* is not a delete: the
 /// server models it as op `move` on the same stable node_id with a new parent/name, so it
 /// falls through to `apply_remote` and updates the existing row in place (no duplicate).
-fn apply_change(provider: &SqliteProvider, ch: &Change, inval: Option<&dyn Invalidate>) -> Result<()> {
+fn apply_change(
+    provider: &SqliteProvider,
+    ch: &Change,
+    inval: Option<&dyn Invalidate>,
+    deferred: &mut Vec<SyncNode>,
+) -> Result<()> {
     // A `conflict` change records a divergent version that is NOT current — the node's
     // content is unchanged, so it must not be applied to the tree. It's surfaced to the
     // user via GET /v1/conflicts and resolved there.
@@ -563,21 +589,83 @@ fn apply_change(provider: &SqliteProvider, ch: &Change, inval: Option<&dyn Inval
     if ch.op == "delete" || deleted {
         provider.apply_remote_delete(&ch.node_id)?;
     } else if let Some(sn) = change_to_sync(ch) {
-        let outcome = provider.apply_remote(&sn)?;
-        if let Some(inval) = inval {
-            if outcome.inserted {
-                // A brand-new node: create a fresh placeholder so it appears without the user
-                // re-navigating the directory (CfAPI on-demand population marks a dir fully
-                // populated after its first enumerate). No-op for FUSE/WebDAV/WinFsp.
-                inval.created(outcome.ino);
-            } else if outcome.content_changed {
-                // An existing inode repointed at new content: drop the OS cache so the next
-                // read re-fetches (we no longer bump mtime to force this). FUSE-strong today.
-                inval.invalidate(outcome.ino);
+        // Defer (don't abort) if the parent isn't present locally yet — see BUG #2. The
+        // parent's own upsert may arrive later in this same delta; `retry_deferred` reapplies.
+        apply_upsert(provider, sn, inval, deferred)?;
+    }
+    Ok(())
+}
+
+/// Apply one upsert `SyncNode`, deferring it (buffering for retry) instead of erroring if
+/// its parent isn't present locally yet. Any *other* provider error still propagates. On a
+/// successful apply, fires the appropriate OS-cache invalidation hook.
+fn apply_upsert(
+    provider: &SqliteProvider,
+    sn: SyncNode,
+    inval: Option<&dyn Invalidate>,
+    deferred: &mut Vec<SyncNode>,
+) -> Result<()> {
+    match provider.apply_remote(&sn) {
+        Ok(outcome) => {
+            if let Some(inval) = inval {
+                if outcome.inserted {
+                    // A brand-new node: create a fresh placeholder so it appears without the
+                    // user re-navigating the directory (CfAPI on-demand population marks a dir
+                    // fully populated after its first enumerate). No-op for FUSE/WebDAV/WinFsp.
+                    inval.created(outcome.ino);
+                } else if outcome.content_changed {
+                    // An existing inode repointed at new content: drop the OS cache so the next
+                    // read re-fetches (we no longer bump mtime to force this). FUSE-strong today.
+                    inval.invalidate(outcome.ino);
+                }
+            }
+            Ok(())
+        }
+        // Parent not present locally yet → buffer for retry within this pull rather than
+        // aborting the whole pull. `apply_remote` only returns `NotFound` for a missing
+        // parent (the upsert itself is keyed by stable node_id, so the node's own absence is
+        // an INSERT, not a NotFound).
+        Err(fs_provider::FsError::NotFound) => {
+            deferred.push(sn);
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Re-apply buffered (parentless) upserts, looping until no further progress — a parent
+/// applied this round may unblock a child. Any node still unresolvable after a fixed point
+/// is dropped: its parent is genuinely gone on the authoritative tree (a recursive delete
+/// also removed it there), so it's an unreachable orphan no device tree can hold. The
+/// full-tree reconcile backstop (`pull_snapshot`) remains the correctness floor for that.
+fn retry_deferred(provider: &SqliteProvider, deferred: &mut Vec<SyncNode>, inval: Option<&dyn Invalidate>) {
+    if deferred.is_empty() {
+        return;
+    }
+    let mut progress = true;
+    while progress && !deferred.is_empty() {
+        progress = false;
+        let pending = std::mem::take(deferred);
+        for sn in pending {
+            match provider.apply_remote(&sn) {
+                Ok(outcome) => {
+                    progress = true;
+                    if let Some(inval) = inval {
+                        if outcome.inserted {
+                            inval.created(outcome.ino);
+                        } else if outcome.content_changed {
+                            inval.invalidate(outcome.ino);
+                        }
+                    }
+                }
+                Err(fs_provider::FsError::NotFound) => deferred.push(sn),
+                // A non-parent error on a deferred node: log + drop (don't poison the pull).
+                Err(e) => eprintln!("retry_deferred: dropping node after error: {e}"),
             }
         }
     }
-    Ok(())
+    // Whatever remains is an unreachable orphan on the authoritative tree — drop it.
+    deferred.clear();
 }
 
 fn change_to_sync(ch: &Change) -> Option<SyncNode> {

@@ -673,6 +673,70 @@ impl SqliteProvider {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// The pending outbox entries `(node_id, op)` **topologically ordered — parents before
+    /// children**, so an `upsert` is never drained before the parent it references.
+    ///
+    /// Insertion order alone is NOT a safe drain order: a `rename`/move re-`enqueue`s the
+    /// moved node, but the outbox `ON CONFLICT(node_id) DO UPDATE` keeps the node's ORIGINAL
+    /// insertion `id`. So moving a file into a directory created *after* it leaves the child
+    /// ahead of its new parent in `outbox_list` order. Draining in that order commits the
+    /// child first → the server changelog records the child before its parent → a pulling
+    /// device's `apply_remote` hits `NotFound` for the missing parent and aborts the pull
+    /// (the sync-stall BUG #1 found by the fault-injection harness). Ordering parents-first
+    /// here closes that.
+    ///
+    /// Any node whose parent is *also* queued is emitted after that parent. Nodes whose
+    /// parent is not queued (root-parented, already on the server, or vanished) are ready
+    /// immediately. Deletes carry no parent dependency (the server delete is recursive, so
+    /// relative order among deletes is harmless) and are treated as ready. A pathological
+    /// cycle (which the tree's acyclic invariant forbids) degrades gracefully: any unplaced
+    /// leftovers are appended in their original insertion order.
+    pub fn outbox_list_topo(&self) -> Result<Vec<(String, String)>> {
+        let entries = self.outbox_list()?;
+        if entries.len() < 2 {
+            return Ok(entries);
+        }
+        // Map each queued upsert node_id -> its current parent_node_id (None = root-parented
+        // or vanished). Deletes don't participate in the dependency (recursive server-side).
+        let mut parent_of: HashMap<String, Option<String>> = HashMap::new();
+        for (nid, op) in &entries {
+            if op != "delete" {
+                if let Ok(Some(n)) = self.sync_node(nid) {
+                    parent_of.insert(nid.clone(), n.parent_node_id.clone());
+                }
+            }
+        }
+        let queued: std::collections::HashSet<&String> = entries.iter().map(|(n, _)| n).collect();
+        let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut ordered: Vec<(String, String)> = Vec::with_capacity(entries.len());
+        let mut progress = true;
+        while ordered.len() < entries.len() && progress {
+            progress = false;
+            for (nid, op) in &entries {
+                if placed.contains(nid) {
+                    continue;
+                }
+                // Ready unless this node's parent is another still-unplaced queued node.
+                let ready = match parent_of.get(nid) {
+                    Some(Some(pid)) => !queued.contains(pid) || placed.contains(pid),
+                    _ => true, // root-parented, a delete, or vanished
+                };
+                if ready {
+                    ordered.push((nid.clone(), op.clone()));
+                    placed.insert(nid.clone());
+                    progress = true;
+                }
+            }
+        }
+        // Cycle fallback (shouldn't happen — the tree is acyclic): append any leftover.
+        for (nid, op) in &entries {
+            if !placed.contains(nid) {
+                ordered.push((nid.clone(), op.clone()));
+            }
+        }
+        Ok(ordered)
+    }
+
     /// Remove one outbox entry once it has been pushed to the server.
     pub fn outbox_clear(&self, node_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
