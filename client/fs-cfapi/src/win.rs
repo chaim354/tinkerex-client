@@ -85,6 +85,11 @@ struct CfState {
     /// instead of an O(tree) DFS. Shared (`Arc`) with the invalidator, which reads it + drops stale
     /// entries on rename/delete. A miss falls back to the tree walk, so it's always correct.
     path_index: Arc<crate::PathIndex>,
+    /// B6.3: transfer keys for FETCH_DATA hydrations the kernel asked us to **cancel** (the reading
+    /// app went away / the file was deleted mid-download). The streamed `fetch_data_callback`
+    /// checks this between slices and stops early; `cancel_fetch_data_callback` inserts the key.
+    /// A `HashSet<i64>` of `CF_CALLBACK_INFO::TransferKey`s.
+    cancelled_transfers: Mutex<std::collections::HashSet<i64>>,
 }
 
 /// A live CfAPI sync root: registered, connected, populated. Drop disconnects + unregisters.
@@ -202,6 +207,7 @@ pub fn mount_full(
         self_writes: Mutex::new(HashMap::new()),
         shutting_down: shutting_down.clone(),
         path_index,
+        cancelled_transfers: Mutex::new(std::collections::HashSet::new()),
     }));
 
     // The callback table must outlive the connection, so leak it (one small leak per mount).
@@ -210,6 +216,9 @@ pub fn mount_full(
     let callbacks: &'static [CF_CALLBACK_REGISTRATION] = Box::leak(Box::new([
         CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS, Callback: Some(fetch_placeholders_callback) },
         CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_FETCH_DATA, Callback: Some(fetch_data_callback) },
+        // B6.3: the kernel cancels an in-flight hydration (reading app gone / file deleted) — mark
+        // the transfer key so the streaming FETCH_DATA loop stops between slices.
+        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, Callback: Some(cancel_fetch_data_callback) },
         // Phase 2: a file handle closed — capture a local edit (content changed) and push it.
         CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION, Callback: Some(notify_file_close_callback) },
         // Phase 2b: a delete/rename is about to happen — mirror it into the Provider, then ACK
@@ -536,10 +545,36 @@ unsafe fn op_info_for(info: &CF_CALLBACK_INFO, op_type: CF_OPERATION_TYPE) -> CF
     }
 }
 
+/// Max bytes per `CfExecute(TRANSFER_DATA)` slice (B6.3). A FETCH_DATA for a multi-GB file is
+/// streamed in page-aligned chunks of at most this size, so we never buffer (or read from the
+/// provider) the whole file at once. 16 MiB is a whole number of 4 KiB pages.
+const FETCH_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Hand one error completion back for a failed FETCH_DATA so the reading app fails fast instead of
+/// hanging to a timeout. `offset` is the kernel's required offset (echoed in the completion).
+unsafe fn transfer_data_error(info: &CF_CALLBACK_INFO, offset: i64) {
+    let op_info = op_info_for(info, CF_OPERATION_TYPE_TRANSFER_DATA);
+    let mut op_params = CF_OPERATION_PARAMETERS {
+        ParamSize: std::mem::size_of::<CF_OPERATION_PARAMETERS>() as u32,
+        Anonymous: CF_OPERATION_PARAMETERS_0 {
+            TransferData: CF_OPERATION_PARAMETERS_0_0 {
+                Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                CompletionStatus: STATUS_UNSUCCESSFUL,
+                Buffer: std::ptr::null(),
+                Offset: offset,
+                Length: 0,
+            },
+        },
+    };
+    if let Err(e) = CfExecute(&op_info, &mut op_params) {
+        eprintln!("cfapi: CfExecute(TRANSFER_DATA error) failed: {e}");
+    }
+}
+
 /// FETCH_DATA: the kernel needs bytes for a dehydrated placeholder. Resolve node → hydrate →
-/// read the requested range → hand it back with `CfExecute(TRANSFER_DATA)`. **Always** answers
-/// (success or an error completion) — an unanswered FETCH_DATA hangs the reading app to a
-/// timeout.
+/// **stream** the requested range back in page-aligned slices via `CfExecute(TRANSFER_DATA)`
+/// (B6.3 — bounded memory for multi-GB files + per-slice progress). **Always** answers (a
+/// per-slice success, or an error completion) — an unanswered FETCH_DATA hangs the reading app.
 unsafe extern "system" fn fetch_data_callback(
     info: *const CF_CALLBACK_INFO,
     params: *const CF_CALLBACK_PARAMETERS,
@@ -556,54 +591,129 @@ unsafe extern "system" fn fetch_data_callback(
     let state = &*state;
 
     let fetch = params.Anonymous.FetchData;
-    let offset = fetch.RequiredFileOffset;
-    let length = fetch.RequiredLength;
+    let req_offset = fetch.RequiredFileOffset;
+    let req_length = fetch.RequiredLength;
 
-    // Try to produce the bytes; on any failure, answer with an error status so the app's read
-    // fails fast instead of hanging.
-    let data: Option<Vec<u8>> = (|| {
-        let node_id = callback_node_id(info)?;
-        eprintln!("cfapi: FETCH_DATA node={node_id} off={offset} len={length}");
-        if let Some(h) = &state.hydrate {
-            h(&node_id);
+    // Resolve node + ino, and make its chunks local (presigned GET into the cache). On any failure
+    // here we can't produce bytes → one error completion, then bail.
+    let node_id = match callback_node_id(info) {
+        Some(n) => n,
+        None => {
+            eprintln!("cfapi: FETCH_DATA — no node identity, reporting error");
+            transfer_data_error(info, req_offset);
+            return;
         }
-        let ino = state.provider.ino_for_node_id(&node_id).ok().flatten()?;
-        state.provider.read(ino, offset as u64, length as u32).ok()
-    })();
+    };
+    eprintln!("cfapi: FETCH_DATA node={node_id} off={req_offset} len={req_length}");
+    if let Some(h) = &state.hydrate {
+        h(&node_id);
+    }
+    let ino = match state.provider.ino_for_node_id(&node_id).ok().flatten() {
+        Some(i) => i,
+        None => {
+            eprintln!("cfapi: FETCH_DATA node={node_id} — not found locally, reporting error");
+            transfer_data_error(info, req_offset);
+            return;
+        }
+    };
+    let file_size = state.provider.getattr(ino).map(|a| a.size).unwrap_or(0);
 
-    let op_info = op_info_for(info, CF_OPERATION_TYPE_TRANSFER_DATA);
-    let mut op_params = match &data {
-        Some(bytes) => CF_OPERATION_PARAMETERS {
+    // Plan the page-aligned slices for the required range (the unit-tested core). An empty plan
+    // (zero length / past EOF) still needs a single success completion so the read can finish.
+    let plan = crate::plan_transfer_chunks(
+        req_offset as u64,
+        req_length as u64,
+        file_size,
+        FETCH_CHUNK_BYTES,
+    );
+    let total: i64 = plan.iter().map(|c| c.length as i64).sum::<i64>().max(1);
+    let mut completed: i64 = 0;
+
+    if plan.is_empty() {
+        // Nothing to transfer (e.g. a zero-length read) — answer success with an empty range so
+        // the kernel's request completes rather than hanging.
+        let op_info = op_info_for(info, CF_OPERATION_TYPE_TRANSFER_DATA);
+        let mut op_params = CF_OPERATION_PARAMETERS {
+            ParamSize: std::mem::size_of::<CF_OPERATION_PARAMETERS>() as u32,
+            Anonymous: CF_OPERATION_PARAMETERS_0 {
+                TransferData: CF_OPERATION_PARAMETERS_0_0 {
+                    Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                    CompletionStatus: STATUS_SUCCESS,
+                    Buffer: std::ptr::null(),
+                    Offset: req_offset,
+                    Length: 0,
+                },
+            },
+        };
+        let _ = CfExecute(&op_info, &mut op_params);
+        return;
+    }
+
+    for chunk in plan {
+        // Read just this slice from the provider (bounded memory). A read failure mid-stream → an
+        // error completion at this offset so the app's read fails rather than hanging.
+        let bytes = match state.provider.read(ino, chunk.offset, chunk.length as u32) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("cfapi: FETCH_DATA node={node_id} read(off={}, len={}) failed: {e}", chunk.offset, chunk.length);
+                transfer_data_error(info, chunk.offset as i64);
+                return;
+            }
+        };
+        let op_info = op_info_for(info, CF_OPERATION_TYPE_TRANSFER_DATA);
+        let mut op_params = CF_OPERATION_PARAMETERS {
             ParamSize: std::mem::size_of::<CF_OPERATION_PARAMETERS>() as u32,
             Anonymous: CF_OPERATION_PARAMETERS_0 {
                 TransferData: CF_OPERATION_PARAMETERS_0_0 {
                     Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
                     CompletionStatus: STATUS_SUCCESS,
                     Buffer: bytes.as_ptr() as *const c_void,
-                    Offset: offset,
+                    Offset: chunk.offset as i64,
                     Length: bytes.len() as i64,
                 },
             },
-        },
-        None => {
-            eprintln!("cfapi: FETCH_DATA failed off={offset} len={length} — reporting error");
-            CF_OPERATION_PARAMETERS {
-                ParamSize: std::mem::size_of::<CF_OPERATION_PARAMETERS>() as u32,
-                Anonymous: CF_OPERATION_PARAMETERS_0 {
-                    TransferData: CF_OPERATION_PARAMETERS_0_0 {
-                        Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-                        CompletionStatus: STATUS_UNSUCCESSFUL,
-                        Buffer: std::ptr::null(),
-                        Offset: offset,
-                        Length: 0,
-                    },
-                },
-            }
+        };
+        if let Err(e) = CfExecute(&op_info, &mut op_params) {
+            eprintln!("cfapi: CfExecute(TRANSFER_DATA off={}) failed: {e}", chunk.offset);
+            return; // the kernel saw an error on this slice; stop streaming
         }
-    };
-    if let Err(e) = CfExecute(&op_info, &mut op_params) {
-        eprintln!("cfapi: CfExecute(TRANSFER_DATA) failed: {e}");
+        // Report progress so Explorer shows a hydration bar for a big file. Best-effort — a
+        // failure here is cosmetic and must not abort the transfer.
+        completed += bytes.len() as i64;
+        if let Some(key) = *state.connection_key.lock().unwrap() {
+            let _ = CfReportProviderProgress(key, info.TransferKey, total, completed);
+        }
+
+        // B6.3: honor a CANCEL_FETCH_DATA that arrived for this transfer — stop streaming further
+        // slices (the kernel already knows the transfer is cancelled; no extra completion needed).
+        if state.cancelled_transfers.lock().unwrap().remove(&info.TransferKey) {
+            eprintln!("cfapi: FETCH_DATA node={node_id} cancelled mid-stream at off={}", chunk.offset);
+            return;
+        }
     }
+    // Done streaming cleanly — clear any (late) cancel marker for this key so it can't leak.
+    state.cancelled_transfers.lock().unwrap().remove(&info.TransferKey);
+}
+
+/// CANCEL_FETCH_DATA: the platform aborts an in-flight hydration (the reading app closed the
+/// handle, or the file was deleted while downloading). Record the transfer key so the streaming
+/// [`fetch_data_callback`] loop stops before its next slice. No completion is issued — a cancel is
+/// not answered with `CfExecute` (the kernel owns the cancellation).
+unsafe extern "system" fn cancel_fetch_data_callback(
+    info: *const CF_CALLBACK_INFO,
+    _params: *const CF_CALLBACK_PARAMETERS,
+) {
+    if info.is_null() {
+        return;
+    }
+    let info = &*info;
+    let state = info.CallbackContext as *const CfState;
+    if state.is_null() {
+        return;
+    }
+    let state = &*state;
+    eprintln!("cfapi: CANCEL_FETCH_DATA transfer_key={}", info.TransferKey);
+    state.cancelled_transfers.lock().unwrap().insert(info.TransferKey);
 }
 
 /// FETCH_PLACEHOLDERS: Explorer opened a directory — enumerate its children from the
