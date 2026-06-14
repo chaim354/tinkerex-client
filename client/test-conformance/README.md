@@ -44,10 +44,23 @@ target=cfapi` for the smoke, `-f target=cfapi-conf` for the conformance). Both a
 `continue-on-error`: CfAPI needs an interactive Windows login session to enumerate, so they're a
 live regression net, not a build gate.
 
+## Relationship to the two-device end-to-end suite
+
+These scripts cover the **kernel-mount leg** (syscalls → adapter → `Provider`) — the part that
+needs an interactive session and can't run headless. The complementary
+`client/sync-engine/tests/two_device_e2e.rs` covers **distributed multi-device convergence**
+(the headline A→B→edit→A roundtrip + delete/move/rename/dedup/restore/conflict) at the
+provider/engine level — the same `SyncEngine` loop + `ServerClient` API the Tauri app's `Daemon`
+runs, minus the kernel mount. That suite runs **headlessly on every OS** (per-PR on Linux in the
+`engine-integration` job; nightly on mac/Windows vs the deployed server in `e2e-{linux,macos,windows}`).
+Together: the e2e suite proves the sync plane converges on all three OSes; these scripts prove the
+mount surface translates syscalls correctly on each.
+
 ## Notes / caveats
 
 - These cover the **mount**, not distributed convergence. Two devices diverging under
-  concurrent edits is what `convergence.rs` (ownCloud-`FakeFolder`-style) covers.
+  concurrent edits is what `convergence.rs` (ownCloud-`FakeFolder`-style) and the
+  `two_device_e2e.rs` end-to-end suite cover.
 - pjdfstest will report failures in chmod/chown/symlink/hardlink/xattr tests — **expected**:
   our sync mount intentionally doesn't expose POSIX permissions or links.
 - fsx runs with mmap disabled (`-W -R`) — FUSE mmap is out of scope for now.
