@@ -62,6 +62,23 @@ pub trait Invalidate: Send + Sync {
     /// parent directory. Default no-op: FUSE/WebDAV/WinFsp surface new nodes via their normal
     /// `readdir`, so only the on-demand-population adapters (CfAPI / File Provider) override it.
     fn created(&self, _ino: u64) {}
+
+    /// A **pull removed a node** from the local tree (a `delete`, or a recursive subtree sweep).
+    /// The adapter must remove the now-stale on-disk placeholder so the deletion converges — e.g.
+    /// CfAPI's `std::fs::remove_file`/`remove_dir_all` at the node's last-known path. Called
+    /// **BEFORE** the tree row is gone is impossible (the path lookup needs it), so the engine
+    /// resolves the ino first and passes it here AFTER the delete; an on-demand adapter keeps an
+    /// ino→path index it can still read. Default no-op: FUSE/WebDAV/WinFsp drop the entry via
+    /// their normal `readdir` (the row is gone), so only on-demand-population adapters override.
+    fn removed(&self, _ino: u64) {}
+
+    /// A **pull moved/renamed an existing node** ((parent, name) changed; same stable node_id).
+    /// The old on-disk path is now stale and the new one doesn't exist yet. An on-demand adapter
+    /// must remove the OLD-path placeholder (resolved from its ino→path index, still holding the
+    /// pre-move path) and create the NEW-path one. The changelog models a move as an upsert (not
+    /// delete+create), so neither `created` nor `invalidate` fires — this is the only hook for it.
+    /// Default no-op: FUSE/WebDAV/WinFsp re-enumerate the new name live.
+    fn moved(&self, _ino: u64) {}
 }
 
 /// Moves chunk bytes to/from "the cloud".
@@ -736,11 +753,22 @@ fn apply_change(
     }
     let deleted = ch.node.as_ref().is_some_and(|n| n.deleted);
     if ch.op == "delete" || deleted {
+        // Resolve the node's ino BEFORE the delete removes its row — an on-demand-population
+        // adapter (CfAPI) needs it to find + remove the on-disk placeholder (its ino→path index
+        // still holds the pre-delete path). FUSE/WebDAV/WinFsp ignore `removed` (the row vanishing
+        // is enough). The recursive subtree sweep is covered by removing the top node's dir on disk.
+        let removed_ino = provider.ino_for_node_id(&ch.node_id).ok().flatten();
         // A recursive delete that sweeps a descendant carrying un-synced local state (e.g. a
         // node moved out of this subtree on the server, or a local move not yet pushed) is a
         // potential silent loss — signal a reconcile (the descendant is still live on the
         // server). The target node's own removal is authorized by this entry.
-        return provider.apply_remote_delete_signaled(&ch.node_id).map_err(Into::into);
+        let signaled = provider.apply_remote_delete_signaled(&ch.node_id)?;
+        if let (Some(inval), Some(ino)) = (inval, removed_ino) {
+            // The placeholder removal runs AFTER the tree delete so a concurrent read can't
+            // re-create it; the adapter resolves the path from its (still-populated) index.
+            inval.removed(ino);
+        }
+        return Ok(signaled);
     } else if let Some(sn) = change_to_sync(ch) {
         // Defer (don't abort) if the parent isn't present locally yet — see BUG #2. The
         // parent's own upsert may arrive later in this same delta; `retry_deferred` reapplies.
@@ -767,6 +795,13 @@ fn apply_upsert(
                     // user re-navigating the directory (CfAPI on-demand population marks a dir
                     // fully populated after its first enumerate). No-op for FUSE/WebDAV/WinFsp.
                     inval.created(outcome.ino);
+                } else if outcome.moved {
+                    // A rename/move: the OLD-path placeholder is stale and the NEW one doesn't
+                    // exist yet. The adapter removes the old (from its still-current index) and
+                    // creates the new. A content change AND a move in the same upsert is handled
+                    // by `moved` re-creating a fresh (dehydrated) placeholder, so a separate
+                    // invalidate would be redundant. No-op for FUSE/WebDAV/WinFsp.
+                    inval.moved(outcome.ino);
                 } else if outcome.content_changed {
                     // An existing inode repointed at new content: drop the OS cache so the next
                     // read re-fetches (we no longer bump mtime to force this). FUSE-strong today.
@@ -817,6 +852,8 @@ fn retry_deferred(
                     if let Some(inval) = inval {
                         if outcome.inserted {
                             inval.created(outcome.ino);
+                        } else if outcome.moved {
+                            inval.moved(outcome.ino);
                         } else if outcome.content_changed {
                             inval.invalidate(outcome.ino);
                         }
@@ -872,4 +909,124 @@ fn now_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod apply_tests {
+    //! The pull-apply → `Invalidate`-seam wiring (the third live CfAPI bug: deletes + renames
+    //! never told the receiving on-demand-population adapter to remove the stale placeholder).
+    //! These drive `apply_change` directly with a recording mock, so the engine-side dispatch is
+    //! verified on any host (the CfAPI FFI that actually removes the on-disk placeholder is
+    //! Windows-only and verified live).
+    use super::*;
+    use fs_provider::{ChunkConfig, LocalChunkStore};
+    use std::sync::Mutex;
+    use sync_client::NodeView;
+
+    const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+
+    fn provider() -> SqliteProvider {
+        SqliteProvider::in_memory(Box::new(LocalChunkStore::temp().unwrap()), TINY).unwrap()
+    }
+
+    #[derive(Default)]
+    struct RecordingInval {
+        created: Mutex<Vec<u64>>,
+        invalidated: Mutex<Vec<u64>>,
+        removed: Mutex<Vec<u64>>,
+        moved: Mutex<Vec<u64>>,
+    }
+    impl Invalidate for RecordingInval {
+        fn invalidate(&self, ino: u64) {
+            self.invalidated.lock().unwrap().push(ino);
+        }
+        fn created(&self, ino: u64) {
+            self.created.lock().unwrap().push(ino);
+        }
+        fn removed(&self, ino: u64) {
+            self.removed.lock().unwrap().push(ino);
+        }
+        fn moved(&self, ino: u64) {
+            self.moved.lock().unwrap().push(ino);
+        }
+    }
+
+    fn upsert_change(node_id: &str, parent: Option<&str>, name: &str) -> Change {
+        Change {
+            seq: 0,
+            op: "upsert".into(),
+            node_id: node_id.into(),
+            node: Some(NodeView {
+                node_id: node_id.into(),
+                parent_node_id: parent.map(|s| s.into()),
+                name: name.into(),
+                kind: "file".into(),
+                deleted: false,
+                mode: Some(0o644),
+                mtime: Some(0),
+            }),
+            manifest: None,
+            version: None,
+        }
+    }
+
+    fn delete_change(node_id: &str) -> Change {
+        Change { seq: 0, op: "delete".into(), node_id: node_id.into(), node: None, manifest: None, version: None }
+    }
+
+    /// A pulled `delete` must resolve the node's ino BEFORE removing the row and fire
+    /// `removed(ino)` so an on-demand adapter can drop the stale on-disk placeholder.
+    #[test]
+    fn delete_fires_removed_with_the_node_ino() {
+        let p = provider();
+        let mut deferred = Vec::new();
+        let inval = RecordingInval::default();
+
+        // Seed a node via a pulled upsert, then look up its ino.
+        apply_change(&p, &upsert_change("N", None, "a.txt"), Some(&inval), &mut deferred).unwrap();
+        let ino = p.ino_for_node_id("N").unwrap().unwrap();
+        assert_eq!(*inval.created.lock().unwrap(), vec![ino], "the insert fired created");
+
+        // Now delete it — removed(ino) must fire with the SAME ino, and the row is gone.
+        apply_change(&p, &delete_change("N"), Some(&inval), &mut deferred).unwrap();
+        assert_eq!(*inval.removed.lock().unwrap(), vec![ino], "delete fired removed with the node's ino");
+        assert!(p.ino_for_node_id("N").unwrap().is_none(), "node removed from the tree");
+    }
+
+    /// A pulled upsert that relocates an EXISTING node (new parent/name, same node_id) must fire
+    /// `moved(ino)` — not `created`/`invalidate` — so the adapter removes the OLD-path placeholder
+    /// and creates the NEW one. (A plain insert fires `created`; an in-place re-upsert fires
+    /// neither.)
+    #[test]
+    fn rename_and_move_fire_moved_not_created_or_invalidate() {
+        let p = provider();
+        let mut deferred = Vec::new();
+        let inval = RecordingInval::default();
+
+        apply_change(&p, &upsert_change("N", None, "old.txt"), Some(&inval), &mut deferred).unwrap();
+        let ino = p.ino_for_node_id("N").unwrap().unwrap();
+
+        // Rename within the root: a move.
+        apply_change(&p, &upsert_change("N", None, "new.txt"), Some(&inval), &mut deferred).unwrap();
+        // Move into a subdir (seed the dir first via its own insert).
+        apply_change(
+            &p,
+            &Change { op: "upsert".into(), ..{
+                let mut c = upsert_change("D", None, "d");
+                if let Some(n) = c.node.as_mut() { n.kind = "dir".into(); }
+                c
+            } },
+            Some(&inval),
+            &mut deferred,
+        )
+        .unwrap();
+        apply_change(&p, &upsert_change("N", Some("D"), "new.txt"), Some(&inval), &mut deferred).unwrap();
+
+        let moved = inval.moved.lock().unwrap().clone();
+        assert_eq!(moved, vec![ino, ino], "rename + reparent each fired moved(ino)");
+        // The relocations must NOT have been misreported as content invalidations.
+        assert!(inval.invalidated.lock().unwrap().is_empty(), "a move is not a content invalidate");
+        // created fired only for the two INSERTs (N's first appearance + the dir D), never for a move.
+        assert_eq!(inval.created.lock().unwrap().len(), 2, "created only for the two inserts");
+    }
 }
