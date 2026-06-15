@@ -586,3 +586,177 @@ fn cursor_advances_and_redelivered_delta_is_idempotent() {
     assert_eq!(c2, c1, "head_seq stable on replay");
     assert_eq!(b.readdir(ROOT_INO).unwrap().len(), snap, "replay is idempotent");
 }
+
+// ---- BUG #1 regression: move into a newer dir (topological outbox drain) ------------
+//
+// A file created BEFORE a directory, then moved INTO that directory, must commit the dir
+// before the moved child so the server changelog records the parent first. Otherwise a
+// fresh device pulling the delta hits `apply_remote` NotFound on the orphaned child and the
+// whole pull aborts. `SyncEngine::push_outbox` now drains in topological (parents-first)
+// order via `SqliteProvider::outbox_list_topo`, proven here against the REAL server.
+
+#[test]
+fn move_into_newer_dir_pushes_parent_before_child() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    let a = dev();
+    // 1. create file F at root (early outbox id). 2. later mkdir D. 3. move F into D.
+    let f = a.create(ROOT_INO, "F.txt").unwrap();
+    a.write(f.ino, 0, b"hello world").unwrap();
+    a.flush(f.ino).unwrap();
+    let d = a.mkdir(ROOT_INO, "D").unwrap();
+    a.rename(ROOT_INO, "F.txt", d.ino, "F.txt").unwrap();
+    let f_id = a.node_id_for(f.ino).unwrap().unwrap();
+
+    // Raw outbox lists the moved child before its new parent (the underlying ordering bug);
+    // the fix is the *drain* order, so the push must still land parent-first on the server.
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push (topological drain)");
+    assert!(a.outbox_list().unwrap().is_empty(), "outbox fully drained");
+
+    // A fresh device pulls the delta. If the child had been committed before the dir, this
+    // would abort on a parentless `apply_remote`. It must converge cleanly: F under D.
+    let b = dev();
+    SyncEngine::pull_changes(&b, &cb, 0).expect("B delta pull converges (no abort)");
+    let b_d = b.lookup(ROOT_INO, "D").expect("B has dir D");
+    let b_f = b.lookup(b_d.ino, "F.txt").expect("B has F under D");
+    assert_eq!(b.node_id_for(b_f.ino).unwrap().unwrap(), f_id, "same node F moved into D");
+    assert!(b.lookup(ROOT_INO, "F.txt").is_err(), "F is no longer at root");
+
+    SyncEngine::hydrate(&b, &cb, &cloud, &f_id).expect("B hydrate");
+    assert_eq!(read_all(&b, b_f.ino), b"hello world", "F content intact");
+}
+
+// ---- BUG #2 regression: move-out then delete-parent (defer-and-retry pull) -----------
+//
+// Source moves a child subtree OUT of a directory, then deletes that directory. A replica
+// applying the changelog delta can transiently sweep its (stale) copy of the moved subtree
+// via the recursive parent delete, then meet the child's re-parenting upsert with its new
+// parent not-yet-present. The pull must DEFER that upsert and retry (not abort via `?`), so
+// the replica converges from the delta alone — child alive under its new parent, no loss.
+
+#[test]
+fn move_out_then_delete_parent_converges_via_delta() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    let a = dev();
+    let p = a.mkdir(ROOT_INO, "P").unwrap();
+    let q = a.mkdir(ROOT_INO, "Q").unwrap();
+    let c = a.mkdir(p.ino, "C").unwrap();
+    let leaf = a.create(c.ino, "leaf.txt").unwrap();
+    a.write(leaf.ino, 0, b"payload").unwrap();
+    a.flush(leaf.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A initial push");
+
+    // Replica pulls the initial tree (P, Q, C-under-P, leaf-under-C).
+    let b = dev();
+    let cursor = SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    let b_p = b.lookup(ROOT_INO, "P").unwrap().ino;
+    assert!(b.lookup(b_p, "C").is_ok(), "B has C under P");
+
+    // Source: move C (with its leaf) OUT of P into Q, then delete P.
+    a.rename(p.ino, "C", q.ino, "C").unwrap();
+    a.rmdir(ROOT_INO, "P").unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push move-out + delete");
+
+    // Replica applies the delta. The defer-and-retry pull must converge it without aborting.
+    SyncEngine::pull_changes(&b, &cb, cursor).expect("B delta pull converges (defer-and-retry)");
+
+    let c_id = a.node_id_for(c.ino).unwrap().unwrap();
+    let q_id = a.node_id_for(q.ino).unwrap().unwrap();
+    let rc = b.sync_node(&c_id).unwrap().expect("C survives move-out + parent delete");
+    assert_eq!(rc.parent_node_id.as_deref(), Some(q_id.as_str()), "C re-parented to Q");
+    let leaf_id = a.node_id_for(leaf.ino).unwrap().unwrap();
+    assert!(b.sync_node(&leaf_id).unwrap().is_some(), "the leaf survived (no data loss)");
+    assert!(b.lookup(ROOT_INO, "P").is_err(), "P is gone on the replica");
+
+    // Bytes intact end-to-end.
+    SyncEngine::hydrate(&b, &cb, &cloud, &leaf_id).expect("B hydrate leaf");
+    let b_leaf_ino = b.ino_for_node_id(&leaf_id).unwrap().unwrap();
+    assert_eq!(read_all(&b, b_leaf_ino), b"payload", "leaf content intact");
+}
+
+// ---- BUG #2 convergence face: local-rename-vs-remote-create same name --------------
+//
+// The fault-injection soak (`tests/fault_injection.rs`) found ~36/1000 seeds where the
+// changelog delta alone did NOT converge — diagnosed (per-seed tracing, e.g. seed 599/349)
+// to a REAL engine convergence loss, NOT a MockCloud-fidelity artifact: a pull's
+// `apply_remote` name-collision sweep HARD-DELETES a local node that was **renamed locally
+// but not yet pushed** (its outbox upsert still pending), because a concurrent remote upsert
+// claimed that same `(parent,name)`. The displaced row then makes the queued outbox upsert a
+// no-op, so the changelog delta can never re-add the node — silent, permanent loss.
+//
+// This exercises the EXACT interleaving against the REAL Rails server (not MockCloud):
+//   1. A creates F = "shared", pushes (→ live on server as "shared").
+//   2. A renames F → "renamed" LOCALLY (un-pushed; F's outbox upsert is pending).
+//   3. Device B creates a DIFFERENT node R = "renamed" at the same path and pushes.
+//   4. A pulls B's delta → `apply_remote(R @ "renamed")` collision-sweeps A's local F.
+// The fix: `apply_remote` now returns `displaced_pending`, and `pull_changes_paged_inval`
+// triggers `pull_snapshot` (the reconcile floor) on that signal. Against the real server F is
+// STILL LIVE (the server keys nodes by node_id and never deleted F — A never pushed the
+// rename), so the reconcile re-adds F under its server name "shared". Assert: after the pull,
+// A converges (F present under its prior name, R present), with NO silent loss.
+#[test]
+fn local_rename_vs_remote_create_same_name_reconciles_no_loss() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A: create F = "shared" under a dir, push it (→ server has F live as "shared").
+    let a = dev();
+    let dir = a.mkdir(ROOT_INO, "dir").unwrap();
+    let f = a.create(dir.ino, "shared").unwrap();
+    a.write(f.ino, 0, b"F-bytes").unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push F");
+    let f_id = a.node_id_for(f.ino).unwrap().unwrap();
+    let dir_id = a.node_id_for(dir.ino).unwrap().unwrap();
+
+    // B snapshots, learns the dir, then creates a DIFFERENT node R = "renamed" under it and
+    // pushes — B's R claims a name A is *about* to claim locally.
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    let b_dir = b.lookup(ROOT_INO, "dir").unwrap().ino;
+    let r = b.create(b_dir, "renamed").unwrap();
+    b.write(r.ino, 0, b"R-bytes").unwrap();
+    b.flush(r.ino).unwrap();
+    SyncEngine::push_outbox(&b, &cb, &cloud).expect("B push R");
+    let r_id = b.node_id_for(r.ino).unwrap().unwrap();
+
+    // A renames F → "renamed" LOCALLY (un-pushed — F's outbox upsert is pending).
+    a.rename(dir.ino, "shared", dir.ino, "renamed").unwrap();
+    assert!(
+        a.outbox_list().unwrap().iter().any(|(id, op)| id == &f_id && op == "upsert"),
+        "precondition: F's local rename is queued, un-pushed"
+    );
+
+    // A pulls B's delta. The pull's collision sweep clobbers A's local F (R wins the name) —
+    // but the engine signals `displaced_pending` and reconciles from the full tree.
+    let cursor = a.cursor().unwrap();
+    SyncEngine::pull_changes(&a, &ca, cursor).expect("A delta pull reconciles");
+
+    // CONVERGENCE WITH NO SILENT LOSS:
+    // - F is STILL present on A (re-added by the reconcile under its server name "shared" —
+    //   the server never deleted it; A's un-pushed rename simply lost the name race to R).
+    let f_node = a.sync_node(&f_id).unwrap().expect("F survives (reconcile re-added it) — no silent loss");
+    assert_eq!(f_node.name, "shared", "F kept its server-authoritative name (the rename lost the race)");
+    assert_eq!(f_node.parent_node_id.as_deref(), Some(dir_id.as_str()), "F still under dir");
+    // - R is present at "renamed" (the authoritative winner of the name).
+    let r_node = a.sync_node(&r_id).unwrap().expect("R present on A");
+    assert_eq!(r_node.name, "renamed");
+    // - Both files' bytes are intact end-to-end.
+    SyncEngine::hydrate(&a, &ca, &cloud, &f_id).expect("hydrate F");
+    SyncEngine::hydrate(&a, &ca, &cloud, &r_id).expect("hydrate R");
+    assert_eq!(read_all(&a, a.ino_for_node_id(&f_id).unwrap().unwrap()), b"F-bytes", "F bytes intact");
+    assert_eq!(read_all(&a, a.ino_for_node_id(&r_id).unwrap().unwrap()), b"R-bytes", "R bytes intact");
+
+    // Full convergence under dir: exactly the authoritative R ("renamed") + the re-added F
+    // ("shared"), no orphan/duplicate.
+    let names: std::collections::BTreeSet<String> =
+        a.readdir(dir.ino).unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(
+        names,
+        ["renamed".to_string(), "shared".to_string()].into_iter().collect(),
+        "A converged: both the authoritative R (renamed) and the re-added F (shared) present"
+    );
+}

@@ -139,6 +139,17 @@ pub struct ApplyOutcome {
     /// adapter should *create* a fresh placeholder for it (e.g. CfAPI `CfCreatePlaceholders`)
     /// rather than invalidate an existing one — there's nothing cached to invalidate yet.
     pub inserted: bool,
+    /// The collision sweep displaced a *different* local node at this `(parent, name)` that
+    /// still had a **pending outbox entry** — i.e. un-synced local intent (typically a local
+    /// rename/create into a name a concurrent remote also claimed). The remote is
+    /// authoritative so the incoming node won the name, but the displaced node's local edit
+    /// was clobbered: it is no longer in the tree, yet its outbox entry will push as a no-op
+    /// (the row is gone), so the changelog delta alone can never re-add it. The pull caller
+    /// must trigger the full-tree **reconcile** (`pull_snapshot`) to reconverge — the
+    /// displaced node is still live on the server under its prior name and reconcile re-adds
+    /// it there (the server's collision adjudication is the conflict's authoritative
+    /// resolution). Without this signal the loss would be silent + permanent.
+    pub displaced_pending: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -548,6 +559,30 @@ impl SqliteProvider {
         // pull fails. Recursively sweeping the displaced subtree mirrors the local POSIX
         // rename-replace path. (The displaced node's own changelog delete, if any, arrives
         // separately and is then a no-op.)
+        //
+        // BUT first detect whether any node we're about to sweep has a **pending outbox entry**:
+        // that's un-synced local intent (a local rename/create into this name that hasn't been
+        // pushed). Hard-deleting it silently loses that local node — and because the displaced
+        // row vanishes, its queued outbox `upsert` later pushes as a no-op, so the changelog
+        // delta can never re-add it. We still let the authoritative remote win the name, but we
+        // signal `displaced_pending` so the pull caller triggers the reconcile backstop that
+        // re-adds the displaced node (still live on the server under its prior name).
+        let displaced_pending: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM outbox WHERE node_id IN (
+                         WITH RECURSIVE sub(ino, node_id) AS (
+                             SELECT ino, node_id FROM nodes
+                               WHERE parent_ino = ?1 AND name = ?2 AND node_id != ?3
+                             UNION ALL
+                             SELECT n.ino, n.node_id FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                         )
+                         SELECT node_id FROM sub
+                     )
+                 )",
+                params![parent_ino, node.name, node.node_id],
+                |r| r.get(0),
+            )?;
         conn.execute(
             "DELETE FROM nodes WHERE ino IN (
                  WITH RECURSIVE sub(ino) AS (
@@ -580,7 +615,7 @@ impl SqliteProvider {
             None => false,
         };
         let inserted = prior.is_none();
-        Ok(ApplyOutcome { ino, content_changed, inserted })
+        Ok(ApplyOutcome { ino, content_changed, inserted, displaced_pending })
     }
 
     /// Apply a delete pulled from the server: remove the node identified by its stable
@@ -594,7 +629,39 @@ impl SqliteProvider {
     /// stays consistent. Manifest/chunk rows are left for GC, matching the local
     /// `unlink`/`rmdir` path.
     pub fn apply_remote_delete(&self, node_id: &str) -> Result<()> {
+        self.apply_remote_delete_signaled(node_id).map(|_| ())
+    }
+
+    /// [`apply_remote_delete`](Self::apply_remote_delete) that also reports whether the
+    /// recursive sweep removed a **descendant** (a node other than `node_id` itself) that
+    /// still had a **pending outbox entry** — i.e. un-synced local intent. That descendant may
+    /// have been *moved out* of this subtree on the authoritative tree (so it's still live on
+    /// the server under a new parent) while this device — applying a parent-delete before the
+    /// descendant's re-parent upsert, or holding an un-pushed local move — sweeps it locally.
+    /// The descendant's queued outbox upsert will then push as a no-op (its row is gone), so
+    /// the changelog delta can never re-add it. The pull caller must reconcile from the full
+    /// tree (the documented correctness floor) when this returns `true`. (The target `node_id`
+    /// itself is excluded: deleting it IS authorized by this delete entry.) This is the
+    /// recursive-delete face of BUG #2's convergence loss, dual to
+    /// [`ApplyOutcome::displaced_pending`].
+    pub fn apply_remote_delete_signaled(&self, node_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        // Detect, BEFORE deleting, whether any node in the to-be-swept subtree OTHER than the
+        // explicit target has a pending outbox entry.
+        let swept_pending: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM outbox WHERE node_id IN (
+                     WITH RECURSIVE sub(ino, node_id) AS (
+                         SELECT ino, node_id FROM nodes WHERE node_id = ?1
+                         UNION ALL
+                         SELECT n.ino, n.node_id FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                     )
+                     SELECT node_id FROM sub WHERE node_id != ?1
+                 )
+             )",
+            params![node_id],
+            |r| r.get(0),
+        )?;
         conn.execute(
             "DELETE FROM nodes WHERE ino IN (
                  WITH RECURSIVE sub(ino) AS (
@@ -606,7 +673,7 @@ impl SqliteProvider {
              )",
             params![node_id],
         )?;
-        Ok(())
+        Ok(swept_pending)
     }
 
     pub fn ino_for_node_id(&self, node_id: &str) -> Result<Option<u64>> {
@@ -673,6 +740,70 @@ impl SqliteProvider {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// The pending outbox entries `(node_id, op)` **topologically ordered — parents before
+    /// children**, so an `upsert` is never drained before the parent it references.
+    ///
+    /// Insertion order alone is NOT a safe drain order: a `rename`/move re-`enqueue`s the
+    /// moved node, but the outbox `ON CONFLICT(node_id) DO UPDATE` keeps the node's ORIGINAL
+    /// insertion `id`. So moving a file into a directory created *after* it leaves the child
+    /// ahead of its new parent in `outbox_list` order. Draining in that order commits the
+    /// child first → the server changelog records the child before its parent → a pulling
+    /// device's `apply_remote` hits `NotFound` for the missing parent and aborts the pull
+    /// (the sync-stall BUG #1 found by the fault-injection harness). Ordering parents-first
+    /// here closes that.
+    ///
+    /// Any node whose parent is *also* queued is emitted after that parent. Nodes whose
+    /// parent is not queued (root-parented, already on the server, or vanished) are ready
+    /// immediately. Deletes carry no parent dependency (the server delete is recursive, so
+    /// relative order among deletes is harmless) and are treated as ready. A pathological
+    /// cycle (which the tree's acyclic invariant forbids) degrades gracefully: any unplaced
+    /// leftovers are appended in their original insertion order.
+    pub fn outbox_list_topo(&self) -> Result<Vec<(String, String)>> {
+        let entries = self.outbox_list()?;
+        if entries.len() < 2 {
+            return Ok(entries);
+        }
+        // Map each queued upsert node_id -> its current parent_node_id (None = root-parented
+        // or vanished). Deletes don't participate in the dependency (recursive server-side).
+        let mut parent_of: HashMap<String, Option<String>> = HashMap::new();
+        for (nid, op) in &entries {
+            if op != "delete" {
+                if let Ok(Some(n)) = self.sync_node(nid) {
+                    parent_of.insert(nid.clone(), n.parent_node_id.clone());
+                }
+            }
+        }
+        let queued: std::collections::HashSet<&String> = entries.iter().map(|(n, _)| n).collect();
+        let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut ordered: Vec<(String, String)> = Vec::with_capacity(entries.len());
+        let mut progress = true;
+        while ordered.len() < entries.len() && progress {
+            progress = false;
+            for (nid, op) in &entries {
+                if placed.contains(nid) {
+                    continue;
+                }
+                // Ready unless this node's parent is another still-unplaced queued node.
+                let ready = match parent_of.get(nid) {
+                    Some(Some(pid)) => !queued.contains(pid) || placed.contains(pid),
+                    _ => true, // root-parented, a delete, or vanished
+                };
+                if ready {
+                    ordered.push((nid.clone(), op.clone()));
+                    placed.insert(nid.clone());
+                    progress = true;
+                }
+            }
+        }
+        // Cycle fallback (shouldn't happen — the tree is acyclic): append any leftover.
+        for (nid, op) in &entries {
+            if !placed.contains(nid) {
+                ordered.push((nid.clone(), op.clone()));
+            }
+        }
+        Ok(ordered)
+    }
+
     /// Remove one outbox entry once it has been pushed to the server.
     pub fn outbox_clear(&self, node_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -719,6 +850,33 @@ impl SqliteProvider {
             "INSERT INTO sync_state(key, value) VALUES ('cursor', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![cursor],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this device is flagged for a full-tree reconcile (`pull_snapshot`) on the next
+    /// sync tick. Set when a pull's `apply_remote` collision sweep clobbered a local node that
+    /// still had un-synced local state (`ApplyOutcome::displaced_pending`): the changelog delta
+    /// alone can never re-add that node, so the engine must reconcile. The flag is **sticky**
+    /// (persisted in `sync_state`) because a single reconcile may not converge — the displaced
+    /// node's authoritative state may not have reached the server yet (the racing peer's push
+    /// is what surfaces it). The engine keeps reconciling each tick until the local tree
+    /// matches the server, then clears the flag. Default `false`.
+    pub fn needs_resync(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT value FROM sync_state WHERE key = 'needs_resync'", [], |r| r.get::<_, i64>(0))
+            .optional()?
+            .unwrap_or(0)
+            != 0)
+    }
+
+    pub fn set_needs_resync(&self, needs: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_state(key, value) VALUES ('needs_resync', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![needs as i64],
         )?;
         Ok(())
     }
@@ -1588,6 +1746,72 @@ mod tests {
         assert!(b.ino_for_node_id(&sub_id).unwrap().is_none(), "nested dir swept");
         assert!(b.ino_for_node_id(&y_id).unwrap().is_none(), "nested file swept");
         assert!(b.export_tree().unwrap().is_empty(), "tree fully emptied");
+    }
+
+    /// A pull whose collision sweep would clobber a locally-renamed-but-not-yet-pushed node
+    /// must SIGNAL it (`displaced_pending`) so the caller can reconcile — otherwise the local
+    /// node is silently + permanently lost (it's still live on the server under its prior
+    /// name, but the changelog delta can never re-add it: its stale outbox upsert pushes as a
+    /// no-op once the row is gone). This is BUG #2's convergence face, isolated to the unit.
+    #[test]
+    fn apply_remote_collision_over_pending_local_node_signals_displaced() {
+        let p = provider();
+        let dir = p.mkdir(ROOT_INO, "d").unwrap();
+        let dir_id = p.node_id_for(dir.ino).unwrap().unwrap();
+
+        // Local node F created + renamed to "g" — a pending, un-pushed local rename.
+        let f = p.create(dir.ino, "f").unwrap();
+        p.write(f.ino, 0, b"local").unwrap();
+        p.flush(f.ino).unwrap();
+        let f_id = p.node_id_for(f.ino).unwrap().unwrap();
+        p.rename(dir.ino, "f", dir.ino, "g").unwrap();
+        assert!(
+            p.outbox_list().unwrap().iter().any(|(id, op)| id == &f_id && op == "upsert"),
+            "precondition: F's local rename is queued (un-pushed)"
+        );
+
+        // A remote pull brings in a DIFFERENT node R that claims the same path (dir, "g") —
+        // a concurrent create/rename on another device that the server made authoritative.
+        let remote = SyncNode {
+            node_id: "remote-R".into(),
+            parent_node_id: Some(dir_id.clone()),
+            name: "g".into(),
+            kind: Kind::File,
+            manifest_id: None,
+            chunks: vec![],
+            version_id: Some("vR".into()),
+            mode: 0o644,
+            mtime: 0,
+        };
+        let outcome = p.apply_remote(&remote).unwrap();
+
+        // The remote won the name (authoritative) — and we were told the displaced local node
+        // had pending state, so the caller knows to reconcile.
+        assert!(outcome.displaced_pending, "must flag that a pending local node was clobbered");
+        assert!(p.ino_for_node_id("remote-R").unwrap().is_some(), "remote node present at the path");
+        assert!(p.ino_for_node_id(&f_id).unwrap().is_none(), "displaced local node is gone from the tree");
+
+        // A plain collision over a node with NO pending outbox state must NOT raise the flag
+        // (the ordinary authoritative name-reuse case — no local intent was lost).
+        let other = p.mkdir(ROOT_INO, "e").unwrap();
+        let other_id = p.node_id_for(other.ino).unwrap().unwrap();
+        let pulled = SyncNode {
+            node_id: "remote-S".into(),
+            parent_node_id: Some(other_id.clone()),
+            name: "h".into(),
+            kind: Kind::File,
+            manifest_id: None,
+            chunks: vec![],
+            version_id: Some("v1".into()),
+            mode: 0o644,
+            mtime: 0,
+        };
+        p.apply_remote(&pulled).unwrap();
+        p.outbox_clear("remote-S").unwrap(); // simulate it being a clean (non-local) row
+        // A re-pull at the same path with a different id, no pending outbox entry on remote-S:
+        let pulled2 = SyncNode { node_id: "remote-T".into(), ..pulled.clone() };
+        let o2 = p.apply_remote(&pulled2).unwrap();
+        assert!(!o2.displaced_pending, "no pending local state → no displaced_pending signal");
     }
 
     /// Convergence harness: drive a deterministic pseudo-random stream of create /
