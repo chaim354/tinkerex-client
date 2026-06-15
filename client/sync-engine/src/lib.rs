@@ -18,6 +18,12 @@ use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
 
 mod daemon;
 pub use daemon::{DaemonConfig, WebdavMount, DEFAULT_POLL};
+
+/// Client-side bandwidth throttling: a [`ThrottledChunkIO`](throttle::ThrottledChunkIO)
+/// decorator that token-bucket rate-limits the bytes any [`ChunkIO`] transfers (separate
+/// up/down caps; unlimited by default). See `docs/research-sync-competitors.md` §4 #6.
+pub mod throttle;
+pub use throttle::{RateLimiter, ThrottledChunkIO};
 #[cfg(target_os = "linux")]
 pub use daemon::Daemon;
 #[cfg(target_os = "windows")]
