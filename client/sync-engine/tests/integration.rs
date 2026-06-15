@@ -186,6 +186,102 @@ fn hydrate_fetches_only_missing_and_is_idempotent() {
     assert_eq!(read_all(&b, bf.ino), body);
 }
 
+// ---- progressive / range hydration: fetch only the chunks a read touches -----------
+
+/// A `ChunkIO` wrapping `SharedDirIO` that records every hash it was asked to `get` — the
+/// proof that range hydration fetched ONLY the overlapping chunks, not the whole file.
+struct CountingIO {
+    inner: SharedDirIO,
+    fetched: std::sync::Mutex<Vec<String>>,
+}
+impl CountingIO {
+    fn new(inner: SharedDirIO) -> Self {
+        Self { inner, fetched: std::sync::Mutex::new(Vec::new()) }
+    }
+    fn fetched(&self) -> Vec<String> {
+        self.fetched.lock().unwrap().clone()
+    }
+}
+impl ChunkIO for CountingIO {
+    fn put(&self, hash: &str, urls: &HashMap<String, String>, bytes: Vec<u8>) -> sync_engine::Result<()> {
+        self.inner.put(hash, urls, bytes)
+    }
+    fn get(&self, hash: &str, url: Option<&str>) -> sync_engine::Result<Vec<u8>> {
+        self.fetched.lock().unwrap().push(hash.to_string());
+        self.inner.get(hash, url)
+    }
+}
+
+#[test]
+fn range_hydration_fetches_only_overlapping_chunks() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A pushes a multi-chunk file (tiny CDC → many chunks).
+    let a = dev();
+    let f = a.create(ROOT_INO, "huge.stl").unwrap();
+    let body: Vec<u8> = (0..30_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    a.write(f.ino, 0, &body).unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push(&a, &ca, &cloud).expect("A push");
+
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    let bf = b.lookup(ROOT_INO, "huge.stl").unwrap();
+    let node_id = b.node_id_for(bf.ino).unwrap().unwrap();
+
+    let all_hashes = b.node_manifest_hashes(&node_id).unwrap();
+    assert!(all_hashes.len() >= 4, "need several chunks to make range meaningful, got {}", all_hashes.len());
+    assert!(all_hashes.iter().all(|h| !b.has_chunk(h)), "no chunks cached pre-hydrate");
+
+    let counting = CountingIO::new(cloud);
+
+    // --- Read just the first 100 bytes (a header read). Range hydration must fetch ONLY the
+    // chunk(s) overlapping [0, 100) — a strict subset of the manifest.
+    let head_expected = b.manifest_range_hashes(&node_id, 0, 100).unwrap();
+    assert!(!head_expected.is_empty() && head_expected.len() < all_hashes.len(),
+        "header range overlaps a strict subset: {} of {}", head_expected.len(), all_hashes.len());
+
+    SyncEngine::hydrate_range(&b, &cb, &counting, &node_id, 0, 100).expect("range hydrate head");
+
+    // Exactly the overlapping chunks were fetched — nothing more.
+    let fetched_head = counting.fetched();
+    let fetched_set: std::collections::HashSet<_> = fetched_head.iter().cloned().collect();
+    let expected_set: std::collections::HashSet<_> = head_expected.iter().cloned().collect();
+    assert_eq!(fetched_set, expected_set, "fetched exactly the header-overlapping chunks");
+    // The cache holds only those chunks; the rest of the file is still un-hydrated.
+    for h in &head_expected {
+        assert!(b.has_chunk(h), "header chunk {h} now cached");
+    }
+    let not_in_head: Vec<&String> = all_hashes.iter().filter(|h| !expected_set.contains(*h)).collect();
+    assert!(not_in_head.iter().any(|h| !b.has_chunk(h)), "chunks outside the header range stay un-hydrated");
+
+    // And the header bytes read back correctly from the partial cache.
+    assert_eq!(b.read(bf.ino, 0, 100).unwrap(), &body[..100]);
+
+    // --- Now read a LATER range; only its (still-missing) chunks should be fetched.
+    let later_off = 25_000u64;
+    let later_len = 200u64;
+    let later_expected = b.manifest_range_hashes(&node_id, later_off, later_len).unwrap();
+    let before = counting.fetched().len();
+    SyncEngine::hydrate_range(&b, &cb, &counting, &node_id, later_off, later_len).expect("range hydrate tail");
+    let newly_fetched: Vec<String> = counting.fetched()[before..].to_vec();
+    // Only the later range's not-yet-cached chunks were fetched this round (any that happened
+    // to overlap the header — unlikely here — would already be cached and skipped).
+    let later_set: std::collections::HashSet<_> = later_expected.iter().cloned().collect();
+    assert!(newly_fetched.iter().all(|h| later_set.contains(h)),
+        "second hydrate fetched only chunks of the later range");
+    assert_eq!(
+        b.read(bf.ino, later_off, later_len as u32).unwrap(),
+        &body[later_off as usize..(later_off + later_len) as usize]
+    );
+
+    // --- Finally a whole-file hydrate fills the rest; the full read is byte-perfect.
+    SyncEngine::hydrate(&b, &cb, &counting, &node_id).expect("full hydrate");
+    assert!(all_hashes.iter().all(|h| b.has_chunk(h)), "every chunk cached after full hydrate");
+    assert_eq!(read_all(&b, bf.ino), body, "whole file byte-for-byte after full hydrate");
+}
+
 // ---- push dedup / idempotency ------------------------------------------------------
 
 #[test]

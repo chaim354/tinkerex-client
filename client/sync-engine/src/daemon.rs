@@ -541,15 +541,18 @@ impl CfApiMount {
             thread::spawn(move || nudge_loop(client, stop, nudge_tx));
         }
 
-        // Hydrate-on-FETCH_DATA: CfAPI hands us the node_id (placeholder FileIdentity); pull
-        // its missing chunks via presigned GET into the local cache.
+        // Hydrate-on-FETCH_DATA: CfAPI hands us the node_id (placeholder FileIdentity) + the
+        // kernel's required byte range; pull only the chunks that range overlaps via presigned
+        // GET (progressive hydration — a header read of a huge file fetches a handful of chunks,
+        // not the whole file). A pin→"keep on device" raises FETCH_DATA for the full range, so a
+        // pinned file still hydrates completely.
         let hydrate: fs_cfapi::Hydrate = {
             let p = provider.clone();
             let c = client.clone();
-            Arc::new(move |node_id: &str| {
+            Arc::new(move |node_id: &str, offset: u64, length: u64| {
                 let io = PresignedIO::new(&c);
-                if let Err(e) = SyncEngine::hydrate(&p, &c, &io, node_id) {
-                    eprintln!("cfapi hydrate {node_id}: {e}");
+                if let Err(e) = SyncEngine::hydrate_range(&p, &c, &io, node_id, offset, length) {
+                    eprintln!("cfapi hydrate_range {node_id} off={offset} len={length}: {e}");
                 }
             })
         };

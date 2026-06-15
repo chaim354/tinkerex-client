@@ -186,6 +186,57 @@ fn empty_and_missing_manifests_return_nothing() {
 }
 
 #[test]
+fn partial_read_works_with_only_the_overlapping_chunks_cached() {
+    // The end-to-end payoff at the provider layer: B holds the manifest but only the chunks
+    // overlapping a range. A read of that range must succeed (assemble from the cached subset),
+    // while a read of an un-cached range must report ChunkMissing (so the mount hydrates it).
+    // We build an explicit partial-cache scenario: a "cloud" source store + an isolated empty
+    // store for B, copying only selected chunks across (the hydrate stand-in).
+    use fs_provider::{LocalChunkStore, SqliteProvider};
+    let cloud = tempdir::Dir::new();
+    let src = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(cloud.path()).unwrap()), TINY).unwrap();
+    let body = unique_body(8192);
+    write_file(&src, ROOT, "f.bin", &body);
+    let id = node_id(&src, "f.bin");
+    let l = layout(&src, "f.bin");
+
+    // B: a fresh device with an EMPTY local chunk store; apply the source tree (manifest only).
+    let b_store_dir = tempdir::Dir::new();
+    let b = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(b_store_dir.path()).unwrap()), TINY).unwrap();
+    for n in &src.export_tree().unwrap() {
+        b.apply_remote(n).unwrap();
+    }
+    let bino = b.lookup(ROOT, "f.bin").unwrap().ino;
+
+    // Simulate range hydration of the header: copy ONLY the chunks overlapping [0, 100).
+    let head_hashes = b.manifest_range_hashes(&id, 0, 100).unwrap();
+    assert_eq!(head_hashes.len(), 1, "header is within chunk 0");
+    for h in &head_hashes {
+        let bytes = src.chunk_get(h).unwrap();
+        b.chunk_put(h, &bytes).unwrap();
+    }
+
+    // The header read succeeds from the single cached chunk...
+    assert_eq!(b.read(bino, 0, 100).unwrap(), &body[..100]);
+
+    // ...but a read into a NOT-yet-cached chunk reports ChunkMissing (the hydrate trigger).
+    let last = l.last().unwrap();
+    let off = last.offset + 1;
+    match b.read(bino, off, 50) {
+        Err(fs_provider::FsError::ChunkMissing(h)) => assert_eq!(h, last.hash, "missing the last chunk"),
+        other => panic!("expected ChunkMissing for an un-hydrated range, got {other:?}"),
+    }
+
+    // Now hydrate that range's chunk too; the read succeeds.
+    let tail_hashes = b.manifest_range_hashes(&id, off, 50).unwrap();
+    for h in &tail_hashes {
+        b.chunk_put(h, &src.chunk_get(h).unwrap()).unwrap();
+    }
+    let want = &body[off as usize..(off as usize + 50).min(body.len())];
+    assert_eq!(b.read(bino, off, 50).unwrap(), want);
+}
+
+#[test]
 fn deduped_chunks_appear_once() {
     // A file whose content repeats a chunk-sized pattern dedups to one chunk hash. A range
     // spanning multiple copies must return that hash only ONCE (fetch each distinct chunk

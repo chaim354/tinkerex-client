@@ -74,9 +74,20 @@ fn file_attr(a: &Attr) -> FileAttr {
 /// chunks from the cloud, then retries the read. Keeping it a trait here means `fs-fuse`
 /// stays free of any server/transport dependency.
 pub trait Hydrate: Send + Sync {
-    /// Best-effort: pull `ino`'s missing chunks into the local cache. Errors are the
-    /// hydrator's to log; the adapter just retries the read once afterward.
+    /// Best-effort: pull `ino`'s **whole** missing content into the local cache. Used by
+    /// open-for-write (where a random write must not miss any region) and as the fallback
+    /// for callers that don't know a range.
     fn hydrate(&self, ino: u64);
+
+    /// **Progressive / range hydration**: best-effort pull only the chunks overlapping
+    /// `[offset, offset + size)` — what a read at that range needs — instead of the whole
+    /// file. The read path calls this so opening a huge file and reading just its header
+    /// fetches a handful of chunks, not gigabytes. Default delegates to the whole-file
+    /// [`hydrate`](Self::hydrate), so an implementor that doesn't (yet) range-fetch stays
+    /// correct (it just fetches more than strictly needed).
+    fn hydrate_range(&self, ino: u64, _offset: u64, _size: u32) {
+        self.hydrate(ino);
+    }
 }
 
 /// Freshness-on-access: a quick catch-up pull when a file is opened, so an open never
@@ -237,8 +248,13 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
             // bytes from the cloud, then retry the read once. This is the on-demand
             // hydration path (placeholder → materialized) for both initial pulls and
             // files repointed at new manifests by a remote change.
+            //
+            // **Range hydration:** fetch only the chunks overlapping the touched
+            // `[offset, size)` — a header read of a huge file pulls a handful of chunks,
+            // not the whole file. Write-open already full-hydrated up front (`open`), so
+            // random writes never reach this miss path with a partial cache.
             Err(FsError::ChunkMissing(_)) if self.hydrator.is_some() => {
-                self.hydrator.as_ref().unwrap().hydrate(ino);
+                self.hydrator.as_ref().unwrap().hydrate_range(ino, offset as u64, size);
                 match self.provider.read(ino, offset as u64, size) {
                     Ok(data) => reply.data(&data),
                     Err(e) => reply.error(errno(&e)),
