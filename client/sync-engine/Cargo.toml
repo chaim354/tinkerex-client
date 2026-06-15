@@ -18,9 +18,10 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # unused on macOS, so it's strictly Linux here.
 [target.'cfg(target_os = "linux")'.dependencies]
 fs-fuse = { path = "../fs-fuse" }
-# abi-7-12 enables BackgroundSession::notifier() + Notifier::inval_inode (active cache
-# invalidation on a content-changing pull — see EngineInvalidate).
-fuser = { version = "0.14", features = ["abi-7-12"] }
+# fuser 0.17: the abi-7-xx feature flags are gone (ignored as of 0.16, removed in 0.18) —
+# BackgroundSession::notifier() + Notifier::inval_inode (active cache invalidation on a
+# content-changing pull, see EngineInvalidate) are now always available, no feature gate.
+fuser = "0.17"
 libc = "0.2"
 
 [dev-dependencies]

@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 fs-provider = { path = "../fs-provider" }
-fuser = "0.14"
+fuser = "0.17"
 libc = "0.2"
 
 [[bin]]
