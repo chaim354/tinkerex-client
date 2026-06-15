@@ -138,6 +138,14 @@ pub struct ApplyOutcome {
     pub ino: u64,
     /// The node already existed and its manifest (content) changed — invalidate its cache.
     pub content_changed: bool,
+    /// The node already existed and this apply **moved/renamed** it — its `(parent, name)`
+    /// changed, so its on-disk path is now different. For on-demand-population adapters (CfAPI /
+    /// macOS File Provider) the OLD-path placeholder must be removed and a NEW-path one created;
+    /// the changelog models a move as an upsert on the same stable `node_id` (not a delete +
+    /// create), so neither `inserted` nor `content_changed` catches it. `false` for an INSERT (a
+    /// brand-new node has no old path) and for an in-place content/metadata change. FUSE/WebDAV/
+    /// WinFsp ignore this (they enumerate live from the tree).
+    pub moved: bool,
     /// The node did not exist locally before this pull (a fresh INSERT, not an UPDATE). The
     /// adapter should *create* a fresh placeholder for it (e.g. CfAPI `CfCreatePlaceholders`)
     /// rather than invalidate an existing one — there's nothing cached to invalidate yet.
@@ -605,11 +613,11 @@ impl SqliteProvider {
         let size: i64 = node.chunks.iter().map(|c| c.length as i64).sum();
         // Look up the prior row (ino + manifest) so we can both reuse the inode on update
         // and decide whether the content actually changed (→ cache invalidation).
-        let prior: Option<(i64, Option<String>)> = conn
+        let prior: Option<(i64, Option<String>, i64, String)> = conn
             .query_row(
-                "SELECT ino, manifest_id FROM nodes WHERE node_id = ?1",
+                "SELECT ino, manifest_id, parent_ino, name FROM nodes WHERE node_id = ?1",
                 params![node.node_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
         // Displace any *different* node already occupying this (parent, name): the remote
@@ -654,7 +662,7 @@ impl SqliteProvider {
              )",
             params![parent_ino, node.name, node.node_id],
         )?;
-        let ino = if let Some((ino, _)) = &prior {
+        let ino = if let Some((ino, _, _, _)) = &prior {
             conn.execute(
                 "UPDATE nodes SET parent_ino=?1, name=?2, kind=?3, manifest_id=?4, size=?5, mtime=?6, version_id=?7, mode=?8 WHERE node_id=?9",
                 params![parent_ino, node.name, node.kind.as_str(), node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64, node.node_id],
@@ -671,11 +679,18 @@ impl SqliteProvider {
         // Content changed iff the node already existed and its manifest moved (a same-size
         // edit included — that's exactly the case the old mtime-bump heuristic could miss).
         let content_changed = match &prior {
-            Some((_, old_manifest)) => *old_manifest != node.manifest_id,
+            Some((_, old_manifest, _, _)) => *old_manifest != node.manifest_id,
+            None => false,
+        };
+        // Moved/renamed iff the node already existed and its (parent, name) changed. The
+        // changelog models a move as an upsert on the same stable node_id, so this is the only
+        // signal that an on-demand-population adapter's old-path placeholder is now stale.
+        let moved = match &prior {
+            Some((_, _, old_parent, old_name)) => *old_parent != parent_ino || *old_name != node.name,
             None => false,
         };
         let inserted = prior.is_none();
-        Ok(ApplyOutcome { ino, content_changed, inserted, displaced_pending })
+        Ok(ApplyOutcome { ino, content_changed, inserted, moved, displaced_pending })
     }
 
     /// Apply a delete pulled from the server: remove the node identified by its stable
@@ -1942,6 +1957,48 @@ mod tests {
         let pulled2 = SyncNode { node_id: "remote-T".into(), ..pulled.clone() };
         let o2 = p.apply_remote(&pulled2).unwrap();
         assert!(!o2.displaced_pending, "no pending local state → no displaced_pending signal");
+    }
+
+    /// `apply_remote` must flag `moved` when a pulled upsert relocates an EXISTING node
+    /// (new parent and/or name, same stable node_id) — and NOT for an INSERT or an in-place
+    /// content/metadata change. This is the signal an on-demand-population adapter (CfAPI)
+    /// needs to remove the old-path placeholder + create the new one (the third live bug:
+    /// renames left the old name lingering on the receiving mount).
+    #[test]
+    fn apply_remote_flags_moved_only_on_relocation() {
+        let p = provider();
+        let d1 = p.mkdir(ROOT_INO, "d1").unwrap();
+        let d1_id = p.node_id_for(d1.ino).unwrap().unwrap();
+        let d2 = p.mkdir(ROOT_INO, "d2").unwrap();
+        let d2_id = p.node_id_for(d2.ino).unwrap().unwrap();
+
+        // INSERT: a brand-new node — moved must be false (no old path).
+        let mk = |node_id: &str, parent: &str, name: &str| SyncNode {
+            node_id: node_id.into(),
+            parent_node_id: Some(parent.into()),
+            name: name.into(),
+            kind: Kind::File,
+            manifest_id: None,
+            chunks: vec![],
+            version_id: Some("v1".into()),
+            mode: 0o644,
+            mtime: 0,
+        };
+        let o_insert = p.apply_remote(&mk("R", &d1_id, "a.txt")).unwrap();
+        assert!(o_insert.inserted && !o_insert.moved, "INSERT is not a move");
+
+        // In-place metadata change (same parent + name): not a move.
+        let o_same = p.apply_remote(&mk("R", &d1_id, "a.txt")).unwrap();
+        assert!(!o_same.inserted && !o_same.moved, "same (parent,name) is not a move");
+
+        // RENAME (same parent, new name): moved.
+        let o_rename = p.apply_remote(&mk("R", &d1_id, "b.txt")).unwrap();
+        assert!(!o_rename.inserted && o_rename.moved, "rename within a dir is a move");
+
+        // MOVE (new parent, possibly same name): moved.
+        let o_move = p.apply_remote(&mk("R", &d2_id, "b.txt")).unwrap();
+        assert!(!o_move.inserted && o_move.moved, "reparent is a move");
+        assert_eq!(p.parent_and_name(o_move.ino).unwrap().unwrap().0, d2.ino, "now under d2");
     }
 
     /// Convergence harness: drive a deterministic pseudo-random stream of create /
