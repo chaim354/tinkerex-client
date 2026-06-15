@@ -320,14 +320,42 @@ impl SyncEngine {
         }
     }
 
-    /// Hydrate a file's chunks from the cloud into the local cache.
+    /// Hydrate a file's **whole** content from the cloud into the local cache. The policy for
+    /// a read that needs every byte (mmap, read-entire-file) and — critically — for an
+    /// **open-for-write** (a random write seeds its staging buffer from the committed content,
+    /// so a partial hydrate would leave the unfetched regions wrong). Equivalent to
+    /// [`hydrate_range`](Self::hydrate_range) over `(0, u64::MAX)`.
     pub fn hydrate(
         provider: &SqliteProvider,
         client: &ServerClient,
         io: &dyn ChunkIO,
         node_id: &str,
     ) -> Result<()> {
-        let hashes = provider.node_manifest_hashes(node_id)?;
+        Self::hydrate_range(provider, client, io, node_id, 0, u64::MAX)
+    }
+
+    /// **Progressive / range hydration**: fetch only the chunks overlapping `[offset, offset +
+    /// size)` — the subset a read at that range actually needs — instead of the whole file. A
+    /// header read of a multi-GB file thus pulls a handful of chunks, not gigabytes.
+    ///
+    /// The range→chunk mapping is [`SqliteProvider::manifest_range_hashes`] (the manifest
+    /// already records each chunk's offset/length); we then fetch only the *missing* ones via
+    /// presigned GET, exactly as the whole-file path does. A subsequent
+    /// [`Provider::read`](fs_provider::Provider::read) of that range assembles from the now-local
+    /// chunks. `size == u64::MAX` (or any range covering EOF) degenerates to a full hydrate, so
+    /// [`hydrate`](Self::hydrate) is just this with the whole-file range.
+    ///
+    /// Policy note: callers pick whole-vs-range by *read intent* — the read path passes the
+    /// touched `(offset, size)`; write-open and mmap/read-whole paths call [`hydrate`](Self::hydrate).
+    pub fn hydrate_range(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        node_id: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        let hashes = provider.manifest_range_hashes(node_id, offset, size)?;
         let missing: Vec<String> = hashes.into_iter().filter(|h| !provider.has_chunk(h)).collect();
         if missing.is_empty() {
             return Ok(());
@@ -500,19 +528,40 @@ impl EngineHydrator {
 }
 
 #[cfg(target_os = "linux")]
-impl fs_fuse::Hydrate for EngineHydrator {
-    fn hydrate(&self, ino: u64) {
-        let node_id = match self.provider.node_id_for(ino) {
-            Ok(Some(id)) => id,
-            Ok(None) => return,
+impl EngineHydrator {
+    /// Resolve `ino` → node_id (logging + swallowing the not-found / error cases the way the
+    /// best-effort hydrate hooks do), shared by the whole-file and range entry points.
+    fn node_id_or_log(&self, ino: u64) -> Option<String> {
+        match self.provider.node_id_for(ino) {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => None,
             Err(e) => {
                 eprintln!("hydrate: node_id lookup for ino {ino} failed: {e}");
-                return;
+                None
             }
-        };
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fs_fuse::Hydrate for EngineHydrator {
+    fn hydrate(&self, ino: u64) {
+        let Some(node_id) = self.node_id_or_log(ino) else { return };
         let io = PresignedIO::new(&self.client);
         if let Err(e) = SyncEngine::hydrate(&self.provider, &self.client, &io, &node_id) {
             eprintln!("hydrate: ino {ino} (node {node_id}) failed: {e}");
+        }
+    }
+
+    /// Range hydration: fetch only the chunks overlapping the read's `[offset, size)` (the
+    /// header-of-a-huge-file case), not the whole file.
+    fn hydrate_range(&self, ino: u64, offset: u64, size: u32) {
+        let Some(node_id) = self.node_id_or_log(ino) else { return };
+        let io = PresignedIO::new(&self.client);
+        if let Err(e) =
+            SyncEngine::hydrate_range(&self.provider, &self.client, &io, &node_id, offset, size as u64)
+        {
+            eprintln!("hydrate_range: ino {ino} (node {node_id}) off={offset} len={size} failed: {e}");
         }
     }
 }

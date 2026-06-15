@@ -42,10 +42,14 @@ use windows::Win32::Storage::FileSystem::{
 
 use crate::{library_relative, unix_nanos_to_filetime, FileIdentity};
 
-/// On-demand hydration hook: "make `node_id`'s chunks local" (presigned GET into the cache).
-/// The sync engine supplies it (see `sync_engine::CfApiMount`); a bare local mount passes
-/// `None` and serves only already-cached chunks.
-pub type Hydrate = Arc<dyn Fn(&str) + Send + Sync>;
+/// On-demand **range** hydration hook: "make the chunks of `node_id` overlapping
+/// `[offset, offset + length)` local" (presigned GET into the cache). FETCH_DATA carries the
+/// kernel's required byte range, so we fetch only the chunks that range needs — a read of a huge
+/// file's header pulls a handful of chunks, not gigabytes (progressive hydration). The sync
+/// engine supplies it (see `sync_engine::CfApiMount`); a bare local mount passes `None` and
+/// serves only already-cached chunks. A caller that wants the whole file passes `0..u64::MAX`
+/// (e.g. the pin→hydrate path, which hydrates everything).
+pub type Hydrate = Arc<dyn Fn(&str, u64, u64) + Send + Sync>;
 
 /// A fixed provider id for the sync-root registration (one logical cloud provider). A real
 /// multi-account build would derive this per user; one constant is fine for v1.
@@ -621,8 +625,11 @@ unsafe extern "system" fn fetch_data_callback(
         }
     };
     eprintln!("cfapi: FETCH_DATA node={node_id} off={req_offset} len={req_length}");
+    // Range hydration: fetch only the chunks overlapping the kernel's required range, not the
+    // whole file. (`CfHydratePlaceholder(0, -1)` from the pin path raises FETCH_DATA for the
+    // full range, so a pinned file still ends up fully local.)
     if let Some(h) = &state.hydrate {
-        h(&node_id);
+        h(&node_id, req_offset as u64, req_length as u64);
     }
     let ino = match state.provider.ino_for_node_id(&node_id).ok().flatten() {
         Some(i) => i,

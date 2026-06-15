@@ -369,6 +369,61 @@ impl SqliteProvider {
         Ok(out)
     }
 
+    /// Assemble **only** the bytes of `[offset, offset + size)` from a committed manifest,
+    /// touching only the chunks that range overlaps. This is what makes progressive hydration
+    /// pay off: a header read of a multi-GB file assembles from the one or two chunks it spans,
+    /// so it needs only *those* chunks cached (the rest can stay un-hydrated) — whereas
+    /// [`assemble`](Self::assemble) reads every chunk and so requires the whole file local.
+    ///
+    /// A `ChunkMissing` for an overlapping chunk propagates (the read path hydrates that range
+    /// and retries — same contract as before, just scoped to the range). Bytes past EOF are
+    /// simply absent from the result (the caller clamps).
+    fn assemble_range(&self, conn: &Connection, manifest_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let req_end = offset.saturating_add(size as u64);
+        let mut stmt = conn.prepare(
+            "SELECT chunk_hash, offset, length FROM manifest_chunks WHERE manifest_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![manifest_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as usize,
+            ))
+        })?;
+        let mut out = vec![0u8; (req_end - offset) as usize];
+        let mut filled_end = offset; // highest contiguous byte position we've produced
+        for row in rows {
+            let (hash, c_off, c_len) = row?;
+            let c_end = c_off.saturating_add(c_len as u64);
+            // Skip chunks entirely outside the request.
+            if c_end <= offset || c_off >= req_end {
+                continue;
+            }
+            let bytes = self.store.get(&hash).map_err(|_| FsError::ChunkMissing(hash))?;
+            let bytes = &bytes[..c_len.min(bytes.len())];
+            // Overlap of [c_off, c_end) with [offset, req_end), copied into the output buffer.
+            let copy_start = c_off.max(offset);
+            let copy_end = c_end.min(req_end);
+            let src_lo = (copy_start - c_off) as usize;
+            let src_hi = (copy_end - c_off) as usize;
+            let dst_lo = (copy_start - offset) as usize;
+            // The chunk store may hold fewer bytes than the manifest claims only on corruption;
+            // guard the slice so we never panic (the missing tail reads as zero / clamps).
+            if src_hi <= bytes.len() {
+                let span = src_hi - src_lo;
+                out[dst_lo..dst_lo + span].copy_from_slice(&bytes[src_lo..src_hi]);
+                filled_end = filled_end.max(copy_end);
+            }
+        }
+        // Clamp to the bytes actually backed by chunks (don't return zero-padding past EOF).
+        let valid = (filled_end.saturating_sub(offset)) as usize;
+        out.truncate(valid);
+        Ok(out)
+    }
+
     /// Current content of `ino`: in-progress staging buffer if open for write, else
     /// the committed content assembled from chunks, else empty.
     fn current_content(&self, ino: u64) -> Result<Vec<u8>> {
@@ -689,6 +744,60 @@ impl SqliteProvider {
             })
             .optional()?
             .map(|i| i as u64))
+    }
+
+    /// The chunk hashes whose byte range overlaps `[offset, offset + size)` — the SUBSET of a
+    /// node's manifest needed to satisfy a read at that range. This is the core of **progressive
+    /// / range hydration**: a read of just a file's header (or any slice) maps to only the few
+    /// chunks covering it, so the hydrator fetches those instead of the whole (possibly
+    /// multi-GB) file. Hashes are returned in manifest order and **deduplicated** (a chunk that
+    /// dedups to the same hash appears once), so the caller fetches each distinct chunk at most
+    /// once.
+    ///
+    /// A chunk spanning `[c.offset, c.offset + c.length)` overlaps the request iff
+    /// `c.offset < offset + size && offset < c.offset + c.length`. A zero-length request (`size
+    /// == 0`) overlaps nothing → empty. An empty manifest (no content, or a never-flushed node)
+    /// → empty. A range past EOF → empty (no chunk overlaps). The whole-file case is just
+    /// `manifest_range_hashes(id, 0, u64::MAX)` and returns every distinct chunk, matching
+    /// [`node_manifest_hashes`](Self::node_manifest_hashes) (modulo dedup).
+    pub fn manifest_range_hashes(&self, node_id: &str, offset: u64, size: u64) -> Result<Vec<String>> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mid: Option<String> = conn
+            .query_row("SELECT manifest_id FROM nodes WHERE node_id = ?1", params![node_id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten();
+        let mid = match mid {
+            None => return Ok(Vec::new()),
+            Some(m) => m,
+        };
+        // The requested range's exclusive end, saturating so `u64::MAX` (whole-file) can't wrap.
+        let req_end = offset.saturating_add(size);
+        let mut stmt = conn.prepare(
+            "SELECT chunk_hash, offset, length FROM manifest_chunks WHERE manifest_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![mid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let (hash, c_off, c_len) = row?;
+            let c_end = c_off.saturating_add(c_len);
+            // Half-open overlap test: the chunk and the request share at least one byte.
+            if c_off < req_end && offset < c_end && seen.insert(hash.clone()) {
+                out.push(hash);
+            }
+        }
+        Ok(out)
     }
 
     /// The ordered chunk hashes for a node's current manifest (for hydration).
@@ -1123,10 +1232,26 @@ impl Provider for SqliteProvider {
     }
 
     fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let content = self.current_content(ino)?;
-        let start = (offset as usize).min(content.len());
-        let end = (start + size as usize).min(content.len());
-        Ok(content[start..end].to_vec())
+        // Open for write → serve from the in-memory staging buffer (the live, uncommitted
+        // content). Slice the requested range out of it.
+        if let Some(buf) = self.staging.lock().unwrap().get(&ino) {
+            let start = (offset as usize).min(buf.len());
+            let end = (start + size as usize).min(buf.len());
+            return Ok(buf[start..end].to_vec());
+        }
+        // Committed file → assemble **only the chunks the range overlaps**, not the whole file.
+        // This is what lets progressive hydration serve a header read from just the first
+        // chunk(s): a `ChunkMissing` here is scoped to the requested range, so the mount's
+        // read-path hydrates *that range* and retries (instead of needing the whole file).
+        let conn = self.conn.lock().unwrap();
+        let manifest: Option<String> = conn
+            .query_row("SELECT manifest_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .optional()?
+            .ok_or(FsError::NotFound)?;
+        match manifest {
+            Some(m) => self.assemble_range(&conn, &m, offset, size),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn create(&self, parent: u64, name: &str) -> Result<Attr> {
