@@ -586,3 +586,93 @@ fn cursor_advances_and_redelivered_delta_is_idempotent() {
     assert_eq!(c2, c1, "head_seq stable on replay");
     assert_eq!(b.readdir(ROOT_INO).unwrap().len(), snap, "replay is idempotent");
 }
+
+// ---- BUG #1 regression: move into a newer dir (topological outbox drain) ------------
+//
+// A file created BEFORE a directory, then moved INTO that directory, must commit the dir
+// before the moved child so the server changelog records the parent first. Otherwise a
+// fresh device pulling the delta hits `apply_remote` NotFound on the orphaned child and the
+// whole pull aborts. `SyncEngine::push_outbox` now drains in topological (parents-first)
+// order via `SqliteProvider::outbox_list_topo`, proven here against the REAL server.
+
+#[test]
+fn move_into_newer_dir_pushes_parent_before_child() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    let a = dev();
+    // 1. create file F at root (early outbox id). 2. later mkdir D. 3. move F into D.
+    let f = a.create(ROOT_INO, "F.txt").unwrap();
+    a.write(f.ino, 0, b"hello world").unwrap();
+    a.flush(f.ino).unwrap();
+    let d = a.mkdir(ROOT_INO, "D").unwrap();
+    a.rename(ROOT_INO, "F.txt", d.ino, "F.txt").unwrap();
+    let f_id = a.node_id_for(f.ino).unwrap().unwrap();
+
+    // Raw outbox lists the moved child before its new parent (the underlying ordering bug);
+    // the fix is the *drain* order, so the push must still land parent-first on the server.
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push (topological drain)");
+    assert!(a.outbox_list().unwrap().is_empty(), "outbox fully drained");
+
+    // A fresh device pulls the delta. If the child had been committed before the dir, this
+    // would abort on a parentless `apply_remote`. It must converge cleanly: F under D.
+    let b = dev();
+    SyncEngine::pull_changes(&b, &cb, 0).expect("B delta pull converges (no abort)");
+    let b_d = b.lookup(ROOT_INO, "D").expect("B has dir D");
+    let b_f = b.lookup(b_d.ino, "F.txt").expect("B has F under D");
+    assert_eq!(b.node_id_for(b_f.ino).unwrap().unwrap(), f_id, "same node F moved into D");
+    assert!(b.lookup(ROOT_INO, "F.txt").is_err(), "F is no longer at root");
+
+    SyncEngine::hydrate(&b, &cb, &cloud, &f_id).expect("B hydrate");
+    assert_eq!(read_all(&b, b_f.ino), b"hello world", "F content intact");
+}
+
+// ---- BUG #2 regression: move-out then delete-parent (defer-and-retry pull) -----------
+//
+// Source moves a child subtree OUT of a directory, then deletes that directory. A replica
+// applying the changelog delta can transiently sweep its (stale) copy of the moved subtree
+// via the recursive parent delete, then meet the child's re-parenting upsert with its new
+// parent not-yet-present. The pull must DEFER that upsert and retry (not abort via `?`), so
+// the replica converges from the delta alone — child alive under its new parent, no loss.
+
+#[test]
+fn move_out_then_delete_parent_converges_via_delta() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    let a = dev();
+    let p = a.mkdir(ROOT_INO, "P").unwrap();
+    let q = a.mkdir(ROOT_INO, "Q").unwrap();
+    let c = a.mkdir(p.ino, "C").unwrap();
+    let leaf = a.create(c.ino, "leaf.txt").unwrap();
+    a.write(leaf.ino, 0, b"payload").unwrap();
+    a.flush(leaf.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A initial push");
+
+    // Replica pulls the initial tree (P, Q, C-under-P, leaf-under-C).
+    let b = dev();
+    let cursor = SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    let b_p = b.lookup(ROOT_INO, "P").unwrap().ino;
+    assert!(b.lookup(b_p, "C").is_ok(), "B has C under P");
+
+    // Source: move C (with its leaf) OUT of P into Q, then delete P.
+    a.rename(p.ino, "C", q.ino, "C").unwrap();
+    a.rmdir(ROOT_INO, "P").unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push move-out + delete");
+
+    // Replica applies the delta. The defer-and-retry pull must converge it without aborting.
+    SyncEngine::pull_changes(&b, &cb, cursor).expect("B delta pull converges (defer-and-retry)");
+
+    let c_id = a.node_id_for(c.ino).unwrap().unwrap();
+    let q_id = a.node_id_for(q.ino).unwrap().unwrap();
+    let rc = b.sync_node(&c_id).unwrap().expect("C survives move-out + parent delete");
+    assert_eq!(rc.parent_node_id.as_deref(), Some(q_id.as_str()), "C re-parented to Q");
+    let leaf_id = a.node_id_for(leaf.ino).unwrap().unwrap();
+    assert!(b.sync_node(&leaf_id).unwrap().is_some(), "the leaf survived (no data loss)");
+    assert!(b.lookup(ROOT_INO, "P").is_err(), "P is gone on the replica");
+
+    // Bytes intact end-to-end.
+    SyncEngine::hydrate(&b, &cb, &cloud, &leaf_id).expect("B hydrate leaf");
+    let b_leaf_ino = b.ino_for_node_id(&leaf_id).unwrap().unwrap();
+    assert_eq!(read_all(&b, b_leaf_ino), b"payload", "leaf content intact");
+}
