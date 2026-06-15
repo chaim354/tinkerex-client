@@ -65,8 +65,12 @@ fn main() {
     println!("DEVICE_A_TOKEN={}", reg_a.device_token);
     println!("DEVICE_B_TOKEN={}", reg_b.device_token);
 
-    eprintln!(
-        "✓ paired two devices into one library ({email}): A + B tokens issued via the real \
-         register → create_pairing → pair flow"
+    // The human-readable confirmation goes to STDOUT (not stderr): the PowerShell harness runs
+    // with `$ErrorActionPreference='Stop'`, which treats ANY native-command stderr output as a
+    // terminating error — so a stderr note here would abort the test even on success. The script
+    // greps the `DEVICE_*=`/`PAIR_EMAIL=` prefixes, so an extra stdout line is harmless.
+    println!(
+        "# paired two devices into one library ({email}): A + B tokens issued via the real \
+         register -> create_pairing -> pair flow"
     );
 }

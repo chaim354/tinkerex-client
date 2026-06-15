@@ -65,7 +65,12 @@ $cfsyncd = "$repo\client\sync-engine\target\debug\maker-cfsyncd.exe"
 # --- 1. Seed: register A + pair B into one library (the REAL pairing flow) --------------------
 Write-Host "==> Pairing two devices into one library (register A -> create_pairing -> pair B)"
 $env:SERVER_URL = $Server
+# Relax ErrorActionPreference for the native cargo call: any stderr (a stray cargo progress line)
+# would otherwise abort under 'Stop'. We assert on the parsed tokens below, so a non-fatal stderr
+# line is fine.
+$prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
 $seed = & cargo run --quiet --manifest-path $engine --example pair_two_devices 2>&1
+$ErrorActionPreference = $prevEAP
 $seed | Out-Host
 $tokA = ($seed | Select-String -Pattern '^DEVICE_A_TOKEN=(.+)$').Matches[0].Groups[1].Value.Trim()
 $tokB = ($seed | Select-String -Pattern '^DEVICE_B_TOKEN=(.+)$').Matches[0].Groups[1].Value.Trim()
