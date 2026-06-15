@@ -23,14 +23,15 @@ use fuser::{
 
 const TTL: Duration = Duration::from_secs(1);
 
-fn errno(e: &FsError) -> i32 {
+fn errno(e: &FsError) -> fuser::Errno {
+    // fuser 0.17: ReplyXxx::error() takes fuser::Errno (named consts), not a bare i32.
     match e {
-        FsError::NotFound => libc::ENOENT,
-        FsError::NotADirectory => libc::ENOTDIR,
-        FsError::IsADirectory => libc::EISDIR,
-        FsError::AlreadyExists => libc::EEXIST,
-        FsError::NotEmpty => libc::ENOTEMPTY,
-        _ => libc::EIO,
+        FsError::NotFound => fuser::Errno::ENOENT,
+        FsError::NotADirectory => fuser::Errno::ENOTDIR,
+        FsError::IsADirectory => fuser::Errno::EISDIR,
+        FsError::AlreadyExists => fuser::Errno::EEXIST,
+        FsError::NotEmpty => fuser::Errno::ENOTEMPTY,
+        _ => fuser::Errno::EIO,
     }
 }
 
@@ -478,7 +479,7 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         let lock = LockRange { owner: lock_owner, start, end, exclusive: typ == libc::F_WRLCK, pid };
         match self.provider.set_lock(ino, lock) {
             Ok(()) => reply.ok(),
-            Err(_) => reply.error(libc::EAGAIN),
+            Err(_) => reply.error(fuser::Errno::EAGAIN),
         }
     }
 

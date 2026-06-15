@@ -77,7 +77,7 @@ echo "  server up"
 # --- 2. Build + seed (real pairing) ---------------------------------------------------------
 echo "==> building maker-syncd + pair_two_devices"
 cargo build --manifest-path client/sync-engine/Cargo.toml --bin maker-syncd --example pair_two_devices >/dev/null 2>&1 || {
-  echo "FAIL: build failed"; cargo build --manifest-path client/sync-engine/Cargo.toml --bin maker-syncd 2>&1 | tail -20; exit 1; }
+  echo "FAIL: build failed"; cargo build --manifest-path client/sync-engine/Cargo.toml --bin maker-syncd 2>&1 | tail -80; exit 1; }
 SYNCD="client/sync-engine/target/debug/maker-syncd"
 
 echo "==> pairing two devices into one library (register A -> create_pairing -> pair B)"
