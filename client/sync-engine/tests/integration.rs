@@ -760,3 +760,90 @@ fn local_rename_vs_remote_create_same_name_reconciles_no_loss() {
         "A converged: both the authoritative R (renamed) and the re-added F (shared) present"
     );
 }
+
+// ---- selective sync (per-device subscription) --------------------------------------
+
+/// Selective sync end-to-end: B subscribes to one folder and unsubscribes another. After
+/// a sync, the engine's proactive hydration brings the **in-scope** file resident but
+/// leaves the **out-of-scope** file as a placeholder — yet an on-demand hydrate of the
+/// out-of-scope file still works (graceful degradation). Then unsubscribing a hydrated
+/// subtree dehydrates it, reclaiming the bytes while keeping the tree complete.
+#[test]
+fn selective_sync_gates_proactive_hydration_but_not_on_demand() {
+    use fs_provider::SubRule;
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // Device A creates two folders, each with a file, and pushes.
+    let a = dev();
+    let active = a.mkdir(ROOT_INO, "Active").unwrap();
+    let af = a.create(active.ino, "current.stl").unwrap();
+    let active_body: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    a.write(af.ino, 0, &active_body).unwrap();
+    a.flush(af.ino).unwrap();
+
+    let archive = a.mkdir(ROOT_INO, "Archive").unwrap();
+    let arf = a.create(archive.ino, "old.stl").unwrap();
+    let archive_body: Vec<u8> = (0..20_000u32).map(|i| ((i + 7) % 251) as u8).collect();
+    a.write(arf.ino, 0, &archive_body).unwrap();
+    a.flush(arf.ino).unwrap();
+    SyncEngine::push(&a, &ca, &cloud).expect("A push");
+
+    // Device B: pull the full tree (metadata for BOTH folders — tree stays complete).
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    let b_active = b.lookup(ROOT_INO, "Active").expect("B has Active");
+    let b_archive = b.lookup(ROOT_INO, "Archive").expect("B has Archive");
+    let b_active_id = b.node_id_for(b_active.ino).unwrap().unwrap();
+    let b_archive_id = b.node_id_for(b_archive.ino).unwrap().unwrap();
+    let b_af = b.lookup(b_active.ino, "current.stl").unwrap();
+    let b_arf = b.lookup(b_archive.ino, "old.stl").unwrap();
+    let b_af_id = b.node_id_for(b_af.ino).unwrap().unwrap();
+    let b_arf_id = b.node_id_for(b_arf.ino).unwrap().unwrap();
+
+    // B's policy: default-exclude, include only Active.
+    b.set_subscription_default(SubRule::Exclude).unwrap();
+    b.subscribe(&b_active_id).unwrap();
+    assert!(b.proactively_hydrate(&b_af_id).unwrap(), "Active file in scope");
+    assert!(!b.proactively_hydrate(&b_arf_id).unwrap(), "Archive file out of scope");
+
+    // Neither file's bytes are local yet.
+    assert!(b.node_manifest_hashes(&b_af_id).unwrap().iter().any(|h| !b.has_chunk(h)));
+    assert!(b.node_manifest_hashes(&b_arf_id).unwrap().iter().any(|h| !b.has_chunk(h)));
+
+    // Proactive hydration: only the in-scope (Active) file is brought resident.
+    SyncEngine::proactive_hydrate(&b, &cb, &cloud).expect("B proactive hydrate");
+    assert!(
+        b.node_manifest_hashes(&b_af_id).unwrap().iter().all(|h| b.has_chunk(h)),
+        "in-scope Active file is now fully hydrated"
+    );
+    assert!(
+        b.node_manifest_hashes(&b_arf_id).unwrap().iter().any(|h| !b.has_chunk(h)),
+        "out-of-scope Archive file stays a placeholder (not proactively hydrated)"
+    );
+    assert_eq!(read_all(&b, b_af.ino), active_body, "Active reads back byte-for-byte");
+
+    // Graceful degradation: an on-demand hydrate of the OUT-OF-SCOPE file still works.
+    SyncEngine::hydrate(&b, &cb, &cloud, &b_arf_id).expect("on-demand hydrate ignores subscription");
+    assert_eq!(read_all(&b, b_arf.ino), archive_body, "out-of-scope file opens on demand");
+
+    // Now subscribe Archive, hydrate it, then unsubscribe → it dehydrates (bytes reclaimed),
+    // but the tree stays complete (metadata + manifest remain; it re-hydrates on demand).
+    b.subscribe(&b_archive_id).unwrap();
+    SyncEngine::proactive_hydrate(&b, &cb, &cloud).expect("hydrate Archive");
+    assert!(b.node_manifest_hashes(&b_arf_id).unwrap().iter().all(|h| b.has_chunk(h)));
+
+    let reclaimed = SyncEngine::unsubscribe(&b, &b_archive_id).expect("unsubscribe + dehydrate");
+    assert!(reclaimed > 0, "unsubscribing a hydrated subtree reclaims chunks");
+    assert!(
+        b.node_manifest_hashes(&b_arf_id).unwrap().iter().any(|h| !b.has_chunk(h)),
+        "Archive is dehydrated after unsubscribe"
+    );
+    // Tree completeness: Archive's metadata + the file are still present + navigable.
+    assert!(b.lookup(ROOT_INO, "Archive").is_ok());
+    assert!(b.lookup(b_archive.ino, "old.stl").is_ok());
+
+    // And it still re-hydrates on demand after the reclaim.
+    SyncEngine::hydrate(&b, &cb, &cloud, &b_arf_id).expect("re-hydrate after dehydrate");
+    assert_eq!(read_all(&b, b_arf.ino), archive_body, "re-hydrates on demand after reclaim");
+}

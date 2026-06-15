@@ -17,6 +17,14 @@ pub trait ChunkStore: Send + Sync {
     /// Idempotent: storing a hash that already exists is a no-op (this is the dedup).
     fn put(&self, hash: &str, data: &[u8]) -> std::io::Result<()>;
     fn has(&self, hash: &str) -> bool;
+    /// Drop a chunk's bytes to reclaim local space (selective-sync dehydration). The
+    /// caller guarantees the chunk is no longer referenced by any *in-scope* file (dedup
+    /// safety). Idempotent: dropping a hash that isn't stored is a silent no-op. The
+    /// default is a no-op so a store that can't reclaim (e.g. a remote/append-only one)
+    /// stays valid; `LocalChunkStore` removes the file.
+    fn delete(&self, _hash: &str) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Chunks as files under a directory, sharded by the first two hex chars.
@@ -83,5 +91,14 @@ impl ChunkStore for LocalChunkStore {
 
     fn has(&self, hash: &str) -> bool {
         self.path_for(hash).exists()
+    }
+
+    fn delete(&self, hash: &str) -> std::io::Result<()> {
+        match std::fs::remove_file(self.path_for(hash)) {
+            Ok(()) => Ok(()),
+            // Already gone — idempotent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }

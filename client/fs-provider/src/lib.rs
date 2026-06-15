@@ -23,6 +23,9 @@ pub use chunkstore::{ChunkStore, LocalChunkStore};
 pub mod locks;
 pub use locks::{LockManager, LockRange};
 
+pub mod subscriptions;
+pub use subscriptions::SubRule;
+
 pub const ROOT_INO: u64 = 1;
 
 /// The default permission bits for a freshly created node (no umask modeling — the
@@ -313,6 +316,8 @@ impl SqliteProvider {
         // Migrate older DBs that predate these columns (ignore "duplicate column").
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN version_id TEXT", []);
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN mode INTEGER", []);
+        // Selective-sync subscription state (per-device hydration policy; never synced).
+        Self::init_subscriptions(&conn)?;
         // Ensure the root directory (ino 1) exists.
         conn.execute(
             "INSERT OR IGNORE INTO nodes(ino, parent_ino, name, kind, node_id) VALUES (?1, NULL, '', 'dir', 'root')",
