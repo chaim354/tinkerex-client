@@ -106,9 +106,13 @@ wait_mounted() {
   return 1
 }
 if ! wait_mounted "$MNT_A" "$PID_A"; then
-  echo "BLOCKED: FUSE mount A did not come up (likely missing /dev/fuse access or user_allow_other)."
-  echo "  A log:"; cat "$WORK/A.log"
-  exit 0   # documented environment gap, not a correctness failure
+  echo "BLOCKED: FUSE mount A did not come up — the daemon exited right after 'mounted at' OR the"
+  echo "         mountpoint never became a fuse mount. On a self-hosted runner this is almost always"
+  echo "         /dev/fuse access for the runner user: 'sudo usermod -aG fuse \$USER' (re-login), or run"
+  echo "         the runner's container with '--device /dev/fuse --cap-add SYS_ADMIN'. user_allow_other"
+  echo "         in /etc/fuse.conf is also required (this script sets it). Environment gap, not a code bug."
+  echo "  A daemon log:"; cat "$WORK/A.log"
+  exit 0   # documented environment gap, not a correctness failure (mirrors the macOS/Windows walls)
 fi
 if ! wait_mounted "$MNT_B" "$PID_B"; then
   echo "BLOCKED: FUSE mount B did not come up."; echo "  B log:"; cat "$WORK/B.log"; exit 0
