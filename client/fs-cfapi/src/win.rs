@@ -1447,6 +1447,13 @@ impl CfApiInvalidate {
     /// `FETCH_PLACEHOLDERS` enumeration recorded it); on a miss, fall back to a DFS over the
     /// provider tree and back-fill the index so the next lookup is O(1).
     fn path_for(&self, ino: u64) -> Option<PathBuf> {
+        // The root maps to the sync-root folder itself — it has no parent and is never recorded
+        // by `FETCH_PLACEHOLDERS` (which only inserts *children*), so without this special case
+        // `path_for(ROOT_INO)` would miss the index AND never be returned by the DFS below,
+        // dropping every root-level node with "parent not enumerated yet".
+        if ino == ROOT_INO {
+            return Some(self.root.clone());
+        }
         if let Some(p) = self.path_index.get(ino) {
             return Some(p);
         }
@@ -1576,17 +1583,60 @@ impl CfApiInvalidate {
                 return;
             }
         };
-        // The parent's on-disk path. If the parent hasn't been enumerated yet there's no
-        // placeholder for it, so a later FETCH_PLACEHOLDERS will surface this child anyway —
-        // skip quietly.
-        let parent_path = match self.path_for(parent_ino) {
-            Some(p) => p,
+
+        // CfAPI disables on-demand population per directory after its first enumeration, so the OS
+        // will NOT re-enumerate a dir that has since gained children — we must materialize them
+        // ourselves. And `CfCreatePlaceholders` requires the *parent directory's placeholder to
+        // exist on disk*, else `0x80070002`/`0x80070003`. So before creating this node we walk its
+        // ancestor chain root-down and create any missing parent-dir placeholder. The root maps to
+        // the sync-root folder (always present), so a root-level node has an empty chain and is
+        // created directly. Each create is idempotent (an existing placeholder is treated as OK).
+        let provider = &self.provider;
+        let chain = crate::ancestor_chain(ino, |i| provider.parent_and_name(i).ok().flatten());
+        let chain = match chain {
+            Some(c) => c,
             None => {
-                eprintln!("cfapi: created ino={ino} — parent ino={parent_ino} not enumerated yet, skipping");
+                eprintln!("cfapi: created ino={ino} — ancestor chain unresolvable (cycle?), skipping");
                 return;
             }
         };
-        // Build the one placeholder from the node's attrs + identity.
+        // Create each ancestor dir placeholder top-down, in the root-most dir's parent path.
+        // Parent path of the root-most ancestor is always the sync root.
+        for (dir_ino, dir_name) in &chain {
+            let dir_parent = match self.provider.parent_and_name(*dir_ino) {
+                Ok(Some((p, _))) => p,
+                _ => ROOT_INO, // a root-level ancestor's parent is the root
+            };
+            let parent_path = match self.path_for(dir_parent) {
+                Some(p) => p,
+                None => {
+                    eprintln!("cfapi: created ino={ino} — ancestor dir parent ino={dir_parent} unresolved, skipping");
+                    return;
+                }
+            };
+            self.create_one_placeholder(*dir_ino, dir_name, &parent_path);
+            // Record the now-on-disk dir in the index so the next ancestor / the leaf resolves it.
+            self.path_index.insert(*dir_ino, parent_path.join(dir_name));
+        }
+
+        // Now the leaf, in its (now-existing) parent directory.
+        let parent_path = match self.path_for(parent_ino) {
+            Some(p) => p,
+            None => {
+                eprintln!("cfapi: created ino={ino} — parent ino={parent_ino} unresolved after ancestor pass, skipping");
+                return;
+            }
+        };
+        self.create_one_placeholder(ino, &name, &parent_path);
+        // Record the leaf too, so a subsequent child (e.g. of a dir we just made) resolves O(1).
+        self.path_index.insert(ino, parent_path.join(&name));
+    }
+
+    /// Create a single placeholder for `ino` (named `name`, dir or file per its attrs) inside the
+    /// already-existing directory `parent_path`. **Idempotent**: if a placeholder already exists at
+    /// that path, `CfCreatePlaceholders` returns `0x800700B7` (ERROR_ALREADY_EXISTS) — treated as
+    /// success (the proactive path can be re-driven by a re-pull / retry without duplicating work).
+    fn create_one_placeholder(&self, ino: u64, name: &str, parent_path: &Path) {
         let attr = match self.provider.getattr(ino) {
             Ok(a) => a,
             Err(e) => {
@@ -1596,22 +1646,39 @@ impl CfApiInvalidate {
         };
         let node_id = self.provider.node_id_for(ino).ok().flatten().unwrap_or_default();
         let holder =
-            PlaceholderHolder::new(&name, &node_id, attr.size, attr.mtime, attr.kind == Kind::Dir);
+            PlaceholderHolder::new(name, &node_id, attr.size, attr.mtime, attr.kind == Kind::Dir);
         let mut infos = [holder.info()];
 
-        let base_w = path_wide(&parent_path);
+        let base_w = path_wide(parent_path);
         let mut processed: u32 = 0;
+        // ERROR_ALREADY_EXISTS as an HRESULT (FACILITY_WIN32) — an idempotent re-create. CfAPI can
+        // surface it either as the call's HRESULT OR in the per-entry `infos[0].Result`, so check
+        // both. A pre-existing placeholder (e.g. a re-pull, or a dir we already made this pass) is
+        // success, not a failure.
+        const HRESULT_ALREADY_EXISTS: windows::core::HRESULT = windows::core::HRESULT(0x8007_00B7u32 as i32);
         unsafe {
-            match CfCreatePlaceholders(
+            let call = CfCreatePlaceholders(
                 PCWSTR(base_w.as_ptr()),
                 &mut infos,
                 CF_CREATE_FLAG_NONE,
                 Some(&mut processed),
-            ) {
-                Ok(()) => eprintln!(
+            );
+            let entry_result = infos[0].Result;
+            match call {
+                Ok(()) if entry_result.is_ok() || entry_result == HRESULT_ALREADY_EXISTS => eprintln!(
                     "cfapi: created placeholder for ino={ino} name={name} in {} ({processed} processed)",
                     parent_path.display()
                 ),
+                Ok(()) => eprintln!(
+                    "cfapi: created ino={ino} name={name} in {} — per-entry result {entry_result:?}",
+                    parent_path.display()
+                ),
+                Err(e) if e.code() == HRESULT_ALREADY_EXISTS || entry_result == HRESULT_ALREADY_EXISTS => {
+                    eprintln!(
+                        "cfapi: created ino={ino} name={name} in {} — already a placeholder (ok)",
+                        parent_path.display()
+                    )
+                }
                 Err(e) => eprintln!(
                     "cfapi: created ino={ino} CfCreatePlaceholders in {} failed: {e}",
                     parent_path.display()
