@@ -184,13 +184,18 @@ impl Daemon {
         // instantly ("mounted at" → "sync loop stopped"). We already unmount gracefully when
         // the BackgroundSession guard drops in stop()/Drop, so AutoUnmount only bought SIGKILL
         // crash-cleanup — not worth a mount that won't stay up. (verified on the Linux runner.)
-        let opts = [
-            MountOption::FSName("maker".into()),
-            MountOption::DefaultPermissions,
-        ];
+        // fuser 0.17: spawn_mount2 takes a &fuser::Config (was a &[MountOption] slice).
+        // Config is #[non_exhaustive], so build it via Default + the mount_options field.
+        let config = fuser::Config {
+            mount_options: vec![
+                MountOption::FSName("maker".into()),
+                MountOption::DefaultPermissions,
+            ],
+            ..Default::default()
+        };
         // spawn_mount2 runs the FUSE session loop on its own thread and returns a handle
         // that unmounts on drop — the non-blocking counterpart to mount2.
-        let session = fuser::spawn_mount2(fs, &cfg.mountpoint, &opts)?;
+        let session = fuser::spawn_mount2(fs, &cfg.mountpoint, &config)?;
         // Now the session exists, hand its notifier to the invalidation hook (both the sync
         // loop and the freshness adapter share it; before this they no-op harmlessly).
         invalidate.set_notifier(session.notifier());
