@@ -22,7 +22,7 @@ use std::time::Duration;
 use fs_provider::{LocalChunkStore, SqliteProvider};
 use sync_client::ServerClient;
 
-use crate::{PresignedIO, SyncEngine};
+use crate::{ChunkIO, PresignedIO, SyncEngine, ThrottledChunkIO};
 
 // FUSE bits — Linux only (macOS → WebDAV, Windows → WinFsp).
 #[cfg(target_os = "linux")]
@@ -55,6 +55,34 @@ pub struct DaemonConfig {
     pub poll: Duration,
     /// Localhost port for the WebDAV mount path (macOS). Ignored by the FUSE `Daemon`.
     pub webdav_port: u16,
+    /// Optional client-side **upload** bandwidth cap in bytes/sec (`None`/`0` = unlimited).
+    /// Applied to chunk PUTs via [`ThrottledChunkIO`](crate::ThrottledChunkIO).
+    pub up_bps: Option<u64>,
+    /// Optional client-side **download** bandwidth cap in bytes/sec (`None`/`0` = unlimited).
+    /// Applied to chunk GETs via [`ThrottledChunkIO`](crate::ThrottledChunkIO).
+    pub down_bps: Option<u64>,
+}
+
+/// A shared pair of token-bucket limiters (upload + download), built once per `Daemon` and
+/// cloned (`Arc`) into the sync loop so the cap is **global per direction**. Either side
+/// `None` = unlimited for that direction. Cheap to clone.
+#[derive(Clone, Default)]
+pub(crate) struct TransferLimits {
+    pub up: Option<Arc<crate::RateLimiter>>,
+    pub down: Option<Arc<crate::RateLimiter>>,
+}
+
+impl TransferLimits {
+    /// Build from optional byte/sec caps. `None`/`Some(0)` on a side → unlimited there.
+    fn from_caps(up_bps: Option<u64>, down_bps: Option<u64>) -> Self {
+        let mk = |b: Option<u64>| b.filter(|&b| b > 0).map(|b| Arc::new(crate::RateLimiter::new(b)));
+        Self { up: mk(up_bps), down: mk(down_bps) }
+    }
+
+    /// Wrap a transport with these limiters (a no-op pass-through when both are unlimited).
+    pub(crate) fn wrap<I: ChunkIO>(&self, io: I) -> ThrottledChunkIO<I> {
+        ThrottledChunkIO::new(io, self.up.clone(), self.down.clone())
+    }
 }
 
 impl DaemonConfig {
@@ -73,7 +101,21 @@ impl DaemonConfig {
             token: token.into(),
             poll: DEFAULT_POLL,
             webdav_port: 9988,
+            up_bps: None,
+            down_bps: None,
         }
+    }
+
+    /// Set client-side bandwidth caps in bytes/sec (`None`/`0` = unlimited). Returns `self`
+    /// for chaining: `DaemonConfig::new(..).with_bandwidth(Some(1_000_000), None)`.
+    pub fn with_bandwidth(mut self, up_bps: Option<u64>, down_bps: Option<u64>) -> Self {
+        self.up_bps = up_bps;
+        self.down_bps = down_bps;
+        self
+    }
+
+    pub(crate) fn limits(&self) -> TransferLimits {
+        TransferLimits::from_caps(self.up_bps, self.down_bps)
     }
 }
 
@@ -113,13 +155,15 @@ impl Daemon {
         let invalidate = EngineInvalidate::new();
         let inval_dyn: Arc<dyn Invalidate> = Arc::new(invalidate.clone());
 
+        let limits = cfg.limits();
         let sync_handle = {
             let provider = provider.clone();
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
             let inval = inval_dyn.clone();
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), None))
+            let limits = limits.clone();
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), None, limits))
         };
         {
             let client = client.clone();
@@ -220,12 +264,13 @@ impl WebdavMount {
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
 
         // Same sync + nudge threads as the FUSE Daemon.
+        let limits = cfg.limits();
         let sync_handle = {
             let provider = provider.clone();
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None))
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits))
         };
         {
             let client = client.clone();
@@ -335,12 +380,13 @@ impl WinfspMount {
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
 
         // Same sync + nudge threads as the other backends.
+        let limits = cfg.limits();
         let sync_handle = {
             let provider = provider.clone();
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None))
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits))
         };
         {
             let client = client.clone();
@@ -469,6 +515,8 @@ pub struct CfApiMount {
     // Serializes the sync loop's push against the shutdown drain so they never push the same
     // outbox node concurrently (which would self-conflict on the second push's stale base version).
     push_gate: Arc<std::sync::Mutex<()>>,
+    // Bandwidth caps (shared with the sync loop) so the post-disconnect drain throttles too.
+    limits: TransferLimits,
 }
 
 #[cfg(target_os = "windows")]
@@ -526,6 +574,7 @@ impl CfApiMount {
         // Serialize the sync loop's push against the shutdown drain (see `push_gate` field).
         let push_gate = Arc::new(std::sync::Mutex::new(()));
 
+        let limits = cfg.limits();
         let sync_handle = {
             let provider = provider.clone();
             let client = client.clone();
@@ -533,7 +582,8 @@ impl CfApiMount {
             let poll = cfg.poll;
             let inval = inval.clone();
             let push_gate = push_gate.clone();
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), Some(push_gate)))
+            let limits = limits.clone();
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), Some(push_gate), limits))
         };
         {
             let client = client.clone();
@@ -574,6 +624,7 @@ impl CfApiMount {
             provider,
             client,
             push_gate,
+            limits,
         })
     }
 
@@ -661,7 +712,7 @@ impl CfApiMount {
     /// outbox to stay empty for a few consecutive polls before declaring done (CfAPI can deliver
     /// a callback a moment after `CfDisconnectSyncRoot` returns), bounded by a deadline.
     fn shutdown_drain(&self) {
-        let io = PresignedIO::new(&self.client);
+        let io = self.limits.wrap(PresignedIO::new(&self.client));
         let start = std::time::Instant::now();
         // CfAPI flushes its batched NOTIFY callbacks (delete/rename/edit) at disconnect, so the
         // outbox can keep growing for a moment AFTER the drain starts, and a slow multi-chunk edit
@@ -748,13 +799,15 @@ fn sync_loop(
     poll: Duration,
     inval: Option<Arc<dyn crate::Invalidate>>,
     push_gate: Option<Arc<std::sync::Mutex<()>>>,
+    limits: TransferLimits,
 ) {
     let mut cursor = provider.cursor().unwrap_or(0);
     println!("sync loop started (cursor {cursor}, poll {poll:?})");
     let mut tick: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         tick += 1;
-        let io = PresignedIO::new(&client);
+        // Wrap the production transport in the bandwidth throttle (a no-op when unlimited).
+        let io = limits.wrap(PresignedIO::new(&client));
         // Hold the push gate across the tick (CfAPI only) so the shutdown drain can't push the
         // SAME outbox node concurrently — a concurrent double-push sends the same base_version_id
         // twice and the server records a spurious self-conflict on the second.
@@ -787,7 +840,7 @@ fn sync_loop(
     // (The CfAPI backend does NOT rely on this — its NOTIFY callbacks flush only at disconnect,
     // *after* the sync thread is joined, so `CfApiMount::stop` runs its own post-disconnect drain.
     // For FUSE/WebDAV/WinFsp the local change is already in the outbox here, so one pass suffices.)
-    let io = PresignedIO::new(&client);
+    let io = limits.wrap(PresignedIO::new(&client));
     if let Err(e) = SyncEngine::push_outbox(&provider, &client, &io) {
         eprintln!("sync: final outbox drain failed: {e}");
     }
