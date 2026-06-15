@@ -4,9 +4,9 @@
 # library by the `seed` job), writes a KNOWN tagged file with deterministic content THROUGH the
 # mount, waits until the sync daemon has pushed it to the SHARED server, then unmounts.
 #
-# This is the single-mount, single-op counterpart of two-device-cfapi.ps1 — same mount/daemon
+# This is the single-mount, single-op counterpart of two-device-cfapi.ps1 - same mount/daemon
 # patterns and the same BLOCKED self-detection (CfAPI enumerates empty / errors 0x8007017C under a
-# Session-0 service account; that's an environment wall, not a failure → exit 0 with a BLOCKED
+# Session-0 service account; that's an environment wall, not a failure -> exit 0 with a BLOCKED
 # notice so the continue-on-error job never false-reds).
 #
 # Inputs (env, set by the workflow from the seed outputs):
@@ -78,7 +78,7 @@ foreach ($lg in @($log, "$log.err")) {
   if ((Test-Path $lg) -and (Select-String -Path $lg -Pattern '0x8007017C|cloud operation is invalid' -Quiet)) { $cloudInvalid = $true }
 }
 if ($cloudInvalid -or $proc.HasExited) {
-  Write-Host "BLOCKED: CfAPI not usable (Session 0 / 0x8007017C, or daemon exited) — the Windows runner is NOT in an interactive desktop session." -ForegroundColor Yellow
+  Write-Host "BLOCKED: CfAPI not usable (Session 0 / 0x8007017C, or daemon exited) - the Windows runner is NOT in an interactive desktop session." -ForegroundColor Yellow
   Write-Host "         Run the runner in an interactive login session (ci/runners/README.md) to exercise this leg."
   if (Test-Path $log) { Get-Content $log | Out-Host }
   if ((Test-Path "$log.err") -and (Get-Item "$log.err").Length -gt 0) { Get-Content "$log.err" | Out-Host }

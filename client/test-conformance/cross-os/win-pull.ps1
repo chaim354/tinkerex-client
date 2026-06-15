@@ -5,7 +5,7 @@
 # passed via env), asserts, then unmounts. Sync is async (nudge + poll) and CfAPI hydrates lazily
 # on open, so we poll with a timeout.
 #
-# Same mount/daemon + BLOCKED self-detection as win-push.ps1 (Session-0 / 0x8007017C → exit 0
+# Same mount/daemon + BLOCKED self-detection as win-push.ps1 (Session-0 / 0x8007017C -> exit 0
 # BLOCKED, never a false red).
 #
 # Inputs (env, set by the workflow):
@@ -71,7 +71,7 @@ foreach ($lg in @($log, "$log.err")) {
   if ((Test-Path $lg) -and (Select-String -Path $lg -Pattern '0x8007017C|cloud operation is invalid' -Quiet)) { $cloudInvalid = $true }
 }
 if ($cloudInvalid -or $proc.HasExited) {
-  Write-Host "BLOCKED: CfAPI not usable (Session 0 / 0x8007017C, or daemon exited) — run the Windows runner interactively." -ForegroundColor Yellow
+  Write-Host "BLOCKED: CfAPI not usable (Session 0 / 0x8007017C, or daemon exited) - run the Windows runner interactively." -ForegroundColor Yellow
   if (Test-Path $log) { Get-Content $log | Out-Host }
   if ((Test-Path "$log.err") -and (Get-Item "$log.err").Length -gt 0) { Get-Content "$log.err" | Out-Host }
   StopDaemon $proc $db
