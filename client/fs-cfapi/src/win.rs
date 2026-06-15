@@ -94,6 +94,13 @@ struct CfState {
     /// checks this between slices and stops early; `cancel_fetch_data_callback` inserts the key.
     /// A `HashSet<i64>` of `CF_CALLBACK_INFO::TransferKey`s.
     cancelled_transfers: Mutex<std::collections::HashSet<i64>>,
+    /// Echo guard for placeholder deletes/renames the **daemon itself** performs while applying a
+    /// remote delete/move (`CfApiInvalidate::removed`/`moved`). Those FS ops fire `NOTIFY_DELETE` /
+    /// `NOTIFY_RENAME`, which would otherwise mirror the change back into the `Provider` (re-enqueue
+    /// the outbox) → a push loop / self-conflict. The invalidator `mark`s the path before the op;
+    /// the NOTIFY callback `take`s it and suppresses its own re-capture exactly once. Shared (`Arc`)
+    /// with the `CfApiInvalidate` so one guard covers both sides.
+    self_removes: Arc<crate::SelfOps>,
 }
 
 /// A live CfAPI sync root: registered, connected, populated. Drop disconnects + unregisters.
@@ -190,19 +197,29 @@ pub fn mount_with_shutdown(
     hydrate: Option<Hydrate>,
     shutting_down: Arc<AtomicBool>,
 ) -> std::io::Result<CfApiMountHandle> {
-    mount_full(provider, root, hydrate, shutting_down, Arc::new(crate::PathIndex::new()))
+    mount_full(
+        provider,
+        root,
+        hydrate,
+        shutting_down,
+        Arc::new(crate::PathIndex::new()),
+        Arc::new(crate::SelfOps::new()),
+    )
 }
 
-/// [`mount_with_shutdown`] plus a caller-supplied [`PathIndex`] (B6.4). Pass the SAME `Arc` to the
-/// engine's `CfApiInvalidate` so the index populated by `FETCH_PLACEHOLDERS` here is the one the
-/// invalidator reads for O(1) path resolution. The engine wires this; the simpler entry points make
-/// their own index (harmless — the invalidator they don't have wouldn't share it anyway).
+/// [`mount_with_shutdown`] plus a caller-supplied [`PathIndex`] (B6.4) + [`SelfOps`](crate::SelfOps)
+/// echo guard. Pass the SAME `Arc`s to the engine's `CfApiInvalidate` so the index populated by
+/// `FETCH_PLACEHOLDERS` here is the one the invalidator reads for O(1) path resolution, and the
+/// echo guard the invalidator `mark`s on a daemon-initiated delete/move is the one this mount's
+/// NOTIFY callbacks check. The engine wires this; the simpler entry points make their own
+/// (harmless — the invalidator they don't have wouldn't share it anyway).
 pub fn mount_full(
     provider: Arc<SqliteProvider>,
     root: &Path,
     hydrate: Option<Hydrate>,
     shutting_down: Arc<AtomicBool>,
     path_index: Arc<crate::PathIndex>,
+    self_removes: Arc<crate::SelfOps>,
 ) -> std::io::Result<CfApiMountHandle> {
     std::fs::create_dir_all(root)?;
     register_sync_root(root)?;
@@ -216,6 +233,7 @@ pub fn mount_full(
         shutting_down: shutting_down.clone(),
         path_index,
         cancelled_transfers: Mutex::new(std::collections::HashSet::new()),
+        self_removes,
     }));
 
     // The callback table must outlive the connection, so leak it (one small leak per mount).
@@ -1165,7 +1183,15 @@ unsafe extern "system" fn notify_delete_callback(
     }
     let state = &*state;
 
-    if let Some(node_id) = callback_node_id(info) {
+    // Echo guard: if the daemon itself is deleting this placeholder (applying a remote delete/move
+    // via `CfApiInvalidate::removed`/`moved`), this NOTIFY_DELETE is our own echo. Mirroring it would
+    // re-enqueue a spurious `delete` to the outbox (or, mid-move, delete the relocated node). Consume
+    // the mark and skip the mirror — but still ACK below so the OS delete proceeds.
+    let path = format!("{}{}", pcwstr_string(info.VolumeDosName), pcwstr_string(info.NormalizedPath));
+    let is_echo = state.self_removes.take(&path);
+    if is_echo {
+        eprintln!("cfapi: delete at {path} — echo of our own remove, not mirrored");
+    } else if let Some(node_id) = callback_node_id(info) {
         eprintln!("cfapi: delete captured node={node_id}");
         // B6.4: drop the node's stale ino→path index entry (resolve the ino BEFORE the delete
         // removes the row). Best-effort — a miss just leaves the entry to be overwritten later.
@@ -1222,6 +1248,12 @@ unsafe extern "system" fn notify_rename_callback(
     }
     let state = &*state;
 
+    // Echo guard: a daemon-applied move is done as remove-old + create-new (not a `MoveFileEx`), so
+    // it should NOT surface here — but if a future path or the OS coalesces it into a rename, the
+    // SOURCE path carries our mark. Consume it and skip the mirror (still ACK below).
+    let src_path = format!("{}{}", pcwstr_string(info.VolumeDosName), pcwstr_string(info.NormalizedPath));
+    let is_echo = state.self_removes.take(&src_path);
+    if !is_echo {
     if let Some(node_id) = callback_node_id(info) {
         // The target path is volume-relative (e.g. `\Users\…\new`); prefix the volume DOS name
         // (e.g. `C:`) to form the full on-disk path, mirroring the close callback.
@@ -1255,6 +1287,9 @@ unsafe extern "system" fn notify_rename_callback(
                 _ => eprintln!("cfapi: rename target outside root for node={node_id} — not mirrored"),
             }
         }
+    }
+    } else {
+        eprintln!("cfapi: rename of {src_path} — echo of our own move, not mirrored");
     }
 
     // During teardown, skip the ACK `CfExecute` (re-entering the closing connection can
@@ -1420,6 +1455,10 @@ pub struct CfApiInvalidate {
     /// closing deadlocks the runtime, and the sync thread runs the pull (hence these) right up to
     /// shutdown, so without this guard a pull-triggered invalidate could wedge the join.
     shutdown: Arc<AtomicBool>,
+    /// Echo guard shared with the mount's `CfState`. `removed`/`moved` `mark` the path(s) they're
+    /// about to mutate so the resulting `NOTIFY_DELETE`/`NOTIFY_RENAME` callback suppresses its own
+    /// re-capture (no push loop / self-conflict).
+    self_removes: Arc<crate::SelfOps>,
 }
 
 impl CfApiInvalidate {
@@ -1428,19 +1467,28 @@ impl CfApiInvalidate {
     /// with no mount can pass a fresh `Arc::new(AtomicBool::new(false))`. Makes its own
     /// [`PathIndex`](crate::PathIndex); use [`with_index`](Self::with_index) to share the mount's.
     pub fn new(provider: Arc<SqliteProvider>, root: PathBuf, shutdown: Arc<AtomicBool>) -> Self {
-        Self::with_index(provider, root, shutdown, Arc::new(crate::PathIndex::new()))
+        Self::with_index(
+            provider,
+            root,
+            shutdown,
+            Arc::new(crate::PathIndex::new()),
+            Arc::new(crate::SelfOps::new()),
+        )
     }
 
-    /// Like [`new`](Self::new) but shares the SAME `path_index` the mount's `CfState` populates from
-    /// `FETCH_PLACEHOLDERS` — so the invalidator gets O(1) path resolution for any node Explorer has
-    /// enumerated. The engine wires this; pass the index it also handed to [`mount_full`].
+    /// Like [`new`](Self::new) but shares the SAME `path_index` + `self_removes` echo guard the
+    /// mount's `CfState` uses — so the invalidator gets O(1) path resolution for any node Explorer
+    /// has enumerated, and a daemon-initiated delete/move it performs is suppressed by the mount's
+    /// NOTIFY callbacks (no echo push loop). The engine wires this; pass the same `Arc`s it handed
+    /// to [`mount_full`].
     pub fn with_index(
         provider: Arc<SqliteProvider>,
         root: PathBuf,
         shutdown: Arc<AtomicBool>,
         path_index: Arc<crate::PathIndex>,
+        self_removes: Arc<crate::SelfOps>,
     ) -> Self {
-        Self { provider, root, path_index, shutdown }
+        Self { provider, root, path_index, shutdown, self_removes }
     }
 
     /// Resolve an ino to its absolute path under the sync root. **O(1)** on an index hit (the
@@ -1630,6 +1678,89 @@ impl CfApiInvalidate {
         self.create_one_placeholder(ino, &name, &parent_path);
         // Record the leaf too, so a subsequent child (e.g. of a dir we just made) resolves O(1).
         self.path_index.insert(ino, parent_path.join(&name));
+    }
+
+    /// A **pull removed a node** (a remote `delete`, or a recursive subtree sweep). Remove the
+    /// now-orphaned on-disk placeholder so Explorer stops showing it. The provider row is already
+    /// gone (the engine deletes it before calling this), so we resolve the path from the
+    /// `path_index` — which still holds the pre-delete path (it's only refreshed by enumeration /
+    /// `created`). A subtree delete removes the whole on-disk subtree via `remove_dir_all`.
+    ///
+    /// **Echo guard:** removing the placeholder fires `NOTIFY_DELETE` (its identity = the node_id),
+    /// which would otherwise re-`delete_by_node_id` (a no-op now — the row is gone — but it
+    /// re-enqueues the outbox → a spurious `delete` push). We `mark` the path in `self_removes`
+    /// first; the callback `take`s it and suppresses itself.
+    pub fn removed(&self, ino: u64) {
+        // During teardown skip the FS op — the connection is going away and the on-disk file is
+        // kept for offline use anyway; a remove racing disconnect can spuriously fire NOTIFY.
+        if self.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let path = match self.path_index.get(ino) {
+            Some(p) => p,
+            None => {
+                // Never enumerated → no on-disk placeholder to remove (Explorer never created one).
+                eprintln!("cfapi: removed ino={ino} — no cached path (not enumerated), nothing on disk");
+                return;
+            }
+        };
+        // Guard the echo BEFORE touching the filesystem (the NOTIFY can fire synchronously).
+        self.self_removes.mark(&path.to_string_lossy());
+        let removed = match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            // Already gone (a parent dir's `remove_dir_all` swept it, or the user deleted it) — fine.
+            Err(_) => Ok(()),
+        };
+        match removed {
+            Ok(()) => eprintln!("cfapi: removed placeholder ino={ino} at {}", path.display()),
+            Err(e) => eprintln!("cfapi: removed ino={ino} remove {} failed: {e}", path.display()),
+        }
+        // Drop the stale index entry regardless (the path no longer maps to this ino).
+        self.path_index.invalidate(ino);
+    }
+
+    /// A **pull moved/renamed an existing node** (same node_id, new `(parent, name)`). The OLD-path
+    /// placeholder is stale and the NEW one doesn't exist yet. Resolve the OLD path from the
+    /// `path_index` (still holding the pre-move path — the tree row already has the new location),
+    /// create the NEW-path placeholder ([`created`](Self::created), which resolves the new path from
+    /// the tree and refreshes the index), then remove the OLD-path placeholder.
+    ///
+    /// **Echo guard:** both the NEW-path create (`NOTIFY` is not fired for our `CfCreatePlaceholders`)
+    /// and the OLD-path remove are daemon-initiated. The remove fires `NOTIFY_DELETE` whose identity
+    /// is THIS node_id — which, if mirrored, would `delete_by_node_id` the node we just relocated
+    /// (deleting it from the tree at its NEW path!). So we `mark` the OLD path in `self_removes`
+    /// before removing; the `NOTIFY_DELETE` callback `take`s it and suppresses itself.
+    pub fn moved(&self, ino: u64) {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        // Capture the OLD path BEFORE `created` refreshes the index to the new path.
+        let old_path = self.path_index.get(ino);
+        // Create the placeholder at the new location (resolves the new path from the tree, and
+        // updates the index entry for `ino` to the new path).
+        self.created(ino);
+        // Remove the stale OLD-path placeholder, if it was ever materialized on disk.
+        if let Some(old) = old_path {
+            // If the node didn't actually move on disk (index already matched the new path — e.g. a
+            // metadata-only "move" to the same place), `created` reinserted the same path; skip a
+            // self-destructive remove of the path we just (re)created.
+            if self.path_index.get(ino).as_deref() == Some(old.as_path()) {
+                return;
+            }
+            self.self_removes.mark(&old.to_string_lossy());
+            let removed = match std::fs::metadata(&old) {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&old),
+                Ok(_) => std::fs::remove_file(&old),
+                Err(_) => Ok(()), // already gone — fine
+            };
+            match removed {
+                Ok(()) => eprintln!("cfapi: moved ino={ino} — removed old placeholder at {}", old.display()),
+                Err(e) => eprintln!("cfapi: moved ino={ino} remove old {} failed: {e}", old.display()),
+            }
+        } else {
+            eprintln!("cfapi: moved ino={ino} — no cached old path (not enumerated); new placeholder created");
+        }
     }
 
     /// Create a single placeholder for `ino` (named `name`, dir or file per its attrs) inside the
