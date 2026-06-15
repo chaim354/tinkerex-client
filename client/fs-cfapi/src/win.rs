@@ -870,7 +870,11 @@ unsafe extern "system" fn fetch_placeholders_callback(
                 Flags: CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
                 CompletionStatus: STATUS_SUCCESS,
                 PlaceholderTotalCount: infos.len() as i64,
-                PlaceholderArray: infos.as_mut_ptr(),
+                // An EMPTY directory must transfer a NULL array, not the dangling pointer
+                // `Vec::as_mut_ptr()` returns for a zero-length Vec — CfExecute rejects the
+                // latter with 0x8007017C ("the cloud operation is invalid"), which broke
+                // enumeration of any empty folder / a fresh (empty) library.
+                PlaceholderArray: if infos.is_empty() { std::ptr::null_mut() } else { infos.as_mut_ptr() },
                 PlaceholderCount: infos.len() as u32,
                 EntriesProcessed: 0,
             },
