@@ -43,7 +43,6 @@ FAILURES=0
 
 pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILURES=$((FAILURES+1)); }
-check() { if [ "$1" = "0" ] || [ "$1" = "true" ]; then pass "$2"; else fail "$2"; fi }
 
 cleanup() {
   for m in "$MNT_A" "$MNT_B"; do fusermount -u "$m" 2>/dev/null || umount "$m" 2>/dev/null || true; done

@@ -99,6 +99,17 @@ function Sha256OfBytes([byte[]]$bytes) {
   $sha = [System.Security.Cryptography.SHA256]::Create()
   ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
 }
+# Write bytes THROUGH a mount; if CfAPI rejects it with the Session-0 "cloud operation is invalid"
+# error, raise a sentinel the top-level catch turns into a clean BLOCKED (not a raw stack trace).
+function WriteThroughMount([string]$path, [byte[]]$bytes) {
+  try { [System.IO.File]::WriteAllBytes($path, $bytes) }
+  catch {
+    if ("$($_.Exception.Message)" -match 'cloud operation is invalid|0x8007017C') {
+      throw "CFAPI_SESSION0_BLOCKED"
+    }
+    throw
+  }
+}
 # Poll for a file to appear THROUGH a mount and read byte-for-byte (CfAPI hydrates on open). The
 # sync is nudge-driven (~tens of ms) but CfAPI enumeration + hydration is lazy, so we poll.
 function WaitForBytes([string]$path, [string]$wantSha, [int]$timeoutSec = 90) {
@@ -127,6 +138,26 @@ $procA = MountDevice $rootA $dbA $chunksA $tokA $logA
 $procB = MountDevice $rootB $dbB $chunksB $tokB $logB
 Start-Sleep -Seconds 8   # register + pull the (empty) snapshot on both
 
+# Preflight: CfAPI's Cloud Filter platform only operates in an INTERACTIVE desktop session. When
+# the self-hosted runner runs as a service (Session 0 / NETWORK SERVICE), FETCH_PLACEHOLDERS
+# returns 0 entries and TRANSFER_PLACEHOLDERS / a write fails with 0x8007017C "The cloud operation
+# is invalid". That's an environment wall, not a product/test failure — detect it and exit 0 with a
+# BLOCKED notice (so the continue-on-error job reads clearly), exactly like the FUSE script's
+# /dev/fuse check. To make this PASS, run the Windows runner in an interactive login session
+# (ci/runners/README).
+function StopBoth { StopDevice $procA $dbA $logA; StopDevice $procB $dbB $logB }
+$cloudInvalid = $false
+foreach ($lg in @($logA, "$logA.err", $logB, "$logB.err")) {
+  if ((Test-Path $lg) -and (Select-String -Path $lg -Pattern '0x8007017C|cloud operation is invalid' -Quiet)) { $cloudInvalid = $true }
+}
+if ($cloudInvalid) {
+  Write-Host "BLOCKED: CfAPI reports 0x8007017C (the cloud operation is invalid) — the Windows runner is NOT in an interactive desktop session (Session 0)." -ForegroundColor Yellow
+  Write-Host "         Cloud Filter can't enumerate/transfer under the service account. Run the runner in an interactive login session to exercise this leg."
+  Write-Host "         (The engine-level two_device_e2e.rs proves convergence headlessly; this script needs the real interactive mount.)"
+  StopBoth
+  exit 0
+}
+
 try {
   Check "A mount is running"  (-not $procA.HasExited)
   Check "B mount is running"  (-not $procB.HasExited)
@@ -134,7 +165,7 @@ try {
   # --- 3. A writes THROUGH its mount -> B reads it THROUGH its mount, byte-for-byte ----------
   Write-Host "==> [A->B] write a file through A's mount; read it through B's mount"
   $v1 = [System.Text.Encoding]::UTF8.GetBytes(("// v1 lamp model`n" * 50))
-  [System.IO.File]::WriteAllBytes((Join-Path $rootA "lamp.scad"), $v1)
+  WriteThroughMount (Join-Path $rootA "lamp.scad") $v1
   $v1sha = Sha256OfBytes $v1
   Check "A->B: lamp.scad appears + reads byte-for-byte through B's mount" `
         (WaitForBytes (Join-Path $rootB "lamp.scad") $v1sha)
@@ -142,7 +173,7 @@ try {
   # --- 4. B edits THROUGH its mount -> A sees the new bytes THROUGH its mount ----------------
   Write-Host "==> [B->A] edit the file through B's mount; A's mount sees the new bytes"
   $v2 = [System.Text.Encoding]::UTF8.GetBytes(("// v2 lamp widened base`n" * 80))
-  [System.IO.File]::WriteAllBytes((Join-Path $rootB "lamp.scad"), $v2)
+  WriteThroughMount (Join-Path $rootB "lamp.scad") $v2
   $v2sha = Sha256OfBytes $v2
   Check "B->A: A's mount sees B's edited bytes byte-for-byte" `
         (WaitForBytes (Join-Path $rootA "lamp.scad") $v2sha)
@@ -151,7 +182,7 @@ try {
   Write-Host "==> [A->B] new file in a nested dir through A's mount"
   New-Item -ItemType Directory -Path (Join-Path $rootA "Docs\2026") -Force -EA SilentlyContinue | Out-Null
   $nested = [System.Text.Encoding]::UTF8.GetBytes("Q3 plan: ship sync`n")
-  [System.IO.File]::WriteAllBytes((Join-Path $rootA "Docs\2026\plan.txt"), $nested)
+  WriteThroughMount (Join-Path $rootA "Docs\2026\plan.txt") $nested
   Check "A->B: nested Docs/2026/plan.txt appears + reads through B's mount" `
         (WaitForBytes (Join-Path $rootB "Docs\2026\plan.txt") (Sha256OfBytes $nested))
 
@@ -159,14 +190,14 @@ try {
   Write-Host "==> [A->B] multi-chunk (1 MiB) file through A's mount"
   $big = New-Object byte[] 1048576
   for ($k = 0; $k -lt $big.Length; $k++) { $big[$k] = [byte](($k * 167 + 13) % 256) }
-  [System.IO.File]::WriteAllBytes((Join-Path $rootA "model.stl"), $big)
+  WriteThroughMount (Join-Path $rootA "model.stl") $big
   Check "A->B: 1 MiB multi-chunk model.stl reads byte-for-byte through B's mount" `
         (WaitForBytes (Join-Path $rootB "model.stl") (Sha256OfBytes $big) 150)
 
   # --- 5c. Delete (A -> B) ------------------------------------------------------------------
   Write-Host "==> [A->B] delete a file through A's mount"
   $scratch = [System.Text.Encoding]::UTF8.GetBytes("temporary")
-  [System.IO.File]::WriteAllBytes((Join-Path $rootA "scratch.txt"), $scratch)
+  WriteThroughMount (Join-Path $rootA "scratch.txt") $scratch
   Check "A->B: scratch.txt first appears through B's mount" `
         (WaitForBytes (Join-Path $rootB "scratch.txt") (Sha256OfBytes $scratch))
   Remove-Item -Path (Join-Path $rootA "scratch.txt") -Force -EA SilentlyContinue
@@ -176,7 +207,7 @@ try {
   # --- 5d. Rename (B -> A) ------------------------------------------------------------------
   Write-Host "==> [B->A] rename a file through B's mount"
   $draft = [System.Text.Encoding]::UTF8.GetBytes("keep me")
-  [System.IO.File]::WriteAllBytes((Join-Path $rootB "draft.txt"), $draft)
+  WriteThroughMount (Join-Path $rootB "draft.txt") $draft
   Check "B->A: draft.txt first appears through A's mount" `
         (WaitForBytes (Join-Path $rootA "draft.txt") (Sha256OfBytes $draft))
   Rename-Item -Path (Join-Path $rootB "draft.txt") -NewName "final.txt" -EA SilentlyContinue
@@ -184,6 +215,15 @@ try {
         (WaitForBytes (Join-Path $rootA "final.txt") (Sha256OfBytes $draft))
   Check "B->A: old name draft.txt gone from A's mount" `
         (WaitForAbsent (Join-Path $rootA "draft.txt"))
+}
+catch {
+  if ("$($_.Exception.Message)" -eq "CFAPI_SESSION0_BLOCKED") {
+    Write-Host "BLOCKED: a write through the mount failed with 0x8007017C — the Windows runner is NOT in an interactive desktop session (Session 0)." -ForegroundColor Yellow
+    Write-Host "         Cloud Filter can't transfer under the service account. Run the runner interactively to exercise this leg."
+    StopBoth
+    exit 0
+  }
+  throw
 }
 finally {
   # --- 6. Graceful stop of BOTH daemons (sentinel) so final pushes complete -----------------
