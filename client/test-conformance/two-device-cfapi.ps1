@@ -1,8 +1,8 @@
 # Two-device, REAL-MOUNT, end-to-end test on Windows (CfAPI).
 #
-# This is the layer ABOVE the engine-level `two_device_e2e.rs`: it drives the actual app stack —
+# This is the layer ABOVE the engine-level `two_device_e2e.rs`: it drives the actual app stack -
 # the real `sync_engine::CfApiMount` (the daemon the Tauri app's `sync_start` command launches) with
-# an ACTUAL Cloud Filter kernel mount — for TWO devices paired into ONE library, and passes files
+# an ACTUAL Cloud Filter kernel mount - for TWO devices paired into ONE library, and passes files
 # THROUGH the mounts (filesystem writes/reads in the sync-root folders), not via Provider calls.
 #
 # Flow (the headline workflow, app-command-level):
@@ -11,7 +11,7 @@
 #   2. Mount BOTH sync roots live at once (two `maker-cfsyncd` = the app's CfApiMount).
 #   3. Write a file THROUGH device A's mount  -> assert it appears + reads byte-for-byte THROUGH B's mount.
 #   4. Edit a file THROUGH device B's mount   -> assert device A's mount sees the new bytes.
-#   5. Plus: new file, nested dir, delete, rename, and a multi-chunk (>chunk-size) file — each
+#   5. Plus: new file, nested dir, delete, rename, and a multi-chunk (>chunk-size) file - each
 #      written through one mount and verified through the other.
 #
 # Requires an INTERACTIVE Windows login session: CfAPI/Cloud Files enumerates empty under the
@@ -141,7 +141,7 @@ Start-Sleep -Seconds 8   # register + pull the (empty) snapshot on both
 # Preflight: CfAPI's Cloud Filter platform only operates in an INTERACTIVE desktop session. When
 # the self-hosted runner runs as a service (Session 0 / NETWORK SERVICE), FETCH_PLACEHOLDERS
 # returns 0 entries and TRANSFER_PLACEHOLDERS / a write fails with 0x8007017C "The cloud operation
-# is invalid". That's an environment wall, not a product/test failure — detect it and exit 0 with a
+# is invalid". That's an environment wall, not a product/test failure - detect it and exit 0 with a
 # BLOCKED notice (so the continue-on-error job reads clearly), exactly like the FUSE script's
 # /dev/fuse check. To make this PASS, run the Windows runner in an interactive login session
 # (ci/runners/README).
@@ -151,7 +151,7 @@ foreach ($lg in @($logA, "$logA.err", $logB, "$logB.err")) {
   if ((Test-Path $lg) -and (Select-String -Path $lg -Pattern '0x8007017C|cloud operation is invalid' -Quiet)) { $cloudInvalid = $true }
 }
 if ($cloudInvalid) {
-  Write-Host "BLOCKED: CfAPI reports 0x8007017C (the cloud operation is invalid) — the Windows runner is NOT in an interactive desktop session (Session 0)." -ForegroundColor Yellow
+  Write-Host "BLOCKED: CfAPI reports 0x8007017C (the cloud operation is invalid) - the Windows runner is NOT in an interactive desktop session (Session 0)." -ForegroundColor Yellow
   Write-Host "         Cloud Filter can't enumerate/transfer under the service account. Run the runner in an interactive login session to exercise this leg."
   Write-Host "         (The engine-level two_device_e2e.rs proves convergence headlessly; this script needs the real interactive mount.)"
   StopBoth
@@ -218,7 +218,7 @@ try {
 }
 catch {
   if ("$($_.Exception.Message)" -eq "CFAPI_SESSION0_BLOCKED") {
-    Write-Host "BLOCKED: a write through the mount failed with 0x8007017C — the Windows runner is NOT in an interactive desktop session (Session 0)." -ForegroundColor Yellow
+    Write-Host "BLOCKED: a write through the mount failed with 0x8007017C - the Windows runner is NOT in an interactive desktop session (Session 0)." -ForegroundColor Yellow
     Write-Host "         Cloud Filter can't transfer under the service account. Run the runner interactively to exercise this leg."
     StopBoth
     exit 0

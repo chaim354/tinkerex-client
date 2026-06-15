@@ -13,12 +13,11 @@ in one process. The mount backend is chosen per platform:
   `winfsp-x64.dll`). The mount point is a **folder** (e.g. `%USERPROFILE%\MakerCF`), not a drive
   letter. The legacy WinFsp (drive-letter) backend is still available with
   `--features winfsp-backend`. (Live smoke + byte-for-byte conformance green — Phase 2b B5.)
-  NOTE: the rest of this doc predates this flip and still describes Windows as unwired — it needs
-  a fuller refresh.
+  See the **Windows** section below for build/run + the two-device real-mount test.
 
 The backend lives in `src-tauri/src/lib.rs` (commands `sync_start`/`sync_stop`/
 `sync_status`) via a per-OS `Mount` alias — `sync_engine::WebdavMount` on macOS,
-`sync_engine::Daemon` (FUSE) on Linux.
+`sync_engine::Daemon` (FUSE) on Linux, `sync_engine::CfApiMount` on Windows.
 
 > **macOS build note:** at runtime macOS needs nothing FUSE-related (WebDAV is native).
 > But `cargo tauri dev` currently still *compiles* the FUSE `fuser` crate (used on Linux,
@@ -151,20 +150,30 @@ binary — see CLAUDE.md §13.)
 
 ## Windows
 
-The mount path is **not available yet**. `fs-fuse` is built on `fuser`
-(Linux/macOS only); the Windows mount adapter (`winfsp-rs`, CLAUDE.md §12 step 4)
-isn't written. The app is gated so it still **builds and launches** on Windows —
-`cargo tauri dev` works — but **Mount & sync** returns:
+**The mount path IS wired** (this section supersedes the older "not available yet" note). The
+default Windows backend is **CfAPI** (driverless Cloud Filter — no WinFsp/GPL driver; the mount
+point is a **folder**, e.g. `%USERPROFILE%\MakerCF`, not a drive letter). The app's
+`sync_start`/`sync_stop`/`sync_status` commands drive `sync_engine::CfApiMount` exactly as they
+drive `Daemon`/`WebdavMount` on Linux/macOS. The legacy WinFsp (drive-letter) backend is still
+available with `--features winfsp-backend`.
 
-> Mounting isn't supported on Windows yet — it needs the winfsp-rs adapter.
+> **CfAPI needs an INTERACTIVE desktop session.** Cloud Filter refuses operations under a Session-0
+> service account (FETCH_PLACEHOLDERS enumerates empty; writes fail with `0x8007017C` "the cloud
+> operation is invalid"). Run the app / daemon from a normal interactive login — not from a service
+> or a detached/headless context.
 
-You can still exercise the **sync engine** itself on Windows (push/pull/hydrate,
-no mount) via the cross-platform example flows against the server:
+Build deps: LLVM/libclang (for `winfsp-sys` bindgen, pulled transitively) + WinFsp. Build & run:
 ```powershell
-cd client\sync-engine
-$env:SERVER_URL = "http://localhost:3001"
-cargo run --example daemon_loop          # outbox → push → pull → hydrate
-cargo run --example presigned_roundtrip  # real bytes through S3-compatible storage
+cd client\maker-app
+cargo tauri dev
 ```
-When the winfsp-rs adapter lands, the same `Daemon` + Tauri commands light up on
-Windows with no frontend changes.
+
+CLI daemon (no GUI), and the two-device real-mount test:
+```powershell
+# one CfAPI daemon (a sync root folder):
+cargo build --manifest-path ..\sync-engine\Cargo.toml --bin maker-cfsyncd
+..\sync-engine\target\debug\maker-cfsyncd.exe %USERPROFILE%\MakerCF tree.db chunks http://localhost:3001 <device_token>
+
+# TWO real CfAPI sync roots, A<->B byte-for-byte through the mounts (needs the deployed S3 server):
+..\..\client\test-conformance\two-device-cfapi.ps1 -Server http://192.168.1.95
+```
