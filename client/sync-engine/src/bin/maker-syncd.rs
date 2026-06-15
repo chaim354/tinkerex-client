@@ -75,7 +75,8 @@ fn main() {
 
     println!("mounted at {mp} (Ctrl-C to unmount)");
     if let Err(e) = daemon.run_until_unmounted() {
-        // fuser 0.17's `umount_and_join` reports a teardown/worker error instead of panicking.
+        // `run_until_unmounted` waits (join) for an external umount/Ctrl-C, then reports any
+        // worker error instead of panicking.
         eprintln!("FUSE session ended with an error: {e}");
         std::process::exit(1);
     }
