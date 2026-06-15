@@ -14,6 +14,9 @@ convergence stays the job of the model-based harness in `fs-provider/tests/conve
 | `pjdfstest-fuse.sh` | **pjdfstest** | `fs-fuse` (Linux path) | ℹ️ informational | POSIX semantics for the ops we implement (rename/unlink/mkdir/rmdir/truncate/open). The suite's perms/owner/link tests are out of scope (we don't expose them), so this is a conformance *map*, not a gate. |
 | `cfapi-smoke.ps1` | self-authored | `fs-cfapi` (Windows path) | ℹ️ on-demand/nightly | Live CfAPI write-path proof: register → enumerate → hydrate → one each of new/edit/delete/rename, each asserted to round-trip to the deployed server via the `tree_names` oracle. Needs an interactive Windows session + the deployed server. |
 | `cfapi-conformance.ps1` | self-authored | `fs-cfapi` (Windows path) | ℹ️ on-demand/nightly | The rigorous CfAPI round-trip (the Windows analogue of `mount-conformance`): many files of varied sizes (incl. > chunk size → multi-chunk + dedup), nested dirs, and create/edit/delete/rename churn through the real Cloud Filter mount — asserted **byte-for-byte** by hydrating every file on a fresh device (`verify_tree`) and comparing SHA-256s. |
+| `two-device-cfapi.ps1` | self-authored | `fs-cfapi` × 2 (Windows) | ℹ️ on-demand/nightly | **Two real CfAPI mounts at once, app-to-app.** Pairs device A + device B into one library (the real `create_pairing`/`pair` flow), mounts BOTH sync roots live (two `maker-cfsyncd` = the app's `CfApiMount`), then passes a file **through A's mount** → reads it **byte-for-byte through B's mount**, edits **through B** → A sees it, plus new/nested/delete/rename/multi-chunk. The layer above `two_device_e2e.rs`. Interactive Windows session + deployed server required. |
+| `two-device-fuse.sh` | self-authored | `fs-fuse` × 2 (Linux) | ℹ️ on-demand/nightly (CI-attemptable) | The Linux analogue: two real FUSE mounts (two `maker-syncd` = the app's `Daemon`) paired into one library, A↔B byte-for-byte **through the mounts**. Self-contained (boots a memory Rails server). FUSE can mount in CI with `/dev/fuse`, so this real-mount leg is automated; it exits 0 with a `BLOCKED` notice if `/dev/fuse`/`allow_other` is unavailable. |
+| `two-device-webdav-macos.sh` | self-authored | `fs-webdav` × 2 (macOS) | 🖐️ manual (interactive) | The macOS analogue: two real native WebDAV mounts (two `maker-webdavd` = the app's `WebdavMount`) paired into one library, A↔B byte-for-byte **through the mounts**. **NOT CI-automated** — `mount_webdav` needs an interactive desktop session; a human runs it locally. |
 
 ## Running locally
 
@@ -28,8 +31,15 @@ client/test-conformance/pjdfstest-fuse.sh         # needs autotools + git + prov
 
 ```powershell
 # Windows only (self-hosted runner, interactive session) — needs the deployed server + chunk store:
-client/test-conformance/cfapi-smoke.ps1        [-Server http://192.168.1.95]
-client/test-conformance/cfapi-conformance.ps1  [-Server http://192.168.1.95] [-Files 24]
+client/test-conformance/cfapi-smoke.ps1         [-Server http://192.168.1.95]
+client/test-conformance/cfapi-conformance.ps1   [-Server http://192.168.1.95] [-Files 24]
+client/test-conformance/two-device-cfapi.ps1    [-Server http://192.168.1.95]   # TWO real mounts, A<->B
+```
+
+```sh
+# Two-device REAL-MOUNT end-to-end (a file through ONE mount, read through ANOTHER device's mount):
+client/test-conformance/two-device-fuse.sh             # Linux, two real FUSE mounts (self-contained)
+client/test-conformance/two-device-webdav-macos.sh     # macOS, two real WebDAV mounts (run AT the machine — interactive)
 ```
 
 ## CI
@@ -46,15 +56,28 @@ live regression net, not a build gate.
 
 ## Relationship to the two-device end-to-end suite
 
-These scripts cover the **kernel-mount leg** (syscalls → adapter → `Provider`) — the part that
-needs an interactive session and can't run headless. The complementary
-`client/sync-engine/tests/two_device_e2e.rs` covers **distributed multi-device convergence**
-(the headline A→B→edit→A roundtrip + delete/move/rename/dedup/restore/conflict) at the
-provider/engine level — the same `SyncEngine` loop + `ServerClient` API the Tauri app's `Daemon`
-runs, minus the kernel mount. That suite runs **headlessly on every OS** (per-PR on Linux in the
-`engine-integration` job; nightly on mac/Windows vs the deployed server in `e2e-{linux,macos,windows}`).
-Together: the e2e suite proves the sync plane converges on all three OSes; these scripts prove the
-mount surface translates syscalls correctly on each.
+There are **three** layers, increasing in fidelity:
+
+1. **Engine-level** — `client/sync-engine/tests/two_device_e2e.rs`: distributed multi-device
+   convergence (A→B→edit→A + delete/move/rename/dedup/restore/conflict) at the provider/engine
+   level — the same `SyncEngine` loop + `ServerClient` API the Tauri app's `Daemon` runs, **minus
+   the kernel mount**. Runs **headlessly on every OS** (per-PR on Linux in `engine-integration`;
+   nightly on mac/Windows vs the deployed server in `e2e-{linux,macos,windows}`).
+
+2. **Single-mount kernel leg** — `cfapi-{smoke,conformance}.ps1` / `webdav-rclone.sh` /
+   `fsx-fuse.sh` / `pjdfstest-fuse.sh`: the syscall→adapter→`Provider` translation on ONE real
+   mount, asserted via a control-plane oracle (a fresh headless device).
+
+3. **Two-mount, app-to-app kernel leg** — `two-device-{cfapi.ps1,fuse.sh,webdav-macos.sh}`: the
+   highest-fidelity test — TWO real kernel mounts live at once (the same `CfApiMount`/`Daemon`/
+   `WebdavMount` the Tauri app's `sync_start` launches), paired via the **real** pairing flow, with
+   a file passed **through one mount** and read **byte-for-byte through the other**. This is the
+   only leg that exercises syscall→adapter→`Provider`→sync→`Provider`→adapter→syscall end-to-end
+   between two devices. Interactive-session-bound on macOS (manual) and Windows (CfAPI); FUSE is
+   CI-automatable on Linux.
+
+Together: layer 1 proves the sync plane converges on all three OSes headlessly; layer 2 proves each
+mount translates syscalls correctly; layer 3 proves the full app-to-app path through two real mounts.
 
 ## Notes / caveats
 

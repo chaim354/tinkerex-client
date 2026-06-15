@@ -17,9 +17,10 @@
 #   4. Edit through B's mount   -> A's mount sees the new bytes.
 #   5. Plus new file, nested dir, delete, rename, and a multi-chunk (>chunk-size) file.
 #
-# It boots its own STORAGE_BACKEND=memory Rails server (chunk bytes served via presigned GET to
-# localhost — fine for two co-located mounts; each device has its own chunk cache so B genuinely
-# hydrates from the server).
+# It boots its own STORAGE_BACKEND=local Rails server — the filesystem-backed chunk store that
+# mints REAL presigned http PUT/GET URLs (the memory backend's `memory://` URLs aren't HTTP, so the
+# real data plane can't move bytes through it). Each device has its own chunk cache, so B genuinely
+# hydrates A's bytes from the server over the wire — a true data-plane round-trip, no SeaweedFS.
 #
 #   client/test-conformance/two-device-webdav-macos.sh
 #
@@ -56,13 +57,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- 1. Boot the memory Rails server --------------------------------------------------------
-echo "==> booting STORAGE_BACKEND=memory Rails on $SERVER"
+# --- 1. Boot the local-storage Rails server (real presigned data plane) ---------------------
+echo "==> booting STORAGE_BACKEND=local Rails on $SERVER"
 (lsof -ti tcp:$PORT | xargs kill -9 2>/dev/null) || true
 sleep 1
 bundle install --quiet 2>/dev/null || true
 bin/rails db:prepare 2>/dev/null || true
-STORAGE_BACKEND=memory bin/rails server -p "$PORT" >"$WORK/server.log" 2>&1 &
+STORAGE_BACKEND=local CHUNK_LOCAL_DIR="$WORK/chunk-store" bin/rails server -p "$PORT" >"$WORK/server.log" 2>&1 &
 SRV_PID=$!
 for _ in $(seq 1 60); do curl -sf "$SERVER/up" >/dev/null && break; sleep 1; done
 curl -sf "$SERVER/up" >/dev/null || { echo "FAIL: server didn't start"; cat "$WORK/server.log"; exit 1; }

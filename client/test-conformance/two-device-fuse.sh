@@ -15,11 +15,11 @@
 #   4. Edit a file THROUGH B's mount   -> assert A's mount sees the new bytes.
 #   5. Plus: new file, nested dir, delete, rename, and a multi-chunk (>chunk-size) file.
 #
-# Boots its own STORAGE_BACKEND=memory Rails server (control-plane only — the local chunk caches
-# carry the bytes between the two co-located mounts; both devices share this box, so a file
-# hydrated into one cache is reachable... NO: each device has its OWN chunk cache, so B genuinely
-# hydrates from the server's chunk store. memory backend keeps chunk bytes in the Rails process,
-# served via presigned GET to localhost — which works for two local mounts).
+# Boots its own STORAGE_BACKEND=local Rails server — the filesystem-backed chunk store that mints
+# REAL presigned http PUT/GET URLs (NOT the memory backend, whose `memory://` URLs aren't HTTP, so
+# the real PresignedIO data plane can't move bytes through it — that breaks a real two-mount test).
+# Each device has its OWN local chunk cache, so device B genuinely hydrates A's bytes from the
+# server's chunk store over the wire — a true data-plane round-trip on one box, no SeaweedFS/MinIO.
 #
 # Requires: /dev/fuse access + libfuse + `user_allow_other` in /etc/fuse.conf (the Daemon mounts
 # with AutoUnmount, which couples allow_other). On a CI runner without an interactive desktop FUSE
@@ -65,11 +65,11 @@ if [ ! -e /dev/fuse ]; then
   exit 0   # not a failure: a documented environment gap, like the macOS/Windows interactive walls
 fi
 
-# --- 1. Boot the memory Rails server --------------------------------------------------------
-echo "==> booting STORAGE_BACKEND=memory Rails on $SERVER"
+# --- 1. Boot the local-storage Rails server (real presigned data plane) ---------------------
+echo "==> booting STORAGE_BACKEND=local Rails on $SERVER"
 (fuser -k "$PORT/tcp" 2>/dev/null || pkill -f 'puma' 2>/dev/null) || true
 sleep 1
-STORAGE_BACKEND=memory bin/rails server -p "$PORT" >"$WORK/server.log" 2>&1 &
+STORAGE_BACKEND=local CHUNK_LOCAL_DIR="$WORK/chunk-store" bin/rails server -p "$PORT" >"$WORK/server.log" 2>&1 &
 SRV_PID=$!
 for _ in $(seq 1 60); do curl -sf "$SERVER/up" >/dev/null && break; sleep 1; done
 curl -sf "$SERVER/up" >/dev/null || { echo "FAIL: server didn't start"; cat "$WORK/server.log"; exit 1; }
