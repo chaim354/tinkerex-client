@@ -490,6 +490,12 @@ impl crate::Invalidate for EngineCfInvalidate {
     fn created(&self, ino: u64) {
         self.0.created(ino);
     }
+    fn removed(&self, ino: u64) {
+        self.0.removed(ino);
+    }
+    fn moved(&self, ino: u64) {
+        self.0.moved(ino);
+    }
 }
 
 /// The **CfAPI** mount path (Windows) — the driverless successor to [`WinfspMount`] (the
@@ -559,15 +565,22 @@ impl CfApiMount {
         // invalidator (reads it for O(1) path resolution; drops stale entries on rename/delete).
         let path_index = Arc::new(fs_cfapi::PathIndex::new());
 
+        // Echo guard shared by the invalidator (it `mark`s the path before a daemon-applied
+        // remote delete/move on disk) and the mount's NOTIFY_DELETE/RENAME callbacks (they `take`
+        // it and suppress re-capturing the daemon's own FS op — no push loop / self-conflict).
+        let self_removes = Arc::new(fs_cfapi::SelfOps::new());
+
         // Cache-invalidation hook over CfUpdatePlaceholder (no construction cycle here — CfAPI
         // resolves paths + opens handles itself, so it needs no post-mount notifier). Share the
-        // path index so it benefits from enumeration-time path knowledge.
+        // path index + echo guard so it benefits from enumeration-time path knowledge and its
+        // delete/move FS ops are recognized as self-echoes by the mount's NOTIFY callbacks.
         let inval: Arc<dyn crate::Invalidate> = Arc::new(EngineCfInvalidate(
             fs_cfapi::CfApiInvalidate::with_index(
                 provider.clone(),
                 cfg.mountpoint.clone(),
                 shutting_down.clone(),
                 path_index.clone(),
+                self_removes.clone(),
             ),
         ));
 
@@ -616,6 +629,7 @@ impl CfApiMount {
             Some(hydrate),
             shutting_down.clone(),
             path_index,
+            self_removes,
         )?;
         println!("CfAPI sync root at {}", cfg.mountpoint.display());
 

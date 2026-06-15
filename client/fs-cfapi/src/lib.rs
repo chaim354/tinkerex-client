@@ -399,9 +399,105 @@ impl PathIndex {
     }
 }
 
+/// Echo guard for placeholder mutations the **daemon itself** performs while applying a pull
+/// (a remote delete → `remove_file`/`remove_dir_all`; a remote move → remove-old + create-new).
+/// Those filesystem ops fire CfAPI's own `NOTIFY_DELETE` / `NOTIFY_RENAME` pre-op callbacks,
+/// which would otherwise mirror the change back into the `Provider` (re-enqueuing the outbox) →
+/// a push loop or a spurious self-conflict. Before each daemon-initiated op we [`mark`](Self::mark)
+/// the affected path; the NOTIFY callback [`take`](Self::take)s it and, on a fresh hit, suppresses
+/// itself exactly once.
+///
+/// **Self-healing** (mirrors `self_writes`): each mark is timestamped. If the expected NOTIFY
+/// never arrives (so the entry is never consumed), a later genuine user op at the same path finds
+/// the entry stale (≥ [`ECHO_TTL`](Self::ECHO_TTL)) and is captured normally — bounding any leak
+/// to that window rather than permanently suppressing the next real change.
+///
+/// Keyed by a **normalized** path (lowercased, `\`→`/`, trailing-sep-trimmed) so the daemon's
+/// path form and the callback's `VolumeDosName + NormalizedPath` form (which can differ in case /
+/// separators) still match. Pure + cross-platform, so it's unit-tested on any host.
+#[derive(Debug, Default)]
+pub struct SelfOps {
+    map: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl SelfOps {
+    /// How long a mark stays valid before a later op at the same path is treated as a genuine
+    /// user change (not our echo). Matches the `self_writes` 5 s window.
+    pub const ECHO_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Normalize a path to the echo-guard key form (case-insensitive, `/`-separated, no trailing
+    /// separator) so the daemon's and the callback's path spellings collide on the same entry.
+    pub fn key(path: &str) -> String {
+        path.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase()
+    }
+
+    /// Record that the daemon is about to mutate `path` itself — the next matching NOTIFY callback
+    /// is our own echo and should be suppressed.
+    pub fn mark(&self, path: &str) {
+        self.map.lock().unwrap().insert(Self::key(path), std::time::Instant::now());
+    }
+
+    /// Consume a mark for `path`. Returns `true` (suppress this callback — it's our echo) only on a
+    /// **fresh** hit; a stale entry is dropped and `false` returned (capture the op normally).
+    /// Always removes the entry so a single mark suppresses at most one callback.
+    pub fn take(&self, path: &str) -> bool {
+        let mut map = self.map.lock().unwrap();
+        match map.remove(&Self::key(path)) {
+            Some(t) => t.elapsed() < Self::ECHO_TTL,
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_ops_suppresses_one_echo_then_releases() {
+        let g = SelfOps::new();
+        let path = r"C:\Users\me\MakerCF\proj\old.txt";
+        g.mark(path);
+        // The daemon's own delete/rename echo is suppressed exactly once.
+        assert!(g.take(path), "fresh mark → suppress the echo");
+        // A second callback at the same path (e.g. a later genuine user op) is NOT suppressed.
+        assert!(!g.take(path), "mark is consumed — a subsequent op is captured");
+    }
+
+    #[test]
+    fn self_ops_matches_case_and_separator_variants() {
+        // CfAPI's NOTIFY callback can report a differently-cased / separator path than the one the
+        // daemon used for the FS op; both must collide on the same guard entry.
+        let g = SelfOps::new();
+        g.mark(r"C:\Users\me\MakerCF\A\B.txt");
+        assert!(g.take("c:/users/ME/makercf/a/b.txt"), "case + separator insensitive match");
+    }
+
+    #[test]
+    fn self_ops_unmarked_path_is_never_suppressed() {
+        // A genuine user delete/rename (the daemon never marked it) must be mirrored, not skipped.
+        let g = SelfOps::new();
+        assert!(!g.take(r"C:\Users\me\MakerCF\user-deleted.txt"));
+    }
+
+    #[test]
+    fn self_ops_stale_mark_is_not_suppressed() {
+        // A mark older than the TTL is treated as a genuine op (self-healing: a missing echo can't
+        // permanently suppress the next real change at that path).
+        let g = SelfOps::new();
+        let path = r"C:\Users\me\MakerCF\x.txt";
+        // Insert a mark whose timestamp is already older than the TTL.
+        g.map
+            .lock()
+            .unwrap()
+            .insert(SelfOps::key(path), std::time::Instant::now() - SelfOps::ECHO_TTL - std::time::Duration::from_secs(1));
+        assert!(!g.take(path), "stale mark → capture normally");
+        assert!(!g.take(path), "and it was removed");
+    }
 
     #[test]
     fn library_relative_strips_root_and_normalizes_backslashes() {
