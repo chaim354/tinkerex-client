@@ -247,6 +247,28 @@ impl SyncEngine {
         // backstop as the correctness floor (BUG #2). Idempotent: a replayed upsert is an
         // in-place update, never a duplicate.
         let mut deferred: Vec<SyncNode> = Vec::new();
+
+        // BUG #2 convergence face — the sticky reconcile flag. A pull can silently remove a
+        // local node that carries un-synced local state (its outbox upsert is still pending):
+        //   - `apply_remote`'s name-collision sweep displaces it when a remote upsert claims its
+        //     `(parent, name)` — `ApplyOutcome::displaced_pending`; or
+        //   - `apply_remote_delete`'s recursive subtree sweep removes it as a descendant of a
+        //     deleted ancestor — `apply_remote_delete_signaled` returns `true`.
+        // Either way the displaced node is typically STILL LIVE on the server (under its prior
+        // name / new parent — the server keys nodes by node_id and never tombstoned it), but the
+        // changelog delta can't re-add it locally: its queued outbox upsert pushes as a no-op
+        // once the row is gone. So we must fall back to the full-tree reconcile (`pull_snapshot`,
+        // the documented correctness floor) to re-establish it. We persist a `needs_resync` flag
+        // (sticky across ticks) so the reconcile is retried until it converges — then clear it.
+        //
+        // Honor a flag set by a PREVIOUS tick up front.
+        if provider.needs_resync().unwrap_or(false) {
+            let head = Self::pull_snapshot(provider, client)?;
+            let _ = provider.set_needs_resync(false);
+            return Ok(head);
+        }
+        // Set when THIS pull clobbers a pending local node (see above).
+        let mut needs_reconcile = false;
         loop {
             let resp = client.changes_paged(cursor, page)?;
 
@@ -263,16 +285,30 @@ impl SyncEngine {
 
             if resp.changes.is_empty() {
                 // Caught up. Final retry of any still-buffered upserts (a parent may have
-                // landed in the last page), then drop the genuinely-unreachable remainder.
-                retry_deferred(provider, &mut deferred, inval);
+                // landed in the last page); `dropped` is true if any remained unresolvable.
+                let dropped = retry_deferred(provider, &mut deferred, inval, true);
+                // A dropped (still-parentless) upsert OR a clobbered-pending displacement
+                // means the changelog delta did not fully converge the local tree to the
+                // server. Fall back to the documented reconcile floor so the missing/displaced
+                // node is re-added (it's still live on the server). Mark dirty FIRST so the
+                // reconcile is retried on the next tick if it can't fully converge yet (the
+                // racing peer's push may not have landed); `pull_snapshot` clears it.
+                if needs_reconcile || dropped {
+                    let _ = provider.set_needs_resync(true);
+                    let head = Self::pull_snapshot(provider, client)?;
+                    let _ = provider.set_needs_resync(false);
+                    return Ok(head);
+                }
                 return Ok(resp.head_seq.max(cursor));
             }
             for ch in &resp.changes {
-                apply_change(provider, ch, inval, &mut deferred)?;
+                if apply_change(provider, ch, inval, &mut deferred)? {
+                    needs_reconcile = true;
+                }
             }
-            // A parent applied this page may unblock a buffered child — retry now so the
-            // buffer doesn't grow unbounded across a long multi-page pull.
-            retry_deferred(provider, &mut deferred, inval);
+            // A parent applied this page may unblock a buffered child — retry now (mid-page:
+            // unresolved nodes stay buffered for later pages, nothing dropped).
+            retry_deferred(provider, &mut deferred, inval, false);
             // Advance only as far as we actually applied; loop for the next page.
             cursor = resp.changes.last().map(|c| c.seq).unwrap_or(cursor);
         }
@@ -573,38 +609,45 @@ fn tree_node_to_sync(n: &TreeNode) -> SyncNode {
 /// and remove the node — and any descendants — locally. A *move* is not a delete: the
 /// server models it as op `move` on the same stable node_id with a new parent/name, so it
 /// falls through to `apply_remote` and updates the existing row in place (no duplicate).
+/// Returns `true` if applying this change clobbered a local node that still had pending
+/// (un-synced) outbox state — the caller must then reconcile (see `displaced_pending`).
 fn apply_change(
     provider: &SqliteProvider,
     ch: &Change,
     inval: Option<&dyn Invalidate>,
     deferred: &mut Vec<SyncNode>,
-) -> Result<()> {
+) -> Result<bool> {
     // A `conflict` change records a divergent version that is NOT current — the node's
     // content is unchanged, so it must not be applied to the tree. It's surfaced to the
     // user via GET /v1/conflicts and resolved there.
     if ch.op == "conflict" {
-        return Ok(());
+        return Ok(false);
     }
     let deleted = ch.node.as_ref().is_some_and(|n| n.deleted);
     if ch.op == "delete" || deleted {
-        provider.apply_remote_delete(&ch.node_id)?;
+        // A recursive delete that sweeps a descendant carrying un-synced local state (e.g. a
+        // node moved out of this subtree on the server, or a local move not yet pushed) is a
+        // potential silent loss — signal a reconcile (the descendant is still live on the
+        // server). The target node's own removal is authorized by this entry.
+        return provider.apply_remote_delete_signaled(&ch.node_id).map_err(Into::into);
     } else if let Some(sn) = change_to_sync(ch) {
         // Defer (don't abort) if the parent isn't present locally yet — see BUG #2. The
         // parent's own upsert may arrive later in this same delta; `retry_deferred` reapplies.
-        apply_upsert(provider, sn, inval, deferred)?;
+        return apply_upsert(provider, sn, inval, deferred);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Apply one upsert `SyncNode`, deferring it (buffering for retry) instead of erroring if
 /// its parent isn't present locally yet. Any *other* provider error still propagates. On a
 /// successful apply, fires the appropriate OS-cache invalidation hook.
+/// Returns `true` if the apply clobbered a pending local node (`displaced_pending`).
 fn apply_upsert(
     provider: &SqliteProvider,
     sn: SyncNode,
     inval: Option<&dyn Invalidate>,
     deferred: &mut Vec<SyncNode>,
-) -> Result<()> {
+) -> Result<bool> {
     match provider.apply_remote(&sn) {
         Ok(outcome) => {
             if let Some(inval) = inval {
@@ -619,7 +662,7 @@ fn apply_upsert(
                     inval.invalidate(outcome.ino);
                 }
             }
-            Ok(())
+            Ok(outcome.displaced_pending)
         }
         // Parent not present locally yet → buffer for retry within this pull rather than
         // aborting the whole pull. `apply_remote` only returns `NotFound` for a missing
@@ -627,20 +670,30 @@ fn apply_upsert(
         // an INSERT, not a NotFound).
         Err(fs_provider::FsError::NotFound) => {
             deferred.push(sn);
-            Ok(())
+            Ok(false)
         }
         Err(e) => Err(e.into()),
     }
 }
 
 /// Re-apply buffered (parentless) upserts, looping until no further progress — a parent
-/// applied this round may unblock a child. Any node still unresolvable after a fixed point
-/// is dropped: its parent is genuinely gone on the authoritative tree (a recursive delete
-/// also removed it there), so it's an unreachable orphan no device tree can hold. The
-/// full-tree reconcile backstop (`pull_snapshot`) remains the correctness floor for that.
-fn retry_deferred(provider: &SqliteProvider, deferred: &mut Vec<SyncNode>, inval: Option<&dyn Invalidate>) {
+/// applied this round may unblock a child. Returns `true` if any node remained unresolvable
+/// at the fixed point.
+///
+/// `final_pass` distinguishes the two call sites:
+///   - mid-page (`false`): leftover unresolvable nodes are RETAINED in `deferred` — their
+///     parent may arrive on a LATER page — and `false` is returned (no decision yet).
+///   - end-of-pull (`true`): leftovers are genuinely unresolvable from the delta; they are
+///     dropped and `true` is returned so the caller reconciles from the full tree
+///     (`pull_snapshot`, the correctness floor) rather than silently losing them (BUG #2).
+fn retry_deferred(
+    provider: &SqliteProvider,
+    deferred: &mut Vec<SyncNode>,
+    inval: Option<&dyn Invalidate>,
+    final_pass: bool,
+) -> bool {
     if deferred.is_empty() {
-        return;
+        return false;
     }
     let mut progress = true;
     while progress && !deferred.is_empty() {
@@ -664,8 +717,15 @@ fn retry_deferred(provider: &SqliteProvider, deferred: &mut Vec<SyncNode>, inval
             }
         }
     }
-    // Whatever remains is an unreachable orphan on the authoritative tree — drop it.
+    if !final_pass {
+        // Mid-page: keep unresolved nodes buffered for a later page; no drop, no signal.
+        return false;
+    }
+    // Whatever remains is unresolvable from the delta alone — drop it and tell the caller to
+    // reconcile (don't silently lose it: it may still be live on the authoritative tree).
+    let dropped = !deferred.is_empty();
     deferred.clear();
+    dropped
 }
 
 fn change_to_sync(ch: &Change) -> Option<SyncNode> {
