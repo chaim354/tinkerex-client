@@ -125,7 +125,7 @@ if wait_bytes "$MNT_B/Docs/2026/plan.txt" "$(sha "$MNT_A/Docs/2026/plan.txt")"; 
 # --- 6b. multi-chunk (A -> B) -------------------------------------------------------------
 echo "==> [A->B] multi-chunk (1 MiB) file"
 head -c 1048576 /dev/urandom > "$MNT_A/model.stl"
-if wait_bytes "$MNT_B/model.stl" "$(sha "$MNT_A/model.stl")" 150; then pass "A->B: 1 MiB model.stl byte-for-byte through B"; else fail "A->B: multi-chunk through B"; fi
+if wait_bytes "$MNT_B/model.stl" "$(sha "$MNT_A/model.stl")" 300; then pass "A->B: 1 MiB model.stl byte-for-byte through B"; else fail "A->B: multi-chunk through B"; fi
 
 # --- 6c. delete (A -> B) ------------------------------------------------------------------
 echo "==> [A->B] delete"

@@ -177,9 +177,15 @@ impl Daemon {
         let fs = FuseAdapter::with_hydrator(provider.clone(), hydrator)
             .with_freshness(freshness)
             .with_remote_lock(remote_lock);
+        // NOTE: do NOT add MountOption::AutoUnmount. With spawn_mount2 (background session) it
+        // tears the mount down IMMEDIATELY after a successful mount on many libfuse setups (the
+        // auto-unmount fusermount helper can't track the spawned session's lifetime) → the FUSE
+        // worker exits at once and `run_until_unmounted`'s session.join() returns instantly
+        // ("mounted at" → "sync loop stopped" with no error). We already unmount gracefully when
+        // the BackgroundSession guard drops in stop()/Drop, so AutoUnmount only bought SIGKILL
+        // crash-cleanup — not worth a mount that won't stay up. (verified on the Linux runner.)
         let opts = [
             MountOption::FSName("maker".into()),
-            MountOption::AutoUnmount,
             MountOption::DefaultPermissions,
         ];
         // spawn_mount2 runs the FUSE session loop on its own thread and returns a handle
