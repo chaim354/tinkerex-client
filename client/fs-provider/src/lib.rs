@@ -686,6 +686,60 @@ impl SqliteProvider {
             .map(|i| i as u64))
     }
 
+    /// The chunk hashes whose byte range overlaps `[offset, offset + size)` — the SUBSET of a
+    /// node's manifest needed to satisfy a read at that range. This is the core of **progressive
+    /// / range hydration**: a read of just a file's header (or any slice) maps to only the few
+    /// chunks covering it, so the hydrator fetches those instead of the whole (possibly
+    /// multi-GB) file. Hashes are returned in manifest order and **deduplicated** (a chunk that
+    /// dedups to the same hash appears once), so the caller fetches each distinct chunk at most
+    /// once.
+    ///
+    /// A chunk spanning `[c.offset, c.offset + c.length)` overlaps the request iff
+    /// `c.offset < offset + size && offset < c.offset + c.length`. A zero-length request (`size
+    /// == 0`) overlaps nothing → empty. An empty manifest (no content, or a never-flushed node)
+    /// → empty. A range past EOF → empty (no chunk overlaps). The whole-file case is just
+    /// `manifest_range_hashes(id, 0, u64::MAX)` and returns every distinct chunk, matching
+    /// [`node_manifest_hashes`](Self::node_manifest_hashes) (modulo dedup).
+    pub fn manifest_range_hashes(&self, node_id: &str, offset: u64, size: u64) -> Result<Vec<String>> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mid: Option<String> = conn
+            .query_row("SELECT manifest_id FROM nodes WHERE node_id = ?1", params![node_id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten();
+        let mid = match mid {
+            None => return Ok(Vec::new()),
+            Some(m) => m,
+        };
+        // The requested range's exclusive end, saturating so `u64::MAX` (whole-file) can't wrap.
+        let req_end = offset.saturating_add(size);
+        let mut stmt = conn.prepare(
+            "SELECT chunk_hash, offset, length FROM manifest_chunks WHERE manifest_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![mid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let (hash, c_off, c_len) = row?;
+            let c_end = c_off.saturating_add(c_len);
+            // Half-open overlap test: the chunk and the request share at least one byte.
+            if c_off < req_end && offset < c_end && seen.insert(hash.clone()) {
+                out.push(hash);
+            }
+        }
+        Ok(out)
+    }
+
     /// The ordered chunk hashes for a node's current manifest (for hydration).
     pub fn node_manifest_hashes(&self, node_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
