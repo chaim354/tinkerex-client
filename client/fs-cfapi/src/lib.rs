@@ -282,6 +282,63 @@ pub fn pin_hydration_action(pin: PinState, kind: Kind) -> HydrationAction {
     }
 }
 
+/// The chain of ancestor directories of `ino` that must hold a placeholder before `ino`'s own
+/// placeholder can be created, listed **top-down (root-most first)**, root-exclusive. Each entry
+/// is an `(ino, name)` pair (the dir's stable ino + its leaf name within its parent).
+///
+/// `lookup(ino)` returns `Some((parent_ino, name))` for any non-root node and `None` for the root
+/// (`ROOT_INO`) or an unknown ino — exactly [`fs_provider::SqliteProvider::parent_and_name`]'s
+/// contract, so the Windows path passes that through. Kept pure (no SQLite / no Windows types) so
+/// the ordering + parent-resolution logic is unit-testable on any host.
+///
+/// Why this exists: CfAPI population is disabled per directory after its first (possibly empty)
+/// enumeration, so when a remote pull inserts nodes into an already-enumerated tree we must
+/// **proactively** `CfCreatePlaceholders` each one — and `CfCreatePlaceholders` requires the
+/// parent directory's placeholder to already exist on disk (else `0x80070002`/`0x80070003`). This
+/// yields the full root→leaf list so the caller can create each missing ancestor dir top-down
+/// before the leaf, regardless of the order the changelog delivered the nodes.
+///
+/// Returns the ancestors **only** (not `ino` itself); the caller appends the leaf. A cycle or a
+/// chain that doesn't terminate at the root within `MAX_DEPTH` hops yields `None` (corrupt tree —
+/// don't loop forever).
+pub fn ancestor_chain<F>(ino: u64, lookup: F) -> Option<Vec<(u64, String)>>
+where
+    F: Fn(u64) -> Option<(u64, String)>,
+{
+    const MAX_DEPTH: usize = 4096;
+    // Walk up parent links, collecting (dir_ino, name) for each ancestor, until we reach the root
+    // (lookup returns None). Bottom-up here; reverse to top-down before returning.
+    let mut chain = Vec::new();
+    let mut cur = ino;
+    for _ in 0..MAX_DEPTH {
+        match lookup(cur) {
+            Some((parent, _name)) => {
+                // `parent` is the directory that must exist for `cur`. Record the *parent's*
+                // identity by looking it up in turn — but the parent's name comes from ITS own
+                // lookup. So we record (cur's parent, cur's parent's name) when we step to it.
+                // Simpler: record the parent dir itself on the next iteration. Here we just climb.
+                if parent == fs_provider::ROOT_INO {
+                    // `cur`'s parent is the root → root is the base, no more ancestors to create.
+                    chain.reverse();
+                    return Some(chain);
+                }
+                // The parent is a non-root directory that must hold a placeholder. Record it with
+                // its own leaf name (from the parent's lookup).
+                let parent_name = lookup(parent).map(|(_, n)| n)?;
+                chain.push((parent, parent_name));
+                cur = parent;
+            }
+            // No parent: `cur` is the root (or unknown). If `cur == ino == ROOT_INO` the caller
+            // asked about the root itself (no ancestors); otherwise the chain terminated cleanly.
+            None => {
+                chain.reverse();
+                return Some(chain);
+            }
+        }
+    }
+    None // ran past MAX_DEPTH — a cycle / corrupt tree; bail rather than loop forever
+}
+
 /// An **ino → absolute-path** index for O(1) placeholder-path resolution.
 ///
 /// `CfApiInvalidate` (and the close/rename callbacks) need a node's on-disk path to open it for
@@ -635,5 +692,72 @@ mod tests {
         idx.clear();
         assert_eq!(idx.get(1), None);
         assert_eq!(idx.get(2), None);
+    }
+
+    // --- ancestor_chain: proactive-placeholder ordering / parent-resolution -------------
+
+    /// Build a `lookup` closure over a fixed tree. `tree[ino] = Some((parent, name))` for a
+    /// non-root node; the root (ino 1) is absent → `None` (matches `parent_and_name`).
+    fn tree_lookup<'a>(
+        tree: &'a std::collections::HashMap<u64, (u64, &'static str)>,
+    ) -> impl Fn(u64) -> Option<(u64, String)> + 'a {
+        move |ino| tree.get(&ino).map(|(p, n)| (*p, (*n).to_string()))
+    }
+
+    #[test]
+    fn ancestor_chain_root_level_file_has_no_ancestors() {
+        // ino 2 is a file directly under the root (ino 1). Its parent IS the root, so there are
+        // no non-root ancestor dirs to create — the chain is empty (the leaf goes in the root).
+        // This is the regression: the old `created` path treated ROOT as "not enumerated" and
+        // dropped the file; here root-level resolves to an empty chain cleanly.
+        let mut tree = std::collections::HashMap::new();
+        tree.insert(2u64, (fs_provider::ROOT_INO, "lamp.scad"));
+        let chain = ancestor_chain(2, tree_lookup(&tree)).expect("resolvable");
+        assert!(chain.is_empty(), "root-level file → no ancestor dirs, got {chain:?}");
+    }
+
+    #[test]
+    fn ancestor_chain_nested_lists_dirs_top_down() {
+        // Tree: root/Docs(3)/2026(4)/plan.txt(5). Creating the leaf (5) needs Docs then 2026
+        // created first, in that (top-down) order.
+        let mut tree = std::collections::HashMap::new();
+        tree.insert(3u64, (fs_provider::ROOT_INO, "Docs"));
+        tree.insert(4u64, (3u64, "2026"));
+        tree.insert(5u64, (4u64, "plan.txt"));
+        let chain = ancestor_chain(5, tree_lookup(&tree)).expect("resolvable");
+        assert_eq!(
+            chain,
+            vec![(3u64, "Docs".to_string()), (4u64, "2026".to_string())],
+            "ancestors must be root-most first (Docs before 2026)"
+        );
+    }
+
+    #[test]
+    fn ancestor_chain_for_a_dir_excludes_itself() {
+        // Asking about dir 4 (root/Docs/2026) yields only its ancestor Docs — the leaf (4) is the
+        // caller's responsibility to append.
+        let mut tree = std::collections::HashMap::new();
+        tree.insert(3u64, (fs_provider::ROOT_INO, "Docs"));
+        tree.insert(4u64, (3u64, "2026"));
+        let chain = ancestor_chain(4, tree_lookup(&tree)).expect("resolvable");
+        assert_eq!(chain, vec![(3u64, "Docs".to_string())]);
+    }
+
+    #[test]
+    fn ancestor_chain_root_itself_is_empty() {
+        // The root (ino 1) has no parent → no ancestors.
+        let tree = std::collections::HashMap::new();
+        let chain = ancestor_chain(fs_provider::ROOT_INO, tree_lookup(&tree)).expect("resolvable");
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn ancestor_chain_breaks_on_a_cycle() {
+        // A corrupt tree where 2's parent is 3 and 3's parent is 2 (never reaches root). Must
+        // bail with None rather than loop forever.
+        let mut tree = std::collections::HashMap::new();
+        tree.insert(2u64, (3u64, "a"));
+        tree.insert(3u64, (2u64, "b"));
+        assert_eq!(ancestor_chain(2, tree_lookup(&tree)), None);
     }
 }
