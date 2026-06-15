@@ -584,7 +584,7 @@ impl fs_fuse::Hydrate for EngineHydrator {
 }
 
 /// Active OS-cache invalidation over the FUSE kernel channel. Holds the session's
-/// [`fuser::Notifier`] and, on a content-changing pull, calls `notify_inval_inode` so the
+/// [`fuser::Notifier`] and, on a content-changing pull, calls `Notifier::inval_inode` so the
 /// kernel drops its cached attrs + data for that inode (the next read re-fetches the new
 /// manifest). This is what lets us preserve the real mtime instead of bumping it to force
 /// a re-read.
@@ -616,7 +616,9 @@ impl Invalidate for EngineInvalidate {
     fn invalidate(&self, ino: u64) {
         if let Some(n) = self.notifier.get() {
             // offset 0 + len 0 = invalidate the inode's attributes and all cached data.
-            if let Err(e) = n.inval_inode(ino, 0, 0) {
+            // fuser 0.17: inval_inode now takes a strongly-typed `INodeNo` (was a bare u64
+            // in 0.14) and offset/len are `i64`.
+            if let Err(e) = n.inval_inode(fuser::INodeNo(ino), 0, 0) {
                 eprintln!("invalidate: inval_inode({ino}) failed: {e}");
             }
         }

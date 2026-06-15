@@ -28,12 +28,15 @@ fn main() {
     let fs = FuseAdapter::new(provider);
 
     println!("mounting at {mountpoint} (Ctrl-C to unmount)");
-    let opts = vec![
+    // fuser 0.17: mount2 takes a &fuser::Config (was a &[MountOption] slice). Config is
+    // #[non_exhaustive], so start from default() and set the public field (no struct literal).
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![
         MountOption::FSName("maker".into()),
         MountOption::AutoUnmount,
         MountOption::DefaultPermissions,
     ];
-    if let Err(e) = fuser::mount2(fs, &mountpoint, &opts) {
+    if let Err(e) = fuser::mount2(fs, &mountpoint, &config) {
         eprintln!("mount failed: {e}");
         std::process::exit(1);
     }

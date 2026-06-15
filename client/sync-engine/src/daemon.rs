@@ -179,21 +179,43 @@ impl Daemon {
             .with_remote_lock(remote_lock);
         // NOTE: do NOT add MountOption::AutoUnmount. With spawn_mount2 (background session) it
         // tears the mount down IMMEDIATELY after a successful mount on many libfuse setups (the
-        // auto-unmount fusermount helper can't track the spawned session's lifetime) → the FUSE
-        // worker exits at once and `run_until_unmounted`'s session.join() returns instantly
-        // ("mounted at" → "sync loop stopped" with no error). We already unmount gracefully when
-        // the BackgroundSession guard drops in stop()/Drop, so AutoUnmount only bought SIGKILL
-        // crash-cleanup — not worth a mount that won't stay up. (verified on the Linux runner.)
-        let opts = [
+        // auto-unmount fusermount helper can't track the spawned session's lifetime). We already
+        // unmount gracefully when the BackgroundSession guard drops in stop()/Drop, so
+        // AutoUnmount only bought SIGKILL crash-cleanup — not worth a mount that won't stay up.
+        // (The real instant-drop culprit was `run_until_unmounted` calling `umount_and_join()`,
+        // which actively unmounts; see that method. Fixed to `join()`.)
+        // fuser 0.17: spawn_mount2 takes a &fuser::Config (was a &[MountOption] slice).
+        // Config is #[non_exhaustive] (external crate), so a struct literal is forbidden even
+        // with ..Default::default(); start from default() and set the public field.
+        let mut config = fuser::Config::default();
+        config.mount_options = vec![
             MountOption::FSName("maker".into()),
             MountOption::DefaultPermissions,
         ];
         // spawn_mount2 runs the FUSE session loop on its own thread and returns a handle
         // that unmounts on drop — the non-blocking counterpart to mount2.
-        let session = fuser::spawn_mount2(fs, &cfg.mountpoint, &opts)?;
+        let session = fuser::spawn_mount2(fs, &cfg.mountpoint, &config)?;
         // Now the session exists, hand its notifier to the invalidation hook (both the sync
         // loop and the freshness adapter share it; before this they no-op harmlessly).
         invalidate.set_notifier(session.notifier());
+
+        // POST-MOUNT LIVENESS CHECK (observability hardening — see maker-syncd).
+        // `spawn_mount2` returns Ok the moment the worker thread is *spawned*, NOT once the
+        // kernel mount is confirmed. A broken mount (e.g. the fuser-0.14 ENODEV-on-first-read
+        // bug, or a kernel/driver mismatch) lets the worker thread exit almost immediately
+        // while `start` still returns Ok — the original silent failure. Give the worker a beat
+        // to either settle (stay alive) or die, then check `guard.is_finished()`. If it already
+        // finished, the mount did NOT attach: surface a real error instead of a happy `Ok`.
+        thread::sleep(Duration::from_millis(300));
+        if session.guard.is_finished() {
+            return Err(std::io::Error::other(format!(
+                "FUSE mount did not attach at {} — the session worker exited immediately. \
+                 Check `dmesg`, the fuser version (need >=0.17; 0.14 fails silently on modern \
+                 kernels), /dev/fuse permissions, and that fusermount3 is setuid.",
+                cfg.mountpoint.display()
+            ))
+            .into());
+        }
 
         Ok(Self {
             stop,
@@ -226,13 +248,33 @@ impl Daemon {
         }
     }
 
-    /// Block until the mount ends (Ctrl-C / `umount` / `AutoUnmount`), then stop the
-    /// loops. For the CLI; a GUI host uses [`start`](Self::start) + [`stop`](Self::stop).
-    pub fn run_until_unmounted(mut self) {
-        if let Some(session) = self.session.take() {
-            session.join(); // blocks; unmounts + joins the FUSE worker
-        }
+    /// Block until the mount ends (Ctrl-C / external `umount`), then stop the loops. For the
+    /// CLI; a GUI host uses [`start`](Self::start) + [`stop`](Self::stop). Returns the FUSE
+    /// session's worker result so the caller can surface a teardown/worker error.
+    ///
+    /// **The bug this fixes (mount dropped instantly on Linux):** fuser 0.17 has two
+    /// `BackgroundSession` finishers with OPPOSITE semantics:
+    ///   - `umount_and_join()` — **actively unmounts the filesystem FIRST**, then joins the
+    ///     worker. Calling it to "wait for unmount" instead *triggers* the unmount immediately:
+    ///     the daemon mounted, printed "mounted at", then unmounted itself the same instant
+    ///     (`findmnt` empty, "sync loop stopped"). That was the whole silent-drop symptom.
+    ///   - `join()` — **just waits** for the worker thread to exit on its own (an external
+    ///     `umount`/`fusermount -u`, Ctrl-C, or `stop()`/`Drop`), keeping the mount live until
+    ///     then, and only unmounts when its `mount` guard drops afterwards.
+    /// We want the latter: hold the mount up and block until something *else* ends it. (The
+    /// 0.14 `join()` we ported from had the wait-only semantics; 0.17 split them and the
+    /// migration grabbed the wrong one.)
+    pub fn run_until_unmounted(mut self) -> std::io::Result<()> {
+        let r = if let Some(session) = self.session.take() {
+            // Wait for the worker to exit on its own — do NOT proactively unmount. The mount
+            // stays live until an external umount/Ctrl-C ends the worker; `session` (and its
+            // `mount` guard) then drops here, unmounting cleanly.
+            session.join()
+        } else {
+            Ok(())
+        };
         self.stop();
+        r
     }
 }
 

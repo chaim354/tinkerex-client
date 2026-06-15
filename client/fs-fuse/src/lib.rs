@@ -10,21 +10,28 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs_provider::{Attr, FsError, Kind, LockRange, Provider};
+// fuser 0.17 wraps many former bare-integer params in strongly-typed newtypes
+// (`INodeNo(u64)`, `FileHandle(u64)`, `LockOwner(u64)`, `OpenFlags(i32)`, `Generation(u64)`)
+// and bitflags (`FopenFlags`, `RenameFlags`, `WriteFlags`, `BsdFileFlags`), and the
+// `Filesystem` trait methods now take `&self` (not `&mut self`). See the migration notes
+// at the bottom of this file's git history / the 0.17 CHANGELOG.
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyLock, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyWrite, Request,
+    TimeOrNow,
 };
 
 const TTL: Duration = Duration::from_secs(1);
 
-fn errno(e: &FsError) -> i32 {
+fn errno(e: &FsError) -> fuser::Errno {
+    // fuser 0.17: ReplyXxx::error() takes fuser::Errno (named consts), not a bare i32.
     match e {
-        FsError::NotFound => libc::ENOENT,
-        FsError::NotADirectory => libc::ENOTDIR,
-        FsError::IsADirectory => libc::EISDIR,
-        FsError::AlreadyExists => libc::EEXIST,
-        FsError::NotEmpty => libc::ENOTEMPTY,
-        _ => libc::EIO,
+        FsError::NotFound => fuser::Errno::ENOENT,
+        FsError::NotADirectory => fuser::Errno::ENOTDIR,
+        FsError::IsADirectory => fuser::Errno::EISDIR,
+        FsError::AlreadyExists => fuser::Errno::EEXIST,
+        FsError::NotEmpty => fuser::Errno::ENOTEMPTY,
+        _ => fuser::Errno::EIO,
     }
 }
 
@@ -51,7 +58,8 @@ fn file_attr(a: &Attr) -> FileAttr {
     };
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     FileAttr {
-        ino: a.ino,
+        // fuser 0.17: FileAttr.ino is now the `INodeNo` newtype (was a bare u64).
+        ino: INodeNo(a.ino),
         size: a.size,
         blocks: (a.size + 511) / 512,
         atime: t,
@@ -140,16 +148,22 @@ impl<P: Provider> FuseAdapter<P> {
     }
 }
 
+// fuser 0.17: `Filesystem` methods take `&self` (was `&mut self` in 0.14) and the mounted
+// FS must be `Send + Sync + 'static`. Our `FuseAdapter` only ever calls `&self` methods on
+// the `Provider` (itself `Send + Sync`, all `&self`), so the switch is mechanical — no
+// interior mutability needed.
 impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self.provider.lookup(parent, &name.to_string_lossy()) {
-            Ok(a) => reply.entry(&TTL, &file_attr(&a), 0),
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        match self.provider.lookup(parent.0, &name.to_string_lossy()) {
+            Ok(a) => reply.entry(&TTL, &file_attr(&a), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        match self.provider.getattr(ino) {
+    // fuser 0.15+ added the `fh: Option<FileHandle>` arg to getattr (a stat on an open fd);
+    // we don't use file handles, so it's ignored.
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
+        match self.provider.getattr(ino.0) {
             Ok(a) => reply.attr(&TTL, &file_attr(&a)),
             Err(e) => reply.error(errno(&e)),
         }
@@ -157,9 +171,9 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
 
     #[allow(clippy::too_many_arguments)]
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
+        ino: INodeNo,
         mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -167,13 +181,14 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         _atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<fuser::FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let ino = ino.0;
         // We persist size (truncate — the kernel issues `setattr(size=0)` on an `O_TRUNC`
         // open), mode (chmod — so the executable bit sticks + syncs), and mtime (the real
         // modification time from `utimensat`/`cp -p` — preserved + synced instead of being
@@ -202,7 +217,10 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         }
     }
 
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    // fuser 0.17: `fh` is a `FileHandle` and `offset` is now `u64` (was `i64`); also
+    // `ReplyDirectory::add` takes an `INodeNo` and a `u64` offset.
+    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: fuser::FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        let ino = ino.0;
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (ino, FileType::Directory, ".".into()),
             (ino, FileType::Directory, "..".into()),
@@ -224,25 +242,28 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         }
         for (i, (e_ino, ft, name)) in entries.into_iter().enumerate().skip(offset as usize) {
             // offset is the *next* entry index
-            if reply.add(e_ino, (i + 1) as i64, ft, name) {
+            if reply.add(INodeNo(e_ino), (i + 1) as u64, ft, name) {
                 break;
             }
         }
         reply.ok();
     }
 
+    // fuser 0.17: `fh: FileHandle`, `offset: u64`, `flags: OpenFlags`, `lock_owner: Option<LockOwner>`.
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
+        _flags: fuser::OpenFlags,
+        _lock: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.provider.read(ino, offset as u64, size) {
+        let ino = ino.0;
+        // fuser 0.17: `offset` is already `u64` (was `i64` in 0.14), matching `Provider::read`.
+        match self.provider.read(ino, offset, size) {
             Ok(data) => reply.data(&data),
             // A chunk-cache miss on a file we know about: ask the hydrator to fetch the
             // bytes from the cloud, then retry the read once. This is the on-demand
@@ -254,8 +275,8 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
             // not the whole file. Write-open already full-hydrated up front (`open`), so
             // random writes never reach this miss path with a partial cache.
             Err(FsError::ChunkMissing(_)) if self.hydrator.is_some() => {
-                self.hydrator.as_ref().unwrap().hydrate_range(ino, offset as u64, size);
-                match self.provider.read(ino, offset as u64, size) {
+                self.hydrator.as_ref().unwrap().hydrate_range(ino, offset, size);
+                match self.provider.read(ino, offset, size) {
                     Ok(data) => reply.data(&data),
                     Err(e) => reply.error(errno(&e)),
                 }
@@ -264,35 +285,41 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         }
     }
 
+    // fuser 0.17: `fh: FileHandle`, `offset: u64`, `write_flags: WriteFlags`,
+    // `flags: OpenFlags`, `lock_owner: Option<LockOwner>`.
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock: Option<u64>,
+        _write_flags: fuser::WriteFlags,
+        _flags: fuser::OpenFlags,
+        _lock: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.provider.write(ino, offset as u64, data) {
+        let ino = ino.0;
+        match self.provider.write(ino, offset, data) {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
+    // fuser 0.17: `parent: INodeNo`; `mode`/`umask` stay `u32`, `flags` stays `i32` on
+    // create (not newtyped). `ReplyCreate::created` now takes `Generation`, `FileHandle`,
+    // `FopenFlags` for the trailing three args.
     fn create(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        match self.provider.create(parent, &name.to_string_lossy()) {
+        match self.provider.create(parent.0, &name.to_string_lossy()) {
             Ok(a) => {
                 // Capture the create-time mode (e.g. a tool creating a 0755 file) — the
                 // default is 0644, so only override when it differs.
@@ -300,55 +327,56 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
                     let _ = self.provider.set_mode(a.ino, mode);
                 }
                 let a = self.provider.getattr(a.ino).unwrap_or(a);
-                reply.created(&TTL, &file_attr(&a), 0, 0, 0)
+                reply.created(&TTL, &file_attr(&a), Generation(0), fuser::FileHandle(0), FopenFlags::empty())
             }
             Err(e) => reply.error(errno(&e)),
         }
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        match self.provider.mkdir(parent, &name.to_string_lossy()) {
-            Ok(a) => reply.entry(&TTL, &file_attr(&a), 0),
+        match self.provider.mkdir(parent.0, &name.to_string_lossy()) {
+            Ok(a) => reply.entry(&TTL, &file_attr(&a), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.provider.unlink(parent, &name.to_string_lossy()) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.provider.unlink(parent.0, &name.to_string_lossy()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.provider.rmdir(parent, &name.to_string_lossy()) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.provider.rmdir(parent.0, &name.to_string_lossy()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
+    // fuser 0.17: `parent`/`newparent` are `INodeNo`, `flags` is now `RenameFlags` (ignored).
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
         match self.provider.rename(
-            parent,
+            parent.0,
             &name.to_string_lossy(),
-            newparent,
+            newparent.0,
             &newname.to_string_lossy(),
         ) {
             Ok(()) => reply.ok(),
@@ -356,7 +384,11 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    // fuser 0.17: `ino: INodeNo`, `flags: OpenFlags` (wraps i32), reply `opened` takes
+    // `FileHandle` + `FopenFlags`.
+    fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
+        let flags = flags.0;
         // Freshness-on-access: a quick catch-up pull so an open never serves a copy
         // another device already changed (closes the window between background sync
         // ticks). Throttled + cheap-when-in-sync inside the implementor.
@@ -379,31 +411,35 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
                 h.hydrate(ino);
             }
         }
-        reply.opened(0, 0);
+        reply.opened(fuser::FileHandle(0), FopenFlags::empty());
     }
 
-    fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        match self.provider.flush(ino) {
+    // fuser 0.17: `ino: INodeNo`, `fh: FileHandle`, `lock_owner: LockOwner` (no longer Option).
+    fn flush(&self, _req: &Request, ino: INodeNo, _fh: fuser::FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
+        match self.provider.flush(ino.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
+    // fuser 0.17: `ino: INodeNo`, `fh: FileHandle`, `flags: OpenFlags`,
+    // `lock_owner: Option<LockOwner>`.
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        _flags: i32,
-        lock_owner: Option<u64>,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _flags: fuser::OpenFlags,
+        lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         // Ensure writeback is finalized on close even if the app didn't flush.
         let _ = self.provider.flush(ino);
         // POSIX: a process's locks are released when it closes the file.
         if let Some(owner) = lock_owner {
-            let _ = self.provider.release_locks(ino, owner);
+            let _ = self.provider.release_locks(ino, owner.0);
         }
         // Release the best-effort cross-device lock on close (best-effort; TTL covers a
         // crash where this never runs).
@@ -418,13 +454,15 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
     // do local locking for free, but routing it here makes it visible to the app and
     // consistent with the WebDAV/WinFsp paths). Non-blocking: a conflicting `F_SETLK`
     // returns EAGAIN; a blocking `F_SETLKW` is not yet waited on (callers retry).
+    // fuser 0.17: `ino: INodeNo`, `fh: FileHandle`, `lock_owner: LockOwner`; start/end/typ/pid
+    // unchanged (u64/u64/i32/u32).
     #[allow(clippy::too_many_arguments)]
     fn setlk(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        lock_owner: u64,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        lock_owner: fuser::LockOwner,
         start: u64,
         end: u64,
         typ: i32,
@@ -432,6 +470,8 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         _sleep: bool,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
+        let lock_owner = lock_owner.0;
         if typ == libc::F_UNLCK {
             let _ = self.provider.unlock(ino, lock_owner, start, end);
             return reply.ok();
@@ -439,23 +479,27 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         let lock = LockRange { owner: lock_owner, start, end, exclusive: typ == libc::F_WRLCK, pid };
         match self.provider.set_lock(ino, lock) {
             Ok(()) => reply.ok(),
-            Err(_) => reply.error(libc::EAGAIN),
+            Err(_) => reply.error(fuser::Errno::EAGAIN),
         }
     }
 
+    // fuser 0.17: `ino: INodeNo`, `fh: FileHandle`, `lock_owner: LockOwner`; `ReplyLock::locked`
+    // args (start: u64, end: u64, typ: i32, pid: u32) are unchanged.
     #[allow(clippy::too_many_arguments)]
     fn getlk(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        lock_owner: u64,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        lock_owner: fuser::LockOwner,
         start: u64,
         end: u64,
         typ: i32,
         pid: u32,
         reply: ReplyLock,
     ) {
+        let ino = ino.0;
+        let lock_owner = lock_owner.0;
         let probe = LockRange { owner: lock_owner, start, end, exclusive: typ == libc::F_WRLCK, pid };
         match self.provider.test_lock(ino, probe) {
             Ok(Some(c)) => {
