@@ -334,6 +334,54 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// **Proactive (selective-sync-gated) hydration.** After a pull, eagerly hydrate the
+    /// chunks of every file that is *in scope* for this device — i.e. the files
+    /// [`SqliteProvider::proactive_hydration_targets`] returns (in-scope files with missing
+    /// chunks). **Out-of-scope subtrees are skipped entirely**: they stay dehydrated
+    /// placeholders and are fetched only on demand by [`hydrate`](Self::hydrate) (which is
+    /// deliberately *not* gated, so an out-of-scope file still opens — graceful degradation,
+    /// the OneDrive online-only model).
+    ///
+    /// This is the single place the subscription gate touches the hydration path; the
+    /// per-file [`hydrate`](Self::hydrate) and the on-demand FUSE/CfAPI read hooks are
+    /// unchanged. Per-file error isolation: one file that fails to hydrate (transient
+    /// network) is logged and skipped, never blocking the rest — the next tick retries it.
+    pub fn proactive_hydrate(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+    ) -> Result<()> {
+        for node_id in provider.proactive_hydration_targets()? {
+            if let Err(e) = Self::hydrate(provider, client, io, &node_id) {
+                eprintln!("proactive_hydrate: node {node_id} failed (will retry next tick): {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// **Subscribe** a subtree (by `node_id`) for proactive hydration on this device, then
+    /// immediately hydrate the now-in-scope files. The local tree already holds the subtree's
+    /// metadata (the full tree always syncs), so this only changes whether its bytes are kept
+    /// resident.
+    pub fn subscribe(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        node_id: &str,
+    ) -> Result<()> {
+        provider.subscribe(node_id)?;
+        Self::proactive_hydrate(provider, client, io)
+    }
+
+    /// **Unsubscribe** a subtree (by `node_id`): stop proactively hydrating it and reclaim
+    /// the bytes it was holding (dropping only chunks no in-scope file shares). The metadata
+    /// stays (placeholders), so the subtree is still navigable and re-hydrates on demand.
+    /// Returns the number of chunks reclaimed.
+    pub fn unsubscribe(provider: &SqliteProvider, node_id: &str) -> Result<usize> {
+        provider.unsubscribe(node_id)?;
+        Ok(provider.dehydrate_subtree(node_id)?)
+    }
+
     /// One whole-tree loop iteration: push the full tree, then pull remote changes.
     /// (Retained for the examples; the daemon uses [`sync_tick`](Self::sync_tick).)
     pub fn sync_once(
@@ -369,7 +417,15 @@ impl SyncEngine {
         inval: Option<&dyn Invalidate>,
     ) -> Result<i64> {
         Self::push_outbox(provider, client, io)?;
-        Self::pull_changes_paged_inval(provider, client, cursor, 500, inval)
+        let new_cursor = Self::pull_changes_paged_inval(provider, client, cursor, 500, inval)?;
+        // Selective sync: after applying the metadata delta, eagerly hydrate the *in-scope*
+        // files (the gate lives in `proactive_hydration_targets`). Out-of-scope subtrees are
+        // left as placeholders and hydrate on demand. Best-effort — a hydration failure is
+        // logged inside and never fails the tick (the cursor still advances; next tick retries).
+        if let Err(e) = Self::proactive_hydrate(provider, client, io) {
+            eprintln!("sync_tick: proactive hydrate pass failed (will retry next tick): {e}");
+        }
+        Ok(new_cursor)
     }
 }
 
