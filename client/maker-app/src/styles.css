@@ -397,3 +397,76 @@ button.danger { color: var(--err); border-color: var(--err); }
   margin-top: 0.6rem;
   min-height: 0;
 }
+
+/* ============================================================================
+   Library (catalog) view — extends the existing design tokens.
+   ============================================================================ */
+
+/* ---- view nav ---- */
+.viewnav { display: flex; gap: var(--s2); margin: var(--s1) 0 var(--s4); }
+.viewnav button { flex: 0 0 auto; }
+.viewnav button.active { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+/* ---- catalog toolbar ---- */
+.lib-toolbar { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.lib-search { flex: 1; min-width: 12rem; }
+.lib-tagbar { display: flex; flex-wrap: wrap; gap: var(--s1); margin: var(--s3) 0; }
+.chip {
+  border: 1px solid var(--line); border-radius: 999px; padding: 0.15rem 0.6rem;
+  cursor: pointer; font-size: 0.82rem; background: transparent; color: var(--ink);
+}
+.chip.on { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+/* ---- catalog grid ---- */
+.lib-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: var(--s3); margin-top: var(--s3);
+}
+.lib-card {
+  border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--s3);
+  cursor: pointer; position: relative; background: var(--card);
+}
+.lib-card:hover { border-color: var(--accent); }
+.lib-thumb {
+  aspect-ratio: 1 / 1; border-radius: var(--r-sm); background: var(--hover);
+  display: flex; align-items: center; justify-content: center; color: var(--muted);
+  font-size: 1.6rem; margin-bottom: var(--s2);
+}
+.lib-title { font-weight: 600; font-size: 0.9rem; line-height: 1.2; color: var(--ink); }
+.badge {
+  display: inline-block; font-size: 0.7rem; padding: 0.05rem 0.4rem; border-radius: 6px;
+  background: var(--hover); color: var(--muted); margin-top: var(--s1);
+}
+.fav { position: absolute; top: var(--s1); right: var(--s2); cursor: pointer; font-size: 1rem; color: var(--off); }
+.fav.on { color: #f5b301; }
+
+/* ---- collections + tasks board ---- */
+.lib-coll-list { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s3); }
+.lib-coll { border: 1px solid var(--line); border-radius: var(--r-sm); padding: var(--s1) var(--s3); cursor: pointer; background: var(--card); }
+.lib-coll:hover { border-color: var(--accent); }
+.lib-board { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s3); margin-top: var(--s3); }
+.lib-col { background: var(--hover); border-radius: var(--r-sm); padding: var(--s2); min-height: 80px; }
+.lib-col h4 { margin: 0.1rem 0 var(--s2); font-size: 0.78rem; text-transform: uppercase; color: var(--muted); }
+.task {
+  background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+  padding: var(--s1) var(--s2); margin-bottom: var(--s1); font-size: 0.85rem;
+  display: flex; justify-content: space-between; gap: var(--s1); align-items: center;
+}
+.task-acts { display: flex; gap: var(--s1); }
+.task button { padding: 0.1rem 0.35rem; font-size: 0.75rem; }
+
+/* ---- wide modal + file picker + attachments ---- */
+.modal-wide { max-width: 640px; width: 92vw; }
+.picker-list { max-height: 50vh; overflow: auto; margin-top: var(--s2); }
+.picker-row {
+  display: flex; justify-content: space-between; padding: var(--s1) var(--s2);
+  border-radius: 6px; cursor: pointer; color: var(--ink);
+}
+.picker-row:hover { background: var(--hover); }
+.picker-row.dir { color: var(--accent); }
+.attach-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: var(--s1) 0; border-bottom: 1px solid var(--line);
+}
+.instructions { margin: var(--s2) 0; line-height: 1.5; }
+.instructions code { background: var(--hover); padding: 0 0.25rem; border-radius: 4px; }

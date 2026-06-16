@@ -15,6 +15,12 @@
         </span>
       </header>
 
+      <nav class="viewnav" role="tablist" aria-label="Sections">
+        <button id="navSync" role="tab" aria-selected="true" class="active">Sync</button>
+        <button id="navLibrary" role="tab" aria-selected="false">Library</button>
+      </nav>
+
+      <div id="viewSync">
       <!-- Connection -->
       <section class="card">
         <h2>Connection</h2>
@@ -73,6 +79,48 @@
         </div>
         <div id="files" class="files hidden" role="tree" aria-label="Library files"></div>
       </section>
+      </div><!-- viewSync -->
+
+      <div id="viewLibrary" class="hidden">
+        <!-- Catalog toolbar -->
+        <section class="card">
+          <div class="lib-toolbar">
+            <input id="libSearch" class="lib-search" placeholder="Search the library…" autocomplete="off" />
+            <select id="libType" aria-label="Filter by type">
+              <option value="">All types</option>
+              <option value="model_3d">3D model</option>
+              <option value="cad">CAD</option>
+              <option value="lightburn">LightBurn</option>
+              <option value="electronics">Electronics</option>
+              <option value="other">Other</option>
+            </select>
+            <button id="libNewItem" class="primary">New item</button>
+          </div>
+          <div id="libTags" class="lib-tagbar" aria-label="Filter by tag"></div>
+          <div id="libGrid" class="lib-grid" aria-live="polite"></div>
+          <div id="libEmpty" class="muted hidden">No items yet. Click “New item” to add one.</div>
+        </section>
+
+        <!-- Collections -->
+        <section class="card">
+          <h2>Collections</h2>
+          <div class="row" style="margin-top:0">
+            <input id="collName" placeholder="New collection name" autocomplete="off" />
+            <button id="collCreate">Create</button>
+          </div>
+          <div id="collList" class="lib-coll-list"></div>
+        </section>
+
+        <!-- Tasks -->
+        <section class="card">
+          <h2>Tasks</h2>
+          <div class="row" style="margin-top:0">
+            <input id="taskTitle" placeholder="Add a task…" autocomplete="off" />
+            <button id="taskCreate">Add</button>
+          </div>
+          <div id="taskBoard" class="lib-board"></div>
+        </section>
+      </div><!-- viewLibrary -->
     </div>
 
     <!-- Conflict resolution -->
@@ -96,6 +144,32 @@
       </div>
     </div>
 
+    <!-- Item detail / edit -->
+    <div id="itemOverlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="itemTitle">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <h3 id="itemTitle">Item</h3>
+          <button id="itemClose" class="modal-close" aria-label="Close">&times;</button>
+        </div>
+        <div id="itemBody"></div>
+        <div id="itemErr" class="modal-err"></div>
+      </div>
+    </div>
+
+    <!-- File picker (reuses the synced tree from `browse`) -->
+    <div id="pickerOverlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
+      <div class="modal">
+        <div class="modal-head">
+          <h3 id="pickerTitle">Attach a file</h3>
+          <button id="pickerClose" class="modal-close" aria-label="Close">&times;</button>
+        </div>
+        <input id="pickerFilter" placeholder="Filter files…" autocomplete="off" />
+        <div id="pickerList" class="picker-list" role="listbox"></div>
+        <div id="pickerErr" class="modal-err"></div>
+      </div>
+    </div>
+
     <script type="module" src="/main.js"></script>
+    <script type="module" src="/library.js"></script>
   </body>
 </html>
