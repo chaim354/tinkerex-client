@@ -17,6 +17,8 @@ let mode = "new"; // "new" | "pair"
 
 /** Turn a raw error (often a Rust String) into something readable. */
 const errText = (e) => (e == null ? "Something went wrong" : String(e));
+// Escape before interpolating into innerHTML (error text may carry a raw server HTML body).
+function escHtml(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 
 const fmtSize = (n) =>
   n < 1024
@@ -252,7 +254,7 @@ const setFilesState = (html) => {
 const showFilesError = (msg) => {
   $("filesHint").textContent = "";
   setFilesState(
-    `<div class="state error"><span class="glyph">⚠️</span>${msg}` +
+    `<div class="state error"><span class="glyph">⚠️</span>${escHtml(msg)}` +
       `<div class="retry"><button id="filesRetry">Try again</button></div></div>`
   );
   $("filesRetry").onclick = loadFiles;
@@ -354,7 +356,7 @@ const toggleVersions = async (afterRow, nodeId, verBtn) => {
   try {
     versions = await invoke("file_versions", { ...args(), nodeId });
   } catch (e) {
-    panel.innerHTML = `<div class="err">${errText(e)}</div>`;
+    panel.innerHTML = `<div class="err">${escHtml(errText(e))}</div>`;
     return;
   }
   if (!versions.length) {

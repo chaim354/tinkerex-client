@@ -38,6 +38,12 @@ const libArgs = () => UI.args(); // { serverUrl, email }
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+// Only allow http(s) URLs as hrefs; blocks javascript:/data:/vbscript: etc.
+// Returns the URL when safe, otherwise null (caller renders no link).
+function safeHref(u) {
+  return /^https?:\/\//i.test(String(u || "")) ? String(u) : null;
+}
+
 // Overlays use the existing `.overlay.show` convention (see main.js / styles.css).
 const showOverlay = (id) => $(id).classList.add("show");
 const closeOverlay = (id) => $(id).classList.remove("show");
@@ -163,7 +169,11 @@ async function openItem(id) {
       .join("") || '<span class="muted">none</span>';
   $("itemBody").innerHTML = `
     <p class="muted">${esc(TYPE_LABEL[it.item_type] || it.item_type)} · ${esc(it.origin)}${
-      it.source_url ? ` · <a href="${esc(it.source_url)}" target="_blank" rel="noreferrer">source</a>` : ""
+      it.source_url
+        ? safeHref(it.source_url)
+          ? ` · <a href="${esc(safeHref(it.source_url))}" target="_blank" rel="noreferrer noopener">source</a>`
+          : ` · ${esc(it.source_url)}`
+        : ""
     }</p>
     ${it.summary ? `<p>${esc(it.summary)}</p>` : ""}
     <div class="instructions">${mdLite(it.instructions)}</div>
