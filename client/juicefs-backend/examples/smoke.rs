@@ -19,7 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = WebDavBackend::new(&base)?;
 
     let meta = backend.stat(&path).await?;
-    println!("stat {path}: dir={} size={} etag={:?}", meta.is_dir, meta.size, meta.etag);
+    println!(
+        "stat {path}: dir={} size={} etag={:?}",
+        meta.is_dir, meta.size, meta.etag
+    );
 
     if meta.is_dir {
         println!("listing {path}:");

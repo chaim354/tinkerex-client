@@ -51,7 +51,10 @@ fn rmdir_nonempty_is_not_empty_then_succeeds_when_emptied() {
 #[test]
 fn rename_missing_source_is_not_found() {
     let p = provider();
-    assert!(matches!(p.rename(ROOT, "nope", ROOT, "x"), Err(FsError::NotFound)));
+    assert!(matches!(
+        p.rename(ROOT, "nope", ROOT, "x"),
+        Err(FsError::NotFound)
+    ));
 }
 
 #[test]
@@ -63,7 +66,11 @@ fn rename_preserves_node_id_across_move() {
     let id_before = p.node_id_for(ino).unwrap().unwrap();
     p.rename(a.ino, "f", b.ino, "f").unwrap();
     let moved = p.lookup(b.ino, "f").unwrap();
-    assert_eq!(p.node_id_for(moved.ino).unwrap().unwrap(), id_before, "id stable across move");
+    assert_eq!(
+        p.node_id_for(moved.ino).unwrap().unwrap(),
+        id_before,
+        "id stable across move"
+    );
     assert!(matches!(p.lookup(a.ino, "f"), Err(FsError::NotFound)));
 }
 
@@ -77,16 +84,33 @@ fn rename_over_existing_file_replaces_it() {
     let tmp = write_file(&p, ROOT, "note.txt.tmp", b"new");
     let tmp_id = p.node_id_for(tmp).unwrap().unwrap();
 
-    p.rename(ROOT, "note.txt.tmp", ROOT, "note.txt").expect("atomic-save rename must succeed");
+    p.rename(ROOT, "note.txt.tmp", ROOT, "note.txt")
+        .expect("atomic-save rename must succeed");
 
     // Source name is gone; destination now holds the source's content + id.
-    assert!(matches!(p.lookup(ROOT, "note.txt.tmp"), Err(FsError::NotFound)));
+    assert!(matches!(
+        p.lookup(ROOT, "note.txt.tmp"),
+        Err(FsError::NotFound)
+    ));
     let dst = p.lookup(ROOT, "note.txt").unwrap();
-    assert_eq!(read_all(&p, dst.ino), b"new", "destination has the source's content");
-    assert_eq!(p.node_id_for(dst.ino).unwrap().unwrap(), tmp_id, "surviving id is the source's");
+    assert_eq!(
+        read_all(&p, dst.ino),
+        b"new",
+        "destination has the source's content"
+    );
+    assert_eq!(
+        p.node_id_for(dst.ino).unwrap().unwrap(),
+        tmp_id,
+        "surviving id is the source's"
+    );
 
     // Exactly one entry named note.txt remains (no duplicate row).
-    let n = p.readdir(ROOT).unwrap().iter().filter(|e| e.name == "note.txt").count();
+    let n = p
+        .readdir(ROOT)
+        .unwrap()
+        .iter()
+        .filter(|e| e.name == "note.txt")
+        .count();
     assert_eq!(n, 1, "no duplicate note.txt after replace");
 }
 
@@ -98,7 +122,10 @@ fn recreate_after_delete_gets_a_fresh_node_id() {
     p.unlink(ROOT, "f").unwrap();
     let f2 = write_file(&p, ROOT, "f", b"two");
     let id2 = p.node_id_for(f2).unwrap().unwrap();
-    assert_ne!(id1, id2, "a re-created path is a new node, not a resurrection");
+    assert_ne!(
+        id1, id2,
+        "a re-created path is a new node, not a resurrection"
+    );
 }
 
 #[test]

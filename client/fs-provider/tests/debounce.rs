@@ -39,18 +39,29 @@ fn rapid_saves_coalesce_to_one_pending_push_of_final_bytes() {
     // The outbox already coalesces same-node edits to ONE row (the design's free win):
     // five flushes → a single (node_id, upsert) entry.
     let raw = p.outbox_list().unwrap();
-    assert_eq!(raw, vec![(id.clone(), "upsert".to_string())], "five saves → one outbox row");
+    assert_eq!(
+        raw,
+        vec![(id.clone(), "upsert".to_string())],
+        "five saves → one outbox row"
+    );
 
     // With a debounce window WIDER than the burst, the node is still "hot" (just touched),
     // so the ready set is EMPTY — we hold it, coalescing with any further save.
     let ready = p.outbox_ready_topo(10_000, 60_000).unwrap();
-    assert!(ready.is_empty(), "a freshly-saved node is held inside the debounce window");
+    assert!(
+        ready.is_empty(),
+        "a freshly-saved node is held inside the debounce window"
+    );
 
     // Once the node has been quiet longer than the window, it becomes ready and will push
     // exactly once — carrying the FINAL bytes (the manifest of the last write).
     sleep(Duration::from_millis(120));
     let ready = p.outbox_ready_topo(100, 60_000).unwrap();
-    assert_eq!(ready, vec![(id.clone(), "upsert".to_string())], "quiesced node flushes once");
+    assert_eq!(
+        ready,
+        vec![(id.clone(), "upsert".to_string())],
+        "quiesced node flushes once"
+    );
 
     // And the content it will push is the LAST save (value 4), proving no intermediate
     // state was committed and the final state is not lost.
@@ -77,7 +88,11 @@ fn max_age_cap_flushes_a_continuously_resaved_file() {
     }
     // window huge (always hot) but max_age 0 → the cap fires, node is ready.
     let ready = p.outbox_ready_topo(10_000, 0).unwrap();
-    assert_eq!(ready, vec![(id, "upsert".to_string())], "max-age cap flushes a hot node");
+    assert_eq!(
+        ready,
+        vec![(id, "upsert".to_string())],
+        "max-age cap flushes a hot node"
+    );
 }
 
 #[test]
@@ -92,7 +107,11 @@ fn deletes_are_never_debounced() {
     // Even with a very wide window, the delete is ready immediately (low-volume,
     // user-visible — push promptly).
     let ready = p.outbox_ready_topo(60_000, 600_000).unwrap();
-    assert_eq!(ready, vec![(id, "delete".to_string())], "deletes bypass the debounce");
+    assert_eq!(
+        ready,
+        vec![(id, "delete".to_string())],
+        "deletes bypass the debounce"
+    );
 }
 
 #[test]

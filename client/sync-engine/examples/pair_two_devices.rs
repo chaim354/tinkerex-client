@@ -27,10 +27,16 @@ fn main() {
         .next()
         .or_else(|| std::env::var("SERVER_URL").ok())
         .unwrap_or_else(|| "http://localhost:3001".to_string());
-    let email = args.next().or_else(|| std::env::var("EMAIL").ok()).unwrap_or_else(|| {
-        let tag = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        format!("twodev-{tag:x}@example.com")
-    });
+    let email = args
+        .next()
+        .or_else(|| std::env::var("EMAIL").ok())
+        .unwrap_or_else(|| {
+            let tag = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            format!("twodev-{tag:x}@example.com")
+        });
 
     // Device A creates the (confirmed) account + enrolls — the app's `sync_login` first-run path.
     let password = "correct horse battery staple";

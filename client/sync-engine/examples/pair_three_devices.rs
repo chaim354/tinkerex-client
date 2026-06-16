@@ -37,7 +37,10 @@ fn main() {
 
     // A unique per-run tag: drives both the unique email (so concurrent/repeat runs never collide
     // on the new-account-only `register`) and the test filename suffix the three machines agree on.
-    let tag = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let tag = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let test_tag = format!("{tag:x}");
     let email = args
         .next()

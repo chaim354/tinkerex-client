@@ -24,14 +24,20 @@ macro_rules! server_url {
         match std::env::var("SYNC_IT_SERVER_URL").or_else(|_| std::env::var("SERVER_URL")) {
             Ok(u) => u,
             Err(_) => {
-                eprintln!("SKIPPED (set SYNC_IT_SERVER_URL or SERVER_URL to run engine integration)");
+                eprintln!(
+                    "SKIPPED (set SYNC_IT_SERVER_URL or SERVER_URL to run engine integration)"
+                );
                 return;
             }
         }
     };
 }
 
-const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+const TINY: ChunkConfig = ChunkConfig {
+    min: 64,
+    avg: 256,
+    max: 1024,
+};
 
 fn uniq() -> String {
     // Time alone collides across parallel test threads (same nanosecond) → duplicate
@@ -39,7 +45,14 @@ fn uniq() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), n)
+    format!(
+        "{:x}-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        n
+    )
 }
 
 /// A device with its own **isolated** local tree + chunk store. (Not `temp()`, which is
@@ -52,17 +65,27 @@ fn dev() -> SqliteProvider {
 
 fn read_all(p: &SqliteProvider, ino: u64) -> Vec<u8> {
     let size = p.getattr(ino).unwrap().size;
-    if size == 0 { Vec::new() } else { p.read(ino, 0, size as u32).unwrap() }
+    if size == 0 {
+        Vec::new()
+    } else {
+        p.read(ino, 0, size as u32).unwrap()
+    }
 }
 
 /// Register a fresh library (device A) + a second device B on it; returns both clients
 /// and a shared "cloud" chunk store between them.
 fn two_devices(url: &str) -> (ServerClient, ServerClient, SharedDirIO) {
     let mut a = ServerClient::new(url);
-    a.enroll(&format!("it-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
+    a.enroll(
+        &format!("it-{}@example.com", uniq()),
+        "correct horse battery staple",
+        "device-A",
+    )
+    .expect("register A");
     let dev_b = a.create_device("device-B").expect("create device B");
     let b = ServerClient::with_token(url, dev_b.device_token);
-    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("it-cloud-{}", uniq()))).unwrap();
+    let cloud =
+        SharedDirIO::new(std::env::temp_dir().join(format!("it-cloud-{}", uniq()))).unwrap();
     (a, b, cloud)
 }
 
@@ -115,13 +138,20 @@ fn delete_and_move_converge_via_delta() {
     assert!(b.lookup(b_inbox, "trash.txt").is_ok());
 
     a.unlink(inbox.ino, "trash.txt").unwrap();
-    a.rename(inbox.ino, "note.txt", archive.ino, "note.txt").unwrap();
+    a.rename(inbox.ino, "note.txt", archive.ino, "note.txt")
+        .unwrap();
     SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push delta");
 
     SyncEngine::pull_changes(&b, &cb, cursor).expect("B delta pull");
     assert!(b.lookup(b_inbox, "trash.txt").is_err(), "delete propagated");
-    assert!(b.lookup(b_archive, "note.txt").is_ok(), "move landed at new path");
-    assert!(b.lookup(b_inbox, "note.txt").is_err(), "no duplicate at old path");
+    assert!(
+        b.lookup(b_archive, "note.txt").is_ok(),
+        "move landed at new path"
+    );
+    assert!(
+        b.lookup(b_inbox, "note.txt").is_err(),
+        "no duplicate at old path"
+    );
 }
 
 // ---- sequential edits fast-forward (no false conflict) -----------------------------
@@ -146,7 +176,10 @@ fn sequential_edits_fast_forward_without_a_conflict() {
     a.flush(f.ino).unwrap();
     SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
 
-    assert!(cb.conflicts().unwrap().conflicts.is_empty(), "sequential edits don't conflict");
+    assert!(
+        cb.conflicts().unwrap().conflicts.is_empty(),
+        "sequential edits don't conflict"
+    );
     // A second device sees the latest, no conflict.
     let b = dev();
     SyncEngine::pull_snapshot(&b, &cb).unwrap();
@@ -175,10 +208,16 @@ fn hydrate_fetches_only_missing_and_is_idempotent() {
     // Before hydration B knows the manifest but holds none of the chunks.
     let hashes = b.node_manifest_hashes(&node_id).unwrap();
     assert!(hashes.len() > 1, "tiny chunks → many hashes");
-    assert!(hashes.iter().all(|h| !b.has_chunk(h)), "no chunks cached pre-hydrate");
+    assert!(
+        hashes.iter().all(|h| !b.has_chunk(h)),
+        "no chunks cached pre-hydrate"
+    );
 
     SyncEngine::hydrate(&b, &cb, &cloud, &node_id).expect("hydrate");
-    assert!(hashes.iter().all(|h| b.has_chunk(h)), "all chunks present post-hydrate");
+    assert!(
+        hashes.iter().all(|h| b.has_chunk(h)),
+        "all chunks present post-hydrate"
+    );
     assert_eq!(read_all(&b, bf.ino), body);
 
     // Re-hydrate is a no-op (nothing missing) and content still reads correctly.
@@ -213,7 +252,12 @@ impl CountingIO {
     }
 }
 impl ChunkIO for CountingIO {
-    fn put(&self, hash: &str, urls: &HashMap<String, String>, bytes: Vec<u8>) -> sync_engine::Result<()> {
+    fn put(
+        &self,
+        hash: &str,
+        urls: &HashMap<String, String>,
+        bytes: Vec<u8>,
+    ) -> sync_engine::Result<()> {
         self.put.lock().unwrap().push(hash.to_string());
         self.inner.put(hash, urls, bytes)
     }
@@ -231,7 +275,9 @@ fn range_hydration_fetches_only_overlapping_chunks() {
     // A pushes a multi-chunk file (tiny CDC → many chunks).
     let a = dev();
     let f = a.create(ROOT_INO, "huge.stl").unwrap();
-    let body: Vec<u8> = (0..30_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let body: Vec<u8> = (0..30_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
     a.write(f.ino, 0, &body).unwrap();
     a.flush(f.ino).unwrap();
     SyncEngine::push(&a, &ca, &cloud).expect("A push");
@@ -242,16 +288,27 @@ fn range_hydration_fetches_only_overlapping_chunks() {
     let node_id = b.node_id_for(bf.ino).unwrap().unwrap();
 
     let all_hashes = b.node_manifest_hashes(&node_id).unwrap();
-    assert!(all_hashes.len() >= 4, "need several chunks to make range meaningful, got {}", all_hashes.len());
-    assert!(all_hashes.iter().all(|h| !b.has_chunk(h)), "no chunks cached pre-hydrate");
+    assert!(
+        all_hashes.len() >= 4,
+        "need several chunks to make range meaningful, got {}",
+        all_hashes.len()
+    );
+    assert!(
+        all_hashes.iter().all(|h| !b.has_chunk(h)),
+        "no chunks cached pre-hydrate"
+    );
 
     let counting = CountingIO::new(cloud);
 
     // --- Read just the first 100 bytes (a header read). Range hydration must fetch ONLY the
     // chunk(s) overlapping [0, 100) — a strict subset of the manifest.
     let head_expected = b.manifest_range_hashes(&node_id, 0, 100).unwrap();
-    assert!(!head_expected.is_empty() && head_expected.len() < all_hashes.len(),
-        "header range overlaps a strict subset: {} of {}", head_expected.len(), all_hashes.len());
+    assert!(
+        !head_expected.is_empty() && head_expected.len() < all_hashes.len(),
+        "header range overlaps a strict subset: {} of {}",
+        head_expected.len(),
+        all_hashes.len()
+    );
 
     SyncEngine::hydrate_range(&b, &cb, &counting, &node_id, 0, 100).expect("range hydrate head");
 
@@ -259,13 +316,22 @@ fn range_hydration_fetches_only_overlapping_chunks() {
     let fetched_head = counting.fetched();
     let fetched_set: std::collections::HashSet<_> = fetched_head.iter().cloned().collect();
     let expected_set: std::collections::HashSet<_> = head_expected.iter().cloned().collect();
-    assert_eq!(fetched_set, expected_set, "fetched exactly the header-overlapping chunks");
+    assert_eq!(
+        fetched_set, expected_set,
+        "fetched exactly the header-overlapping chunks"
+    );
     // The cache holds only those chunks; the rest of the file is still un-hydrated.
     for h in &head_expected {
         assert!(b.has_chunk(h), "header chunk {h} now cached");
     }
-    let not_in_head: Vec<&String> = all_hashes.iter().filter(|h| !expected_set.contains(*h)).collect();
-    assert!(not_in_head.iter().any(|h| !b.has_chunk(h)), "chunks outside the header range stay un-hydrated");
+    let not_in_head: Vec<&String> = all_hashes
+        .iter()
+        .filter(|h| !expected_set.contains(*h))
+        .collect();
+    assert!(
+        not_in_head.iter().any(|h| !b.has_chunk(h)),
+        "chunks outside the header range stay un-hydrated"
+    );
 
     // And the header bytes read back correctly from the partial cache.
     assert_eq!(b.read(bf.ino, 0, 100).unwrap(), &body[..100]);
@@ -273,15 +339,20 @@ fn range_hydration_fetches_only_overlapping_chunks() {
     // --- Now read a LATER range; only its (still-missing) chunks should be fetched.
     let later_off = 25_000u64;
     let later_len = 200u64;
-    let later_expected = b.manifest_range_hashes(&node_id, later_off, later_len).unwrap();
+    let later_expected = b
+        .manifest_range_hashes(&node_id, later_off, later_len)
+        .unwrap();
     let before = counting.fetched().len();
-    SyncEngine::hydrate_range(&b, &cb, &counting, &node_id, later_off, later_len).expect("range hydrate tail");
+    SyncEngine::hydrate_range(&b, &cb, &counting, &node_id, later_off, later_len)
+        .expect("range hydrate tail");
     let newly_fetched: Vec<String> = counting.fetched()[before..].to_vec();
     // Only the later range's not-yet-cached chunks were fetched this round (any that happened
     // to overlap the header — unlikely here — would already be cached and skipped).
     let later_set: std::collections::HashSet<_> = later_expected.iter().cloned().collect();
-    assert!(newly_fetched.iter().all(|h| later_set.contains(h)),
-        "second hydrate fetched only chunks of the later range");
+    assert!(
+        newly_fetched.iter().all(|h| later_set.contains(h)),
+        "second hydrate fetched only chunks of the later range"
+    );
     assert_eq!(
         b.read(bf.ino, later_off, later_len as u32).unwrap(),
         &body[later_off as usize..(later_off + later_len) as usize]
@@ -289,8 +360,15 @@ fn range_hydration_fetches_only_overlapping_chunks() {
 
     // --- Finally a whole-file hydrate fills the rest; the full read is byte-perfect.
     SyncEngine::hydrate(&b, &cb, &counting, &node_id).expect("full hydrate");
-    assert!(all_hashes.iter().all(|h| b.has_chunk(h)), "every chunk cached after full hydrate");
-    assert_eq!(read_all(&b, bf.ino), body, "whole file byte-for-byte after full hydrate");
+    assert!(
+        all_hashes.iter().all(|h| b.has_chunk(h)),
+        "every chunk cached after full hydrate"
+    );
+    assert_eq!(
+        read_all(&b, bf.ino),
+        body,
+        "whole file byte-for-byte after full hydrate"
+    );
 }
 
 // ---- push dedup / idempotency ------------------------------------------------------
@@ -314,7 +392,15 @@ fn re_push_of_identical_content_dedups_and_stays_consistent() {
 
     let b = dev();
     SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
-    assert_eq!(b.readdir(ROOT_INO).unwrap().iter().filter(|e| e.name == "f.bin").count(), 1, "no dup node");
+    assert_eq!(
+        b.readdir(ROOT_INO)
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == "f.bin")
+            .count(),
+        1,
+        "no dup node"
+    );
     let bf = b.lookup(ROOT_INO, "f.bin").unwrap();
     let node_id = b.node_id_for(bf.ino).unwrap().unwrap();
     SyncEngine::hydrate(&b, &cb, &cloud, &node_id).expect("hydrate");
@@ -332,7 +418,8 @@ fn device_login_adds_a_device_to_an_existing_library() {
     // Device A creates the (confirmed) account + enrolls, then pushes a file.
     let mut ca = ServerClient::new(&url);
     ca.enroll(&email, password, "device-A").expect("enroll A");
-    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("login-cloud-{}", uniq()))).unwrap();
+    let cloud =
+        SharedDirIO::new(std::env::temp_dir().join(format!("login-cloud-{}", uniq()))).unwrap();
     let a = dev();
     let f = a.create(ROOT_INO, "shared.txt").unwrap();
     a.write(f.ino, 0, b"hello from A").unwrap();
@@ -342,16 +429,22 @@ fn device_login_adds_a_device_to_an_existing_library() {
     // A brand-new device B enrolls by logging in with the SAME account credentials (the
     // Dropbox model — each device authenticates independently; no pairing code).
     let mut cb = ServerClient::new(&url);
-    cb.device_login(&email, password, "device-B").expect("B logs in");
+    cb.device_login(&email, password, "device-B")
+        .expect("B logs in");
 
     // B is now a real device on the same library — it sees A's file.
     let b = dev();
     SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
-    assert!(b.lookup(ROOT_INO, "shared.txt").is_ok(), "device B sees A's library");
+    assert!(
+        b.lookup(ROOT_INO, "shared.txt").is_ok(),
+        "device B sees A's library"
+    );
 
     // A wrong password cannot enroll a device.
     assert!(
-        ServerClient::new(&url).device_login(&email, "wrong-password", "device-C").is_err(),
+        ServerClient::new(&url)
+            .device_login(&email, "wrong-password", "device-C")
+            .is_err(),
         "wrong credentials are rejected"
     );
 }
@@ -375,7 +468,11 @@ fn executable_bit_propagates_across_devices() {
     let b = dev();
     SyncEngine::pull_snapshot(&b, &cb).unwrap();
     let bf = b.lookup(ROOT_INO, "flash.sh").unwrap();
-    assert_eq!(b.getattr(bf.ino).unwrap().mode, 0o755, "chmod +x on A is visible on B");
+    assert_eq!(
+        b.getattr(bf.ino).unwrap().mode,
+        0o755,
+        "chmod +x on A is visible on B"
+    );
 }
 
 // ---- symlink sync (metadata-only node; target on the wire) --------------------------
@@ -403,15 +500,31 @@ fn symlink_roundtrips_across_devices() {
     // B converges via the delta (exercises `change_to_sync`).
     SyncEngine::pull_changes(&b, &cb, cursor).unwrap();
     let bl = b.lookup(ROOT_INO, "libfoo.so").expect("B has the symlink");
-    assert_eq!(bl.kind, fs_provider::Kind::Symlink, "B sees a symlink kind (delta)");
-    assert_eq!(b.readlink(bl.ino).unwrap(), target, "A → server → B link target byte-for-byte (delta)");
+    assert_eq!(
+        bl.kind,
+        fs_provider::Kind::Symlink,
+        "B sees a symlink kind (delta)"
+    );
+    assert_eq!(
+        b.readlink(bl.ino).unwrap(),
+        target,
+        "A → server → B link target byte-for-byte (delta)"
+    );
 
     // A brand-new device converges via the full SNAPSHOT (exercises `tree_node_to_sync`).
     let c = dev();
     SyncEngine::pull_snapshot(&c, &cb).unwrap();
     let cl = c.lookup(ROOT_INO, "libfoo.so").expect("C has the symlink");
-    assert_eq!(cl.kind, fs_provider::Kind::Symlink, "C sees a symlink kind (snapshot)");
-    assert_eq!(c.readlink(cl.ino).unwrap(), target, "snapshot also carries the link target");
+    assert_eq!(
+        cl.kind,
+        fs_provider::Kind::Symlink,
+        "C sees a symlink kind (snapshot)"
+    );
+    assert_eq!(
+        c.readlink(cl.ino).unwrap(),
+        target,
+        "snapshot also carries the link target"
+    );
 }
 
 // ---- offline availability after hydration (cross-platform) --------------------------
@@ -420,7 +533,12 @@ fn symlink_roundtrips_across_devices() {
 /// hydration never touches the network — the bytes come from the local cache.
 struct OfflineIO;
 impl ChunkIO for OfflineIO {
-    fn put(&self, hash: &str, _urls: &HashMap<String, String>, _bytes: Vec<u8>) -> sync_engine::Result<()> {
+    fn put(
+        &self,
+        hash: &str,
+        _urls: &HashMap<String, String>,
+        _bytes: Vec<u8>,
+    ) -> sync_engine::Result<()> {
         Err(sync_engine::Error::NoUrl(format!("offline: {hash}")))
     }
     fn get(&self, hash: &str, _url: Option<&str>) -> sync_engine::Result<Vec<u8>> {
@@ -456,11 +574,15 @@ fn hydrated_file_stays_readable_offline() {
 
     // Now go OFFLINE: an unreachable server + a chunk source that errors on every fetch.
     let dead = ServerClient::new("http://127.0.0.1:9"); // nothing listening
-    // A re-hydrate must NOT contact the network — all chunks are already cached, so it finds
-    // nothing missing and never calls the (failing) transport or the (dead) server.
+                                                        // A re-hydrate must NOT contact the network — all chunks are already cached, so it finds
+                                                        // nothing missing and never calls the (failing) transport or the (dead) server.
     SyncEngine::hydrate(&b, &dead, &OfflineIO, &node_id).expect("offline re-hydrate is a no-op");
     // And the file still reads byte-for-byte, served entirely from the local cache.
-    assert_eq!(read_all(&b, bf.ino), body, "hydrated file reads OFFLINE from the local cache");
+    assert_eq!(
+        read_all(&b, bf.ino),
+        body,
+        "hydrated file reads OFFLINE from the local cache"
+    );
 }
 
 // ---- real mtime preservation across devices ----------------------------------------
@@ -486,7 +608,11 @@ fn real_mtime_propagates_across_devices() {
     let b = dev();
     SyncEngine::pull_snapshot(&b, &cb).unwrap();
     let bf = b.lookup(ROOT_INO, "old.txt").unwrap();
-    assert_eq!(b.getattr(bf.ino).unwrap().mtime, old_mtime, "A's real mtime is visible on B, verbatim");
+    assert_eq!(
+        b.getattr(bf.ino).unwrap().mtime,
+        old_mtime,
+        "A's real mtime is visible on B, verbatim"
+    );
 }
 
 // ---- best-effort cross-device advisory lock ----------------------------------------
@@ -507,7 +633,12 @@ fn best_effort_lock_coordinates_connected_devices() {
     assert_eq!(b.device_name.as_deref(), Some("device-A"));
 
     // It shows up in the active-locks list (for the browser's indicators).
-    assert!(ca.locks().unwrap().locks.iter().any(|l| l.node_id == node && l.held));
+    assert!(ca
+        .locks()
+        .unwrap()
+        .locks
+        .iter()
+        .any(|l| l.node_id == node && l.held));
 
     // A releases → B can now acquire.
     ca.unlock(&node).expect("A unlock");
@@ -551,12 +682,18 @@ fn offline_divergent_edit_raises_a_conflict() {
     assert_eq!(conflicts.len(), 1, "B's stale-based edit raised a conflict");
     let c = &conflicts[0];
     assert_eq!(c.name.as_deref(), Some("design.scad"));
-    assert!(c.current.is_some() && c.incoming.is_some(), "both sides reported (device + time)");
+    assert!(
+        c.current.is_some() && c.incoming.is_some(),
+        "both sides reported (device + time)"
+    );
 
     // Resolve by splitting → a new sibling conflicted-copy node, conflict cleared.
     let split = cb.resolve_conflict_split(&c.node_id).unwrap();
     assert!(!split.split_node_id.is_empty());
-    assert!(cb.conflicts().unwrap().conflicts.is_empty(), "resolved after split");
+    assert!(
+        cb.conflicts().unwrap().conflicts.is_empty(),
+        "resolved after split"
+    );
 }
 
 // ---- freshness-on-access (the on-open catch-up pull) -------------------------------
@@ -591,12 +728,20 @@ fn freshness_check_on_access_serves_latest_after_remote_change() {
     SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
 
     // RED: with no freshness check, B keeps serving the stale local copy.
-    assert_eq!(read_all(&b, bf.ino), b"version one", "stale until B catches up (the gap freshness-on-open closes)");
+    assert_eq!(
+        read_all(&b, bf.ino),
+        b"version one",
+        "stale until B catches up (the gap freshness-on-open closes)"
+    );
 
     // GREEN: the on-access catch-up pull (+ lazy re-hydrate of the new manifest) → latest.
     SyncEngine::pull_changes(&b, &cb, cursor).expect("freshness catch-up pull");
     SyncEngine::hydrate(&b, &cb, &cloud, &node).expect("hydrate the new manifest");
-    assert_eq!(read_all(&b, bf.ino), b"version two is newer", "fresh after the on-access pull");
+    assert_eq!(
+        read_all(&b, bf.ino),
+        b"version two is newer",
+        "fresh after the on-access pull"
+    );
 }
 
 // ---- offline reconnect: paging through a large backlog -----------------------------
@@ -619,12 +764,23 @@ fn pull_changes_pages_through_a_backlog_without_dropping_entries() {
     // B is far behind (cursor 0). Page size 5 → ~5 round-trips.
     let b = dev();
     let head = SyncEngine::pull_changes_paged(&b, &cb, 0, 5).expect("B pages the backlog");
-    let names: std::collections::HashSet<String> =
-        b.readdir(ROOT_INO).unwrap().into_iter().map(|e| e.name).collect();
+    let names: std::collections::HashSet<String> = b
+        .readdir(ROOT_INO)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
     for i in 0..total {
-        assert!(names.contains(&format!("d{i:02}")), "d{i:02} must survive paging");
+        assert!(
+            names.contains(&format!("d{i:02}")),
+            "d{i:02} must survive paging"
+        );
     }
-    assert_eq!(names.len(), total, "every backlog entry applied, none dropped");
+    assert_eq!(
+        names.len(),
+        total,
+        "every backlog entry applied, none dropped"
+    );
     assert!(head > 0, "cursor advanced to head");
 
     // A follow-up pull from the returned cursor is a clean no-op (fully caught up).
@@ -668,10 +824,22 @@ fn offline_writes_reconcile_with_remote_changes_on_reconnect() {
     SyncEngine::pull_changes(&a, &ca, b_cur).expect("A pulls B's reconnect push");
 
     // Both devices now hold both files.
-    assert!(b.lookup(b_shared, "from_a.txt").is_ok(), "B got A's offline-era file");
-    assert!(b.lookup(b_shared, "from_b.txt").is_ok(), "B kept its own offline file");
-    assert!(a.lookup(a_shared, "from_b.txt").is_ok(), "A got B's queued file");
-    assert!(a.lookup(a_shared, "from_a.txt").is_ok(), "A kept its own file");
+    assert!(
+        b.lookup(b_shared, "from_a.txt").is_ok(),
+        "B got A's offline-era file"
+    );
+    assert!(
+        b.lookup(b_shared, "from_b.txt").is_ok(),
+        "B kept its own offline file"
+    );
+    assert!(
+        a.lookup(a_shared, "from_b.txt").is_ok(),
+        "A got B's queued file"
+    );
+    assert!(
+        a.lookup(a_shared, "from_a.txt").is_ok(),
+        "A kept its own file"
+    );
 }
 
 // ---- hydrate after a conflict (manifest swapped by a pull) --------------------------
@@ -703,7 +871,11 @@ fn hydrate_reads_the_winning_version_after_a_conflict() {
     SyncEngine::pull_changes(&a, &ca, b_cur).expect("A pulls B's edit");
     let node = a.node_id_for(f.ino).unwrap().unwrap();
     SyncEngine::hydrate(&a, &ca, &cloud, &node).expect("A hydrates the swapped-in manifest");
-    assert_eq!(read_all(&a, f.ino), winner, "A reads B's winning content after hydrate");
+    assert_eq!(
+        read_all(&a, f.ino),
+        winner,
+        "A reads B's winning content after hydrate"
+    );
 }
 
 // ---- cursor monotonicity / delta idempotency ---------------------------------------
@@ -731,7 +903,11 @@ fn cursor_advances_and_redelivered_delta_is_idempotent() {
     let snap = b.readdir(ROOT_INO).unwrap().len();
     let c2 = SyncEngine::pull_changes(&b, &cb, c0).expect("re-delivered delta");
     assert_eq!(c2, c1, "head_seq stable on replay");
-    assert_eq!(b.readdir(ROOT_INO).unwrap().len(), snap, "replay is idempotent");
+    assert_eq!(
+        b.readdir(ROOT_INO).unwrap().len(),
+        snap,
+        "replay is idempotent"
+    );
 }
 
 // ---- BUG #1 regression: move into a newer dir (topological outbox drain) ------------
@@ -767,8 +943,15 @@ fn move_into_newer_dir_pushes_parent_before_child() {
     SyncEngine::pull_changes(&b, &cb, 0).expect("B delta pull converges (no abort)");
     let b_d = b.lookup(ROOT_INO, "D").expect("B has dir D");
     let b_f = b.lookup(b_d.ino, "F.txt").expect("B has F under D");
-    assert_eq!(b.node_id_for(b_f.ino).unwrap().unwrap(), f_id, "same node F moved into D");
-    assert!(b.lookup(ROOT_INO, "F.txt").is_err(), "F is no longer at root");
+    assert_eq!(
+        b.node_id_for(b_f.ino).unwrap().unwrap(),
+        f_id,
+        "same node F moved into D"
+    );
+    assert!(
+        b.lookup(ROOT_INO, "F.txt").is_err(),
+        "F is no longer at root"
+    );
 
     SyncEngine::hydrate(&b, &cb, &cloud, &f_id).expect("B hydrate");
     assert_eq!(read_all(&b, b_f.ino), b"hello world", "F content intact");
@@ -812,10 +995,20 @@ fn move_out_then_delete_parent_converges_via_delta() {
 
     let c_id = a.node_id_for(c.ino).unwrap().unwrap();
     let q_id = a.node_id_for(q.ino).unwrap().unwrap();
-    let rc = b.sync_node(&c_id).unwrap().expect("C survives move-out + parent delete");
-    assert_eq!(rc.parent_node_id.as_deref(), Some(q_id.as_str()), "C re-parented to Q");
+    let rc = b
+        .sync_node(&c_id)
+        .unwrap()
+        .expect("C survives move-out + parent delete");
+    assert_eq!(
+        rc.parent_node_id.as_deref(),
+        Some(q_id.as_str()),
+        "C re-parented to Q"
+    );
     let leaf_id = a.node_id_for(leaf.ino).unwrap().unwrap();
-    assert!(b.sync_node(&leaf_id).unwrap().is_some(), "the leaf survived (no data loss)");
+    assert!(
+        b.sync_node(&leaf_id).unwrap().is_some(),
+        "the leaf survived (no data loss)"
+    );
     assert!(b.lookup(ROOT_INO, "P").is_err(), "P is gone on the replica");
 
     // Bytes intact end-to-end.
@@ -873,7 +1066,10 @@ fn local_rename_vs_remote_create_same_name_reconciles_no_loss() {
     // A renames F → "renamed" LOCALLY (un-pushed — F's outbox upsert is pending).
     a.rename(dir.ino, "shared", dir.ino, "renamed").unwrap();
     assert!(
-        a.outbox_list().unwrap().iter().any(|(id, op)| id == &f_id && op == "upsert"),
+        a.outbox_list()
+            .unwrap()
+            .iter()
+            .any(|(id, op)| id == &f_id && op == "upsert"),
         "precondition: F's local rename is queued, un-pushed"
     );
 
@@ -885,25 +1081,49 @@ fn local_rename_vs_remote_create_same_name_reconciles_no_loss() {
     // CONVERGENCE WITH NO SILENT LOSS:
     // - F is STILL present on A (re-added by the reconcile under its server name "shared" —
     //   the server never deleted it; A's un-pushed rename simply lost the name race to R).
-    let f_node = a.sync_node(&f_id).unwrap().expect("F survives (reconcile re-added it) — no silent loss");
-    assert_eq!(f_node.name, "shared", "F kept its server-authoritative name (the rename lost the race)");
-    assert_eq!(f_node.parent_node_id.as_deref(), Some(dir_id.as_str()), "F still under dir");
+    let f_node = a
+        .sync_node(&f_id)
+        .unwrap()
+        .expect("F survives (reconcile re-added it) — no silent loss");
+    assert_eq!(
+        f_node.name, "shared",
+        "F kept its server-authoritative name (the rename lost the race)"
+    );
+    assert_eq!(
+        f_node.parent_node_id.as_deref(),
+        Some(dir_id.as_str()),
+        "F still under dir"
+    );
     // - R is present at "renamed" (the authoritative winner of the name).
     let r_node = a.sync_node(&r_id).unwrap().expect("R present on A");
     assert_eq!(r_node.name, "renamed");
     // - Both files' bytes are intact end-to-end.
     SyncEngine::hydrate(&a, &ca, &cloud, &f_id).expect("hydrate F");
     SyncEngine::hydrate(&a, &ca, &cloud, &r_id).expect("hydrate R");
-    assert_eq!(read_all(&a, a.ino_for_node_id(&f_id).unwrap().unwrap()), b"F-bytes", "F bytes intact");
-    assert_eq!(read_all(&a, a.ino_for_node_id(&r_id).unwrap().unwrap()), b"R-bytes", "R bytes intact");
+    assert_eq!(
+        read_all(&a, a.ino_for_node_id(&f_id).unwrap().unwrap()),
+        b"F-bytes",
+        "F bytes intact"
+    );
+    assert_eq!(
+        read_all(&a, a.ino_for_node_id(&r_id).unwrap().unwrap()),
+        b"R-bytes",
+        "R bytes intact"
+    );
 
     // Full convergence under dir: exactly the authoritative R ("renamed") + the re-added F
     // ("shared"), no orphan/duplicate.
-    let names: std::collections::BTreeSet<String> =
-        a.readdir(dir.ino).unwrap().into_iter().map(|e| e.name).collect();
+    let names: std::collections::BTreeSet<String> = a
+        .readdir(dir.ino)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
     assert_eq!(
         names,
-        ["renamed".to_string(), "shared".to_string()].into_iter().collect(),
+        ["renamed".to_string(), "shared".to_string()]
+            .into_iter()
+            .collect(),
         "A converged: both the authoritative R (renamed) and the re-added F (shared) present"
     );
 }
@@ -951,39 +1171,78 @@ fn selective_sync_gates_proactive_hydration_but_not_on_demand() {
     // B's policy: default-exclude, include only Active.
     b.set_subscription_default(SubRule::Exclude).unwrap();
     b.subscribe(&b_active_id).unwrap();
-    assert!(b.proactively_hydrate(&b_af_id).unwrap(), "Active file in scope");
-    assert!(!b.proactively_hydrate(&b_arf_id).unwrap(), "Archive file out of scope");
+    assert!(
+        b.proactively_hydrate(&b_af_id).unwrap(),
+        "Active file in scope"
+    );
+    assert!(
+        !b.proactively_hydrate(&b_arf_id).unwrap(),
+        "Archive file out of scope"
+    );
 
     // Neither file's bytes are local yet.
-    assert!(b.node_manifest_hashes(&b_af_id).unwrap().iter().any(|h| !b.has_chunk(h)));
-    assert!(b.node_manifest_hashes(&b_arf_id).unwrap().iter().any(|h| !b.has_chunk(h)));
+    assert!(b
+        .node_manifest_hashes(&b_af_id)
+        .unwrap()
+        .iter()
+        .any(|h| !b.has_chunk(h)));
+    assert!(b
+        .node_manifest_hashes(&b_arf_id)
+        .unwrap()
+        .iter()
+        .any(|h| !b.has_chunk(h)));
 
     // Proactive hydration: only the in-scope (Active) file is brought resident.
     SyncEngine::proactive_hydrate(&b, &cb, &cloud).expect("B proactive hydrate");
     assert!(
-        b.node_manifest_hashes(&b_af_id).unwrap().iter().all(|h| b.has_chunk(h)),
+        b.node_manifest_hashes(&b_af_id)
+            .unwrap()
+            .iter()
+            .all(|h| b.has_chunk(h)),
         "in-scope Active file is now fully hydrated"
     );
     assert!(
-        b.node_manifest_hashes(&b_arf_id).unwrap().iter().any(|h| !b.has_chunk(h)),
+        b.node_manifest_hashes(&b_arf_id)
+            .unwrap()
+            .iter()
+            .any(|h| !b.has_chunk(h)),
         "out-of-scope Archive file stays a placeholder (not proactively hydrated)"
     );
-    assert_eq!(read_all(&b, b_af.ino), active_body, "Active reads back byte-for-byte");
+    assert_eq!(
+        read_all(&b, b_af.ino),
+        active_body,
+        "Active reads back byte-for-byte"
+    );
 
     // Graceful degradation: an on-demand hydrate of the OUT-OF-SCOPE file still works.
-    SyncEngine::hydrate(&b, &cb, &cloud, &b_arf_id).expect("on-demand hydrate ignores subscription");
-    assert_eq!(read_all(&b, b_arf.ino), archive_body, "out-of-scope file opens on demand");
+    SyncEngine::hydrate(&b, &cb, &cloud, &b_arf_id)
+        .expect("on-demand hydrate ignores subscription");
+    assert_eq!(
+        read_all(&b, b_arf.ino),
+        archive_body,
+        "out-of-scope file opens on demand"
+    );
 
     // Now subscribe Archive, hydrate it, then unsubscribe → it dehydrates (bytes reclaimed),
     // but the tree stays complete (metadata + manifest remain; it re-hydrates on demand).
     b.subscribe(&b_archive_id).unwrap();
     SyncEngine::proactive_hydrate(&b, &cb, &cloud).expect("hydrate Archive");
-    assert!(b.node_manifest_hashes(&b_arf_id).unwrap().iter().all(|h| b.has_chunk(h)));
+    assert!(b
+        .node_manifest_hashes(&b_arf_id)
+        .unwrap()
+        .iter()
+        .all(|h| b.has_chunk(h)));
 
     let reclaimed = SyncEngine::unsubscribe(&b, &b_archive_id).expect("unsubscribe + dehydrate");
-    assert!(reclaimed > 0, "unsubscribing a hydrated subtree reclaims chunks");
     assert!(
-        b.node_manifest_hashes(&b_arf_id).unwrap().iter().any(|h| !b.has_chunk(h)),
+        reclaimed > 0,
+        "unsubscribing a hydrated subtree reclaims chunks"
+    );
+    assert!(
+        b.node_manifest_hashes(&b_arf_id)
+            .unwrap()
+            .iter()
+            .any(|h| !b.has_chunk(h)),
         "Archive is dehydrated after unsubscribe"
     );
     // Tree completeness: Archive's metadata + the file are still present + navigable.
@@ -992,7 +1251,11 @@ fn selective_sync_gates_proactive_hydration_but_not_on_demand() {
 
     // And it still re-hydrates on demand after the reclaim.
     SyncEngine::hydrate(&b, &cb, &cloud, &b_arf_id).expect("re-hydrate after dehydrate");
-    assert_eq!(read_all(&b, b_arf.ino), archive_body, "re-hydrates on demand after reclaim");
+    assert_eq!(
+        read_all(&b, b_arf.ino),
+        archive_body,
+        "re-hydrates on demand after reclaim"
+    );
 }
 
 // ---- G10: delta-on-wire audit ------------------------------------------------------
@@ -1008,7 +1271,12 @@ fn selective_sync_gates_proactive_hydration_but_not_on_demand() {
 fn one_block_edit_uploads_only_the_delta_chunks() {
     let url = server_url!();
     let mut ca = ServerClient::new(&url);
-    ca.enroll(&format!("it-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
+    ca.enroll(
+        &format!("it-{}@example.com", uniq()),
+        "correct horse battery staple",
+        "device-A",
+    )
+    .expect("register A");
     let cloud = CountingIO::new(
         SharedDirIO::new(std::env::temp_dir().join(format!("it-cloud-{}", uniq()))).unwrap(),
     );
@@ -1023,8 +1291,14 @@ fn one_block_edit_uploads_only_the_delta_chunks() {
     // Initial push uploads the whole file (every chunk is new to the server).
     SyncEngine::push_outbox(&a, &ca, &cloud).expect("initial push");
     let initial = cloud.take_puts();
-    let total_chunks = a.node_manifest_hashes(&a.node_id_for(f.ino).unwrap().unwrap()).unwrap().len();
-    assert!(total_chunks > 20, "test needs a multi-chunk file (got {total_chunks})");
+    let total_chunks = a
+        .node_manifest_hashes(&a.node_id_for(f.ino).unwrap().unwrap())
+        .unwrap()
+        .len();
+    assert!(
+        total_chunks > 20,
+        "test needs a multi-chunk file (got {total_chunks})"
+    );
     assert_eq!(
         initial.len(),
         total_chunks,
@@ -1095,16 +1369,32 @@ fn pinned_subtree_stays_fully_hydrated_across_a_pull_that_adds_a_file() {
     let cursor0 = SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
     b.set_cursor(cursor0).unwrap();
     b.set_subscription_default(SubRule::Exclude).unwrap();
-    let b_jobs_id = b.node_id_for(b.lookup(ROOT_INO, "Jobs").unwrap().ino).unwrap().unwrap();
-    let b_archive_id = b.node_id_for(b.lookup(ROOT_INO, "Archive").unwrap().ino).unwrap().unwrap();
+    let b_jobs_id = b
+        .node_id_for(b.lookup(ROOT_INO, "Jobs").unwrap().ino)
+        .unwrap()
+        .unwrap();
+    let b_archive_id = b
+        .node_id_for(b.lookup(ROOT_INO, "Archive").unwrap().ino)
+        .unwrap()
+        .unwrap();
 
     // The engine pin: record the pin AND make it available offline right now.
     let summary = SyncEngine::pin(&b, &cb, &cloud, &b_jobs_id, 4).expect("pin + download Jobs");
-    assert_eq!(summary.files_hydrated, 1, "the existing Jobs file downloaded");
+    assert_eq!(
+        summary.files_hydrated, 1,
+        "the existing Jobs file downloaded"
+    );
     assert!(b.is_pinned(&b_jobs_id).unwrap(), "Jobs is pinned");
-    assert!(SyncEngine::offline_readiness(&b, &b_jobs_id).unwrap().is_ready(), "Jobs ready for offline");
+    assert!(
+        SyncEngine::offline_readiness(&b, &b_jobs_id)
+            .unwrap()
+            .is_ready(),
+        "Jobs ready for offline"
+    );
     // Archive stays online-only (default exclude, not pinned).
-    assert!(!SyncEngine::offline_readiness(&b, &b_archive_id).unwrap().is_ready());
+    assert!(!SyncEngine::offline_readiness(&b, &b_archive_id)
+        .unwrap()
+        .is_ready());
 
     // A adds a SECOND file to Jobs and pushes.
     let second = a.create(jobs.ino, "second.lbrn2").unwrap();
@@ -1120,12 +1410,26 @@ fn pinned_subtree_stays_fully_hydrated_across_a_pull_that_adds_a_file() {
     // The pin held: Jobs is STILL 100% ready, now including the new file.
     let readiness = SyncEngine::offline_readiness(&b, &b_jobs_id).unwrap();
     assert_eq!(readiness.total_files, 2, "B sees both Jobs files");
-    assert!(readiness.is_ready(), "pinned Jobs stayed fully hydrated across the pull (new file too)");
-    let b_second = b.lookup(b.lookup(ROOT_INO, "Jobs").unwrap().ino, "second.lbrn2").unwrap();
-    assert_eq!(read_all(&b, b_second.ino), pseudo_random(15_000, 3), "new file reads byte-for-byte offline");
+    assert!(
+        readiness.is_ready(),
+        "pinned Jobs stayed fully hydrated across the pull (new file too)"
+    );
+    let b_second = b
+        .lookup(b.lookup(ROOT_INO, "Jobs").unwrap().ino, "second.lbrn2")
+        .unwrap();
+    assert_eq!(
+        read_all(&b, b_second.ino),
+        pseudo_random(15_000, 3),
+        "new file reads byte-for-byte offline"
+    );
 
     // And the un-pinned Archive was NOT dragged resident by the tick.
-    assert!(!SyncEngine::offline_readiness(&b, &b_archive_id).unwrap().is_ready(), "Archive stays online-only");
+    assert!(
+        !SyncEngine::offline_readiness(&b, &b_archive_id)
+            .unwrap()
+            .is_ready(),
+        "Archive stays online-only"
+    );
 }
 
 /// `SyncEngine::unpin` stops the subtree being force-kept and (optionally) reclaims its
@@ -1146,18 +1450,41 @@ fn unpin_stops_forced_hydration_and_can_reclaim() {
     let b = dev();
     SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
     b.set_subscription_default(SubRule::Exclude).unwrap();
-    let b_jobs_id = b.node_id_for(b.lookup(ROOT_INO, "Jobs").unwrap().ino).unwrap().unwrap();
-    let b_f_id = b.node_id_for(b.lookup(jobs_child(&b), "part.step").unwrap().ino).unwrap().unwrap();
+    let b_jobs_id = b
+        .node_id_for(b.lookup(ROOT_INO, "Jobs").unwrap().ino)
+        .unwrap()
+        .unwrap();
+    let b_f_id = b
+        .node_id_for(b.lookup(jobs_child(&b), "part.step").unwrap().ino)
+        .unwrap()
+        .unwrap();
 
     SyncEngine::pin(&b, &cb, &cloud, &b_jobs_id, 4).expect("pin");
-    assert!(b.node_manifest_hashes(&b_f_id).unwrap().iter().all(|h| b.has_chunk(h)), "resident after pin");
+    assert!(
+        b.node_manifest_hashes(&b_f_id)
+            .unwrap()
+            .iter()
+            .all(|h| b.has_chunk(h)),
+        "resident after pin"
+    );
 
     // Unpin + reclaim: bytes dropped, pin gone, no longer in scope.
     let reclaimed = SyncEngine::unpin(&b, &b_jobs_id, true).expect("unpin + reclaim");
     assert!(reclaimed > 0, "reclaimed the pinned subtree's chunks");
     assert!(!b.is_pinned(&b_jobs_id).unwrap(), "no longer pinned");
-    assert!(b.node_manifest_hashes(&b_f_id).unwrap().iter().any(|h| !b.has_chunk(h)), "dehydrated after unpin");
-    assert!(!SyncEngine::offline_readiness(&b, &b_jobs_id).unwrap().is_ready(), "no longer offline-ready");
+    assert!(
+        b.node_manifest_hashes(&b_f_id)
+            .unwrap()
+            .iter()
+            .any(|h| !b.has_chunk(h)),
+        "dehydrated after unpin"
+    );
+    assert!(
+        !SyncEngine::offline_readiness(&b, &b_jobs_id)
+            .unwrap()
+            .is_ready(),
+        "no longer offline-ready"
+    );
 }
 
 /// Tiny helper: the ino of B's `Jobs` dir (re-looked-up because the dir ino differs per device).
@@ -1171,7 +1498,9 @@ fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
     let mut s = seed.wrapping_add(0x9e3779b97f4a7c15);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as u8
         })
         .collect()

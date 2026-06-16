@@ -55,7 +55,10 @@ pub struct WebdavFs<P: Provider + 'static> {
 
 impl<P: Provider + 'static> Clone for WebdavFs<P> {
     fn clone(&self) -> Self {
-        Self { provider: self.provider.clone(), hydrate: self.hydrate.clone() }
+        Self {
+            provider: self.provider.clone(),
+            hydrate: self.hydrate.clone(),
+        }
     }
 }
 
@@ -71,7 +74,10 @@ impl<P: Provider + 'static> WebdavFs<P> {
         let mut attr = self.provider.getattr(ROOT_INO).map_err(map_err)?;
         for comp in pb.components() {
             if let Component::Normal(os) = comp {
-                attr = self.provider.lookup(ino, &os.to_string_lossy()).map_err(map_err)?;
+                attr = self
+                    .provider
+                    .lookup(ino, &os.to_string_lossy())
+                    .map_err(map_err)?;
                 ino = attr.ino;
             }
         }
@@ -116,13 +122,20 @@ impl<P: Provider + 'static> DavFileSystem for WebdavFs<P> {
             let mut out: Vec<Box<dyn DavDirEntry>> = Vec::new();
             for c in self.provider.readdir(ino).map_err(map_err)? {
                 let a = self.provider.getattr(c.ino).map_err(map_err)?;
-                out.push(Box::new(WebdavEntry { name: c.name, meta: WebdavMeta::from(a) }));
+                out.push(Box::new(WebdavEntry {
+                    name: c.name,
+                    meta: WebdavMeta::from(a),
+                }));
             }
             Ok(Box::pin(stream::iter(out).map(Ok)) as FsStream<Box<dyn DavDirEntry>>)
         })
     }
 
-    fn open<'a>(&'a self, path: &'a DavPath, options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
+    fn open<'a>(
+        &'a self,
+        path: &'a DavPath,
+        options: OpenOptions,
+    ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
             if options.write {
                 let (parent, name) = self.split(path)?;
@@ -176,7 +189,9 @@ impl<P: Provider + 'static> DavFileSystem for WebdavFs<P> {
         Box::pin(async move {
             let (fp, fname) = self.split(from)?;
             let (tp, tname) = self.split(to)?;
-            self.provider.rename(fp, &fname, tp, &tname).map_err(map_err)
+            self.provider
+                .rename(fp, &fname, tp, &tname)
+                .map_err(map_err)
         })
     }
 }
@@ -217,7 +232,9 @@ impl<P: Provider + 'static> DavFile for WebdavFile<P> {
                     let hydrate = self.hydrate.as_ref().unwrap().clone();
                     let ino = self.ino;
                     let _ = tokio::task::spawn_blocking(move || hydrate(ino)).await;
-                    self.provider.read(self.ino, self.pos, count as u32).map_err(map_err)?
+                    self.provider
+                        .read(self.ino, self.pos, count as u32)
+                        .map_err(map_err)?
                 }
                 Err(e) => return Err(map_err(e)),
             };
@@ -228,7 +245,10 @@ impl<P: Provider + 'static> DavFile for WebdavFile<P> {
 
     fn write_bytes(&'_ mut self, buf: Bytes) -> FsFuture<'_, ()> {
         Box::pin(async move {
-            let n = self.provider.write(self.ino, self.pos, &buf).map_err(map_err)?;
+            let n = self
+                .provider
+                .write(self.ino, self.pos, &buf)
+                .map_err(map_err)?;
             self.pos += n as u64;
             Ok(())
         })
@@ -238,7 +258,10 @@ impl<P: Provider + 'static> DavFile for WebdavFile<P> {
         Box::pin(async move {
             while buf.has_remaining() {
                 let chunk = buf.chunk().to_vec();
-                let n = self.provider.write(self.ino, self.pos, &chunk).map_err(map_err)?;
+                let n = self
+                    .provider
+                    .write(self.ino, self.pos, &chunk)
+                    .map_err(map_err)?;
                 self.pos += n as u64;
                 buf.advance(chunk.len());
             }
@@ -273,7 +296,11 @@ struct WebdavMeta {
 
 impl From<Attr> for WebdavMeta {
     fn from(a: Attr) -> Self {
-        Self { size: a.size, is_dir: a.kind == Kind::Dir, mtime: a.mtime }
+        Self {
+            size: a.size,
+            is_dir: a.kind == Kind::Dir,
+            mtime: a.mtime,
+        }
     }
 }
 
@@ -328,7 +355,9 @@ pub fn serve_blocking<P: Provider + 'static>(
     addr: SocketAddr,
     hydrate: Option<Hydrate>,
 ) -> std::io::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(serve(provider, addr, hydrate))
 }
 
@@ -376,19 +405,34 @@ mod tests {
         let store_b = base.join("b");
         std::fs::create_dir_all(&store_a).unwrap();
         std::fs::create_dir_all(&store_b).unwrap();
-        let cfg = ChunkConfig { min: 64, avg: 256, max: 1024 };
+        let cfg = ChunkConfig {
+            min: 64,
+            avg: 256,
+            max: 1024,
+        };
 
         // A writes a file (its chunks live in store A).
-        let a = Arc::new(SqliteProvider::in_memory(Box::new(LocalChunkStore::new(&store_a).unwrap()), cfg).unwrap());
+        let a = Arc::new(
+            SqliteProvider::in_memory(Box::new(LocalChunkStore::new(&store_a).unwrap()), cfg)
+                .unwrap(),
+        );
         let body = vec![7u8; 2000];
         let fa = a.create(ROOT_INO, "f.bin").unwrap();
         a.write(fa.ino, 0, &body).unwrap();
         a.flush(fa.ino).unwrap();
         let nodes = a.export_tree().unwrap();
-        let node_id = nodes.iter().find(|n| n.name == "f.bin").unwrap().node_id.clone();
+        let node_id = nodes
+            .iter()
+            .find(|n| n.name == "f.bin")
+            .unwrap()
+            .node_id
+            .clone();
 
         // B has the tree (manifest) but an EMPTY store → a read misses → hydrate fires.
-        let b = Arc::new(SqliteProvider::in_memory(Box::new(LocalChunkStore::new(&store_b).unwrap()), cfg).unwrap());
+        let b = Arc::new(
+            SqliteProvider::in_memory(Box::new(LocalChunkStore::new(&store_b).unwrap()), cfg)
+                .unwrap(),
+        );
         for n in &nodes {
             b.apply_remote(n).unwrap();
         }
@@ -409,10 +453,19 @@ mod tests {
 
         // Drive the real async read path on a multi-thread runtime, exactly like `serve`.
         let n = body.len();
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         let got = rt
             .block_on(async move {
-                let mut file = WebdavFile { provider: b.clone(), hydrate: Some(hydrate), ino, pos: 0 };
+                let mut file = WebdavFile {
+                    provider: b.clone(),
+                    hydrate: Some(hydrate),
+                    ino,
+                    pos: 0,
+                };
                 file.read_bytes(n).await
             })
             .expect("read should succeed after hydrate (no runtime-drop panic)");

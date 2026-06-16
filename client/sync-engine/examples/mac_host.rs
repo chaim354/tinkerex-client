@@ -34,32 +34,58 @@ fn main() {
             println!("✓ using existing library via TOKEN");
         }
         Err(_) => {
-            let tag = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-            let email = std::env::var("EMAIL").unwrap_or_else(|_| format!("maker-{tag}@example.com"));
+            let tag = format!(
+                "{:x}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            );
+            let email =
+                std::env::var("EMAIL").unwrap_or_else(|_| format!("maker-{tag}@example.com"));
             client = ServerClient::new(&server);
-            client.enroll(&email, "correct horse battery staple", "mac-host").expect("register failed (email may already exist — omit EMAIL or pass TOKEN=)");
+            client
+                .enroll(&email, "correct horse battery staple", "mac-host")
+                .expect("register failed (email may already exist — omit EMAIL or pass TOKEN=)");
             println!("✓ registered new library: {email}");
         }
     }
 
     // 2. Mint a device token for the Windows machine (same library).
-    let win = client.create_device("windows-cfapi").expect("mint windows device token");
+    let win = client
+        .create_device("windows-cfapi")
+        .expect("mint windows device token");
 
     // 3. Build a scratch local tree + seed it, then push to the server.
-    let tag = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+    let tag = format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
     let db = std::env::temp_dir().join(format!("maker-host-{tag}.db"));
     let chunks = std::env::temp_dir().join(format!("maker-host-{tag}-chunks"));
-    let provider = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).expect("chunk store"))).expect("open db");
+    let provider = SqliteProvider::open(
+        &db,
+        Box::new(LocalChunkStore::new(&chunks).expect("chunk store")),
+    )
+    .expect("open db");
 
     let mut names: Vec<String> = Vec::new();
     match std::env::var("FILES_DIR") {
         Ok(dir) => {
             let dir = shellexpand(&dir);
-            for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read FILES_DIR {dir}: {e}")).flatten() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read FILES_DIR {dir}: {e}"))
+                .flatten()
+            {
                 let path = entry.path();
                 if path.is_file() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with('.') { continue; } // skip .DS_Store etc.
+                    if name.starts_with('.') {
+                        continue;
+                    } // skip .DS_Store etc.
                     let bytes = std::fs::read(&path).expect("read file");
                     let attr = provider.create(ROOT_INO, &name).expect("create");
                     provider.ingest_bytes(attr.ino, &bytes).expect("ingest");
@@ -74,8 +100,14 @@ fn main() {
         Err(_) => {
             for (name, body) in [
                 ("hello.txt", b"hello from the mac host\n".to_vec()),
-                ("notes.md", b"# Maker\n\nThis file was pushed to the server by mac_host.\n".to_vec()),
-                ("blob.bin", (0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>()),
+                (
+                    "notes.md",
+                    b"# Maker\n\nThis file was pushed to the server by mac_host.\n".to_vec(),
+                ),
+                (
+                    "blob.bin",
+                    (0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+                ),
             ] {
                 let attr = provider.create(ROOT_INO, name).expect("create");
                 provider.ingest_bytes(attr.ino, &body).expect("ingest");
@@ -92,7 +124,11 @@ fn main() {
     println!("WINDOWS_DEVICE_TOKEN={}", win.device_token);
 
     println!("\n────────────────────────────────────────────────────────");
-    println!("  Pushed {} file(s) to the library: {}", names.len(), names.join(", "));
+    println!(
+        "  Pushed {} file(s) to the library: {}",
+        names.len(),
+        names.join(", ")
+    );
     println!();
     println!("  PASTE THIS ON WINDOWS as the device token:");
     println!("    {}", win.device_token);

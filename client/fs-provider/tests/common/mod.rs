@@ -7,11 +7,17 @@
 
 #![allow(dead_code, unused_imports)]
 
-use fs_provider::{ChunkConfig, ChunkLoc, LocalChunkStore, Provider, SqliteProvider, SyncNode, ROOT_INO};
+use fs_provider::{
+    ChunkConfig, ChunkLoc, LocalChunkStore, Provider, SqliteProvider, SyncNode, ROOT_INO,
+};
 
 /// Tiny CDC parameters so even small test files split into many chunks — this is what
 /// makes the dedup / block-delta properties observable at KB scale instead of MB.
-pub const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+pub const TINY: ChunkConfig = ChunkConfig {
+    min: 64,
+    avg: 256,
+    max: 1024,
+};
 
 /// An in-memory provider with the tiny chunk config (a fresh temp chunk store each time).
 pub fn provider() -> SqliteProvider {
@@ -28,8 +34,10 @@ pub fn provider_with(cfg: ChunkConfig) -> SqliteProvider {
 /// `(a, b, chunk_dir)`; keep `chunk_dir` alive for the test's duration.
 pub fn shared_store_pair() -> (SqliteProvider, SqliteProvider, tempdir::Dir) {
     let dir = tempdir::Dir::new();
-    let a = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir.path()).unwrap()), TINY).unwrap();
-    let b = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir.path()).unwrap()), TINY).unwrap();
+    let a = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir.path()).unwrap()), TINY)
+        .unwrap();
+    let b = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir.path()).unwrap()), TINY)
+        .unwrap();
     (a, b, dir)
 }
 
@@ -64,7 +72,11 @@ pub fn chunk_hashes(p: &SqliteProvider, name: &str) -> std::collections::HashSet
 
 /// The exported `SyncNode` for a top-level node by name (panics if absent).
 pub fn node_named(p: &SqliteProvider, name: &str) -> SyncNode {
-    p.export_tree().unwrap().into_iter().find(|n| n.name == name).unwrap_or_else(|| panic!("no node named {name}"))
+    p.export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == name)
+        .unwrap_or_else(|| panic!("no node named {name}"))
 }
 
 /// Apply every node A exported into B (parents first — `export_tree` orders by ino).
@@ -93,12 +105,22 @@ pub fn sync_to(source: &SqliteProvider, replicas: &[&SqliteProvider]) {
 /// A normalized, order-independent snapshot of a tree for cross-replica equality:
 /// `(node_id, parent_node_id, name, is_dir, manifest_id)` sorted. Content equality is
 /// implied by `manifest_id` (content-addressed), so this also asserts byte convergence.
-pub fn tree_snapshot(p: &SqliteProvider) -> Vec<(String, Option<String>, String, bool, Option<String>)> {
+pub fn tree_snapshot(
+    p: &SqliteProvider,
+) -> Vec<(String, Option<String>, String, bool, Option<String>)> {
     let mut v: Vec<_> = p
         .export_tree()
         .unwrap()
         .into_iter()
-        .map(|n| (n.node_id, n.parent_node_id, n.name, n.kind == fs_provider::Kind::Dir, n.manifest_id))
+        .map(|n| {
+            (
+                n.node_id,
+                n.parent_node_id,
+                n.name,
+                n.kind == fs_provider::Kind::Dir,
+                n.manifest_id,
+            )
+        })
         .collect();
     v.sort();
     v

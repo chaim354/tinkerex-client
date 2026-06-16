@@ -45,7 +45,9 @@ fn unique_body(len: usize) -> Vec<u8> {
     let mut x: u64 = 0x9E3779B97F4A7C15;
     (0..len)
         .map(|_| {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (x >> 33) as u8
         })
         .collect()
@@ -84,7 +86,10 @@ fn first_bytes_map_to_only_the_first_chunk() {
     assert_eq!(expected.len(), 1, "first 10 bytes are inside chunk 0");
     assert_eq!(hashes, expected);
     // And it's a strict SUBSET — not the whole manifest.
-    assert!(hashes.len() < l.len(), "range fetch is fewer chunks than the whole file");
+    assert!(
+        hashes.len() < l.len(),
+        "range fetch is fewer chunks than the whole file"
+    );
 }
 
 #[test]
@@ -105,7 +110,11 @@ fn later_range_maps_to_its_overlapping_chunks_only() {
         .map(|i| l[i].hash.clone())
         .collect();
     assert_eq!(hashes, expected);
-    assert_eq!(hashes, vec![last.hash.clone()], "a slice of the last chunk → just that chunk");
+    assert_eq!(
+        hashes,
+        vec![last.hash.clone()],
+        "a slice of the last chunk → just that chunk"
+    );
 }
 
 #[test]
@@ -120,7 +129,11 @@ fn range_spanning_a_chunk_boundary_returns_both_chunks() {
     let offset = boundary - 1;
     let size = 2; // [boundary-1, boundary+1) touches both chunk 0 and chunk 1
     let hashes = p.manifest_range_hashes(&id, offset, size).unwrap();
-    assert_eq!(hashes, vec![l[0].hash.clone(), l[1].hash.clone()], "straddle → both chunks, in order");
+    assert_eq!(
+        hashes,
+        vec![l[0].hash.clone(), l[1].hash.clone()],
+        "straddle → both chunks, in order"
+    );
 }
 
 #[test]
@@ -134,7 +147,11 @@ fn range_exactly_at_a_boundary_is_half_open() {
 
     let boundary = l[0].length;
     let hashes = p.manifest_range_hashes(&id, boundary, 1).unwrap();
-    assert_eq!(hashes, vec![l[1].hash.clone()], "the boundary byte is in chunk 1 only");
+    assert_eq!(
+        hashes,
+        vec![l[1].hash.clone()],
+        "the boundary byte is in chunk 1 only"
+    );
 }
 
 #[test]
@@ -169,7 +186,10 @@ fn range_past_eof_returns_nothing() {
     write_file(&p, ROOT, "f.bin", &unique_body(4096));
     let id = node_id(&p, "f.bin");
     // Start well past EOF — no chunk overlaps.
-    assert!(p.manifest_range_hashes(&id, 1_000_000, 1024).unwrap().is_empty());
+    assert!(p
+        .manifest_range_hashes(&id, 1_000_000, 1024)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -182,7 +202,10 @@ fn empty_and_missing_manifests_return_nothing() {
     assert!(p.manifest_range_hashes(&id, 0, 1024).unwrap().is_empty());
 
     // An unknown node_id is also empty (not an error).
-    assert!(p.manifest_range_hashes("no-such-node", 0, 1024).unwrap().is_empty());
+    assert!(p
+        .manifest_range_hashes("no-such-node", 0, 1024)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -194,7 +217,9 @@ fn partial_read_works_with_only_the_overlapping_chunks_cached() {
     // store for B, copying only selected chunks across (the hydrate stand-in).
     use fs_provider::{LocalChunkStore, SqliteProvider};
     let cloud = tempdir::Dir::new();
-    let src = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(cloud.path()).unwrap()), TINY).unwrap();
+    let src =
+        SqliteProvider::in_memory(Box::new(LocalChunkStore::new(cloud.path()).unwrap()), TINY)
+            .unwrap();
     let body = unique_body(8192);
     write_file(&src, ROOT, "f.bin", &body);
     let id = node_id(&src, "f.bin");
@@ -202,7 +227,11 @@ fn partial_read_works_with_only_the_overlapping_chunks_cached() {
 
     // B: a fresh device with an EMPTY local chunk store; apply the source tree (manifest only).
     let b_store_dir = tempdir::Dir::new();
-    let b = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(b_store_dir.path()).unwrap()), TINY).unwrap();
+    let b = SqliteProvider::in_memory(
+        Box::new(LocalChunkStore::new(b_store_dir.path()).unwrap()),
+        TINY,
+    )
+    .unwrap();
     for n in &src.export_tree().unwrap() {
         b.apply_remote(n).unwrap();
     }
@@ -223,7 +252,9 @@ fn partial_read_works_with_only_the_overlapping_chunks_cached() {
     let last = l.last().unwrap();
     let off = last.offset + 1;
     match b.read(bino, off, 50) {
-        Err(fs_provider::FsError::ChunkMissing(h)) => assert_eq!(h, last.hash, "missing the last chunk"),
+        Err(fs_provider::FsError::ChunkMissing(h)) => {
+            assert_eq!(h, last.hash, "missing the last chunk")
+        }
         other => panic!("expected ChunkMissing for an un-hydrated range, got {other:?}"),
     }
 
@@ -253,9 +284,16 @@ fn deduped_chunks_appear_once() {
     // Whole-file range returns each distinct hash once, regardless of how many manifest
     // entries share it.
     let hashes = p.manifest_range_hashes(&id, 0, u64::MAX).unwrap();
-    assert_eq!(hashes.len(), distinct.len(), "deduped: one entry per distinct hash");
+    assert_eq!(
+        hashes.len(),
+        distinct.len(),
+        "deduped: one entry per distinct hash"
+    );
     let mut seen = std::collections::HashSet::new();
     for h in &hashes {
-        assert!(seen.insert(h.clone()), "no duplicate hash in the returned list");
+        assert!(
+            seen.insert(h.clone()),
+            "no duplicate hash in the returned list"
+        );
     }
 }

@@ -45,10 +45,11 @@ impl LockManager {
     pub fn set(&self, ino: u64, lock: LockRange) -> Result<(), LockRange> {
         let mut map = self.by_ino.lock().unwrap();
         let ranges = map.entry(ino).or_default();
-        if let Some(c) = ranges
-            .iter()
-            .find(|r| r.owner != lock.owner && r.overlaps(lock.start, lock.end) && (r.exclusive || lock.exclusive))
-        {
+        if let Some(c) = ranges.iter().find(|r| {
+            r.owner != lock.owner
+                && r.overlaps(lock.start, lock.end)
+                && (r.exclusive || lock.exclusive)
+        }) {
             return Err(*c);
         }
         ranges.retain(|r| !(r.owner == lock.owner && r.overlaps(lock.start, lock.end)));
@@ -62,7 +63,11 @@ impl LockManager {
         map.get(&ino).and_then(|ranges| {
             ranges
                 .iter()
-                .find(|r| r.owner != probe.owner && r.overlaps(probe.start, probe.end) && (r.exclusive || probe.exclusive))
+                .find(|r| {
+                    r.owner != probe.owner
+                        && r.overlaps(probe.start, probe.end)
+                        && (r.exclusive || probe.exclusive)
+                })
                 .copied()
         })
     }
@@ -96,7 +101,13 @@ mod tests {
     use super::*;
 
     fn lk(owner: u64, start: u64, end: u64, exclusive: bool) -> LockRange {
-        LockRange { owner, start, end, exclusive, pid: owner as u32 }
+        LockRange {
+            owner,
+            start,
+            end,
+            exclusive,
+            pid: owner as u32,
+        }
     }
 
     #[test]
@@ -111,22 +122,28 @@ mod tests {
     fn shared_locks_coexist_but_exclusive_does_not() {
         let m = LockManager::new();
         m.set(1, lk(10, 0, 100, false)).unwrap();
-        m.set(1, lk(20, 0, 100, false)).expect("two read locks share");
-        assert!(m.set(1, lk(30, 0, 100, true)).is_err(), "a write lock conflicts with held reads");
+        m.set(1, lk(20, 0, 100, false))
+            .expect("two read locks share");
+        assert!(
+            m.set(1, lk(30, 0, 100, true)).is_err(),
+            "a write lock conflicts with held reads"
+        );
     }
 
     #[test]
     fn non_overlapping_ranges_dont_conflict() {
         let m = LockManager::new();
         m.set(1, lk(10, 0, 99, true)).unwrap();
-        m.set(1, lk(20, 100, 199, true)).expect("disjoint ranges are independent");
+        m.set(1, lk(20, 100, 199, true))
+            .expect("disjoint ranges are independent");
     }
 
     #[test]
     fn same_owner_can_re_lock_and_upgrade() {
         let m = LockManager::new();
         m.set(1, lk(10, 0, 100, false)).unwrap();
-        m.set(1, lk(10, 0, 100, true)).expect("owner upgrades its own lock");
+        m.set(1, lk(10, 0, 100, true))
+            .expect("owner upgrades its own lock");
         // Now another owner is blocked by the (upgraded) exclusive lock.
         assert!(m.set(1, lk(20, 0, 100, false)).is_err());
     }
@@ -137,7 +154,8 @@ mod tests {
         m.set(1, lk(10, 0, u64::MAX, true)).unwrap();
         assert!(m.set(1, lk(20, 0, u64::MAX, true)).is_err());
         m.unlock(1, 10, 0, u64::MAX);
-        m.set(1, lk(20, 0, u64::MAX, true)).expect("freed after unlock");
+        m.set(1, lk(20, 0, u64::MAX, true))
+            .expect("freed after unlock");
     }
 
     #[test]
@@ -146,14 +164,18 @@ mod tests {
         m.set(1, lk(10, 0, 50, true)).unwrap();
         m.set(1, lk(10, 100, 150, true)).unwrap();
         m.release_owner(1, 10);
-        m.set(1, lk(20, 0, 200, true)).expect("all of the closed owner's locks are gone");
+        m.set(1, lk(20, 0, 200, true))
+            .expect("all of the closed owner's locks are gone");
     }
 
     #[test]
     fn test_reports_conflict_without_acquiring() {
         let m = LockManager::new();
         m.set(1, lk(10, 0, u64::MAX, true)).unwrap();
-        assert_eq!(m.test(1, lk(20, 0, u64::MAX, false)).map(|l| l.owner), Some(10));
+        assert_eq!(
+            m.test(1, lk(20, 0, u64::MAX, false)).map(|l| l.owner),
+            Some(10)
+        );
         // test() must not have acquired anything for owner 20.
         m.unlock(1, 10, 0, u64::MAX);
         assert!(m.test(1, lk(20, 0, u64::MAX, true)).is_none());

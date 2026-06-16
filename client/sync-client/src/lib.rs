@@ -120,7 +120,6 @@ pub struct DeviceResponse {
     pub device_token: String,
 }
 
-
 #[derive(Debug, Deserialize)]
 pub struct NodeVersion {
     pub version_id: String,
@@ -326,7 +325,10 @@ impl ServerClient {
         format!("{}{}", self.base, path)
     }
 
-    fn authed(&self, rb: reqwest::blocking::RequestBuilder) -> Result<reqwest::blocking::RequestBuilder> {
+    fn authed(
+        &self,
+        rb: reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::RequestBuilder> {
         let token = self.token.as_ref().ok_or(Error::Unauthenticated)?;
         Ok(rb.bearer_auth(token))
     }
@@ -336,7 +338,10 @@ impl ServerClient {
         if status.is_success() {
             Ok(resp.json()?)
         } else {
-            Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+            Err(Error::Server {
+                status: status.as_u16(),
+                body: resp.text().unwrap_or_default(),
+            })
         }
     }
 
@@ -349,7 +354,10 @@ impl ServerClient {
         if status.is_success() {
             Ok(())
         } else {
-            Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+            Err(Error::Server {
+                status: status.as_u16(),
+                body: resp.text().unwrap_or_default(),
+            })
         }
     }
 
@@ -389,7 +397,10 @@ impl ServerClient {
         if status.is_success() {
             Ok(())
         } else {
-            Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+            Err(Error::Server {
+                status: status.as_u16(),
+                body: resp.text().unwrap_or_default(),
+            })
         }
     }
 
@@ -419,18 +430,31 @@ impl ServerClient {
     }
 
     pub fn commit_begin(&self, req: &CommitBegin) -> Result<CommitBeginResponse> {
-        let resp = self.authed(self.http.post(self.url("/v1/commit")))?.json(req).send()?;
+        let resp = self
+            .authed(self.http.post(self.url("/v1/commit")))?
+            .json(req)
+            .send()?;
         Self::json(resp)
     }
 
     pub fn commit_finalize(&self, commit_id: &str) -> Result<FinalizeResponse> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/commit/{commit_id}/finalize"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/commit/{commit_id}/finalize"))),
+            )?
             .send()?;
         Self::json(resp)
     }
 
-    pub fn mkdir(&self, node_id: &str, parent_node_id: Option<&str>, name: &str, mode: u32, mtime: i64) -> Result<SeqResponse> {
+    pub fn mkdir(
+        &self,
+        node_id: &str,
+        parent_node_id: Option<&str>,
+        name: &str,
+        mode: u32,
+        mtime: i64,
+    ) -> Result<SeqResponse> {
         let resp = self
             .authed(self.http.post(self.url("/v1/nodes")))?
             .json(&serde_json::json!({ "node_id": node_id, "parent_node_id": parent_node_id, "name": name, "mode": mode, "mtime": mtime }))
@@ -441,7 +465,15 @@ impl ServerClient {
     /// Create/update a symlink node. The target is raw link bytes (a path, possibly
     /// non-UTF8) and rides the control plane base64'd — a symlink has no manifest/chunks,
     /// so this is a single metadata op (mkdir-shaped), not a two-phase content commit.
-    pub fn symlink(&self, node_id: &str, parent_node_id: Option<&str>, name: &str, target: &[u8], mode: u32, mtime: i64) -> Result<SeqResponse> {
+    pub fn symlink(
+        &self,
+        node_id: &str,
+        parent_node_id: Option<&str>,
+        name: &str,
+        target: &[u8],
+        mode: u32,
+        mtime: i64,
+    ) -> Result<SeqResponse> {
         use base64::Engine as _;
         let encoded = base64::engine::general_purpose::STANDARD.encode(target);
         let resp = self
@@ -455,13 +487,18 @@ impl ServerClient {
     }
 
     pub fn delete_node(&self, node_id: &str) -> Result<SeqResponse> {
-        let resp = self.authed(self.http.delete(self.url(&format!("/v1/nodes/{node_id}"))))?.send()?;
+        let resp = self
+            .authed(self.http.delete(self.url(&format!("/v1/nodes/{node_id}"))))?
+            .send()?;
         Self::json(resp)
     }
 
     pub fn restore(&self, node_id: &str, version_id: &str) -> Result<FinalizeResponse> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/restore"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/nodes/{node_id}/restore"))),
+            )?
             .json(&serde_json::json!({ "version_id": version_id }))
             .send()?;
         Self::json(resp)
@@ -471,7 +508,10 @@ impl ServerClient {
     /// versions/restore UI.
     pub fn versions(&self, node_id: &str) -> Result<VersionsResponse> {
         let resp = self
-            .authed(self.http.get(self.url(&format!("/v1/nodes/{node_id}/versions"))))?
+            .authed(
+                self.http
+                    .get(self.url(&format!("/v1/nodes/{node_id}/versions"))),
+            )?
             .send()?;
         Self::json(resp)
     }
@@ -481,7 +521,10 @@ impl ServerClient {
     /// copy — conflict detection is the safety net). Returns the lock status.
     pub fn lock(&self, node_id: &str) -> Result<LockStatus> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/lock"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/nodes/{node_id}/lock"))),
+            )?
             .timeout(std::time::Duration::from_secs(2))
             .send()?;
         Self::json(resp)
@@ -489,9 +532,12 @@ impl ServerClient {
 
     /// Release the advisory lock on a node (no-op if this device isn't the holder).
     pub fn unlock(&self, node_id: &str) -> Result<()> {
-        self.authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/unlock"))))?
-            .timeout(std::time::Duration::from_secs(2))
-            .send()?;
+        self.authed(
+            self.http
+                .post(self.url(&format!("/v1/nodes/{node_id}/unlock"))),
+        )?
+        .timeout(std::time::Duration::from_secs(2))
+        .send()?;
         Ok(())
     }
 
@@ -503,14 +549,23 @@ impl ServerClient {
 
     /// Unresolved conflicts (divergent offline edits) with both sides' device + time.
     pub fn conflicts(&self) -> Result<ConflictsResponse> {
-        let resp = self.authed(self.http.get(self.url("/v1/conflicts")))?.send()?;
+        let resp = self
+            .authed(self.http.get(self.url("/v1/conflicts")))?
+            .send()?;
         Self::json(resp)
     }
 
     /// Resolve a conflict by keeping one side as current.
-    pub fn resolve_conflict_keep(&self, node_id: &str, keep_version_id: &str) -> Result<SeqResponse> {
+    pub fn resolve_conflict_keep(
+        &self,
+        node_id: &str,
+        keep_version_id: &str,
+    ) -> Result<SeqResponse> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/resolve_conflict"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/nodes/{node_id}/resolve_conflict"))),
+            )?
             .json(&serde_json::json!({ "keep_version_id": keep_version_id }))
             .send()?;
         Self::json(resp)
@@ -519,7 +574,10 @@ impl ServerClient {
     /// Resolve a conflict by keeping both — the incoming side becomes a new sibling file.
     pub fn resolve_conflict_split(&self, node_id: &str) -> Result<SplitResponse> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/nodes/{node_id}/resolve_conflict"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/nodes/{node_id}/resolve_conflict"))),
+            )?
             .json(&serde_json::json!({ "split": true }))
             .send()?;
         Self::json(resp)
@@ -581,7 +639,10 @@ impl ServerClient {
         if status.is_success() {
             Ok(())
         } else {
-            Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+            Err(Error::Server {
+                status: status.as_u16(),
+                body: resp.text().unwrap_or_default(),
+            })
         }
     }
 
@@ -592,7 +653,10 @@ impl ServerClient {
         if status.is_success() {
             Ok(resp.bytes()?.to_vec())
         } else {
-            Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+            Err(Error::Server {
+                status: status.as_u16(),
+                body: resp.text().unwrap_or_default(),
+            })
         }
     }
 
@@ -629,8 +693,10 @@ impl ServerClient {
                     // Envelope: {"identifier":..,"message":{"head_seq":N}}. Only act on
                     // frames that carry a head_seq (skip welcome/confirm/ping).
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                        if let Some(seq) =
-                            v.get("message").and_then(|m| m.get("head_seq")).and_then(|s| s.as_i64())
+                        if let Some(seq) = v
+                            .get("message")
+                            .and_then(|m| m.get("head_seq"))
+                            .and_then(|s| s.as_i64())
                         {
                             on_head_seq(seq);
                         }
@@ -652,8 +718,16 @@ mod tests {
     fn manifest_id_matches_server_formula() {
         // SHA-256 of the concatenated hex hash strings, in order.
         let m = vec![
-            ChunkRef { hash: "aa".into(), offset: 0, length: 1 },
-            ChunkRef { hash: "bb".into(), offset: 1, length: 1 },
+            ChunkRef {
+                hash: "aa".into(),
+                offset: 0,
+                length: 1,
+            },
+            ChunkRef {
+                hash: "bb".into(),
+                offset: 1,
+                length: 1,
+            },
         ];
         let expected = hex::encode(Sha256::digest(b"aabb"));
         assert_eq!(manifest_id(&m), expected);

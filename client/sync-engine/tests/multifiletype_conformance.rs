@@ -49,12 +49,23 @@ macro_rules! server_url {
 /// Production-shaped chunk config (NOT the TINY config the other suites use). FastCDC defaults
 /// are ~16K/64K/256K; we use a smaller-but-realistic window so a few-hundred-KB file is a
 /// genuine many-chunk file (real dedup coverage) without needing tens of MB for every type.
-const CHUNK: ChunkConfig = ChunkConfig { min: 2 * 1024, avg: 8 * 1024, max: 32 * 1024 };
+const CHUNK: ChunkConfig = ChunkConfig {
+    min: 2 * 1024,
+    avg: 8 * 1024,
+    max: 32 * 1024,
+};
 
 fn uniq() -> String {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), n)
+    format!(
+        "{:x}-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        n
+    )
 }
 
 /// A device: isolated local tree + its own chunk cache (so a reader genuinely hydrates from
@@ -66,15 +77,25 @@ fn dev() -> SqliteProvider {
 
 fn read_all(p: &SqliteProvider, ino: u64) -> Vec<u8> {
     let size = p.getattr(ino).unwrap().size;
-    if size == 0 { Vec::new() } else { p.read(ino, 0, size as u32).unwrap() }
+    if size == 0 {
+        Vec::new()
+    } else {
+        p.read(ino, 0, size as u32).unwrap()
+    }
 }
 
 fn two_devices(url: &str) -> (ServerClient, ServerClient, SharedDirIO) {
     let mut a = ServerClient::new(url);
-    a.enroll(&format!("mft-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
+    a.enroll(
+        &format!("mft-{}@example.com", uniq()),
+        "correct horse battery staple",
+        "device-A",
+    )
+    .expect("register A");
     let dev_b = a.create_device("device-B").expect("create device B");
     let b = ServerClient::with_token(url, dev_b.device_token);
-    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("mft-cloud-{}", uniq()))).unwrap();
+    let cloud =
+        SharedDirIO::new(std::env::temp_dir().join(format!("mft-cloud-{}", uniq()))).unwrap();
     (a, b, cloud)
 }
 
@@ -88,7 +109,10 @@ impl Lcg {
         Self(seed ^ 0x9e37_79b9_7f4a_7c15)
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 1
     }
     fn byte(&mut self) -> u8 {
@@ -126,10 +150,20 @@ fn stl_ascii(seed: u64, facets: usize) -> Vec<u8> {
     let mut r = Lcg::new(seed);
     let mut s = String::from("solid conformance\n");
     for _ in 0..facets {
-        s.push_str(&format!("  facet normal {} {} {}\n", r.f32(), r.f32(), r.f32()));
+        s.push_str(&format!(
+            "  facet normal {} {} {}\n",
+            r.f32(),
+            r.f32(),
+            r.f32()
+        ));
         s.push_str("    outer loop\n");
         for _ in 0..3 {
-            s.push_str(&format!("      vertex {} {} {}\n", r.f32(), r.f32(), r.f32()));
+            s.push_str(&format!(
+                "      vertex {} {} {}\n",
+                r.f32(),
+                r.f32(),
+                r.f32()
+            ));
         }
         s.push_str("    endloop\n  endfacet\n");
     }
@@ -144,13 +178,22 @@ fn threemf(seed: u64) -> Vec<u8> {
     let mut r = Lcg::new(seed);
     // Two parts: content-types and the model XML (with some bulk vertex data for size).
     let content_types = br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>"#.to_vec();
-    let mut model = String::from(r#"<?xml version="1.0"?><model unit="millimeter"><resources><object id="1" type="model"><mesh><vertices>"#);
+    let mut model = String::from(
+        r#"<?xml version="1.0"?><model unit="millimeter"><resources><object id="1" type="model"><mesh><vertices>"#,
+    );
     for _ in 0..2000 {
-        model.push_str(&format!(r#"<vertex x="{}" y="{}" z="{}"/>"#, r.f32(), r.f32(), r.f32()));
+        model.push_str(&format!(
+            r#"<vertex x="{}" y="{}" z="{}"/>"#,
+            r.f32(),
+            r.f32(),
+            r.f32()
+        ));
     }
     model.push_str("</vertices></mesh></object></resources></model>");
-    let parts: [(&str, Vec<u8>); 2] =
-        [("[Content_Types].xml", content_types), ("3D/3dmodel.model", model.into_bytes())];
+    let parts: [(&str, Vec<u8>); 2] = [
+        ("[Content_Types].xml", content_types),
+        ("3D/3dmodel.model", model.into_bytes()),
+    ];
     build_zip(&parts)
 }
 
@@ -162,7 +205,11 @@ fn build_zip(parts: &[(&str, Vec<u8>)]) -> Vec<u8> {
         for &b in data {
             crc ^= b as u32;
             for _ in 0..8 {
-                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
             }
         }
         !crc
@@ -240,9 +287,17 @@ fn iges(seed: u64, records: usize) -> Vec<u8> {
     s.push_str(&line("Synthetic IGES conformance corpus.".into(), 'S', 1));
     s.push_str(&line("1H,,1H;,4HSLF,".into(), 'G', 1));
     for i in 1..=records {
-        s.push_str(&line(format!("116,{:.4},{:.4},{:.4},0,0,0;", r.f32(), r.f32(), r.f32()), 'P', i));
+        s.push_str(&line(
+            format!("116,{:.4},{:.4},{:.4},0,0,0;", r.f32(), r.f32(), r.f32()),
+            'P',
+            i,
+        ));
     }
-    s.push_str(&line(format!("S{:>7}G{:>7}D{:>7}P{:>7}", 1, 1, 0, records), 'T', 1));
+    s.push_str(&line(
+        format!("S{:>7}G{:>7}D{:>7}P{:>7}", 1, 1, 0, records),
+        'T',
+        1,
+    ));
     s.into_bytes()
 }
 
@@ -262,7 +317,9 @@ fn obj(seed: u64, verts: usize) -> Vec<u8> {
 /// A **LightBurn `.lbrn2`** project: the XML grammar with `<Shape>` + base64-ish path data.
 fn lbrn2(seed: u64, shapes: usize) -> Vec<u8> {
     let mut r = Lcg::new(seed);
-    let mut s = String::from(r#"<?xml version="1.0"?><LightBurnProject AppVersion="1.5" FormatVersion="1"><Thumbnail Source=""/>"#);
+    let mut s = String::from(
+        r#"<?xml version="1.0"?><LightBurnProject AppVersion="1.5" FormatVersion="1"><Thumbnail Source=""/>"#,
+    );
     for _ in 0..shapes {
         s.push_str(&format!(
             r#"<Shape Type="Path" CutIndex="0"><XForm>1 0 0 1 {} {}</XForm><VertList>"#,
@@ -287,7 +344,11 @@ fn png(seed: u64, idat_chunks: usize) -> Vec<u8> {
         for &b in data {
             crc ^= b as u32;
             for _ in 0..8 {
-                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
             }
         }
         !crc
@@ -319,7 +380,7 @@ fn jpeg(seed: u64, body_kb: usize) -> Vec<u8> {
     out.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]); // APP0, len 16
     out.extend_from_slice(b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00");
     out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]); // SOS
-    // Entropy-coded body: random bytes, but never an EOI marker (0xFFD9) mid-stream.
+                                                                                          // Entropy-coded body: random bytes, but never an EOI marker (0xFFD9) mid-stream.
     let mut body = r.fill(body_kb * 1024);
     for i in 0..body.len() {
         if body[i] == 0xFF {
@@ -356,8 +417,22 @@ fn gcode(seed: u64, moves: usize) -> Vec<u8> {
 fn markdown(seed: u64, paras: usize) -> Vec<u8> {
     let mut r = Lcg::new(seed);
     let words = [
-        "print", "layer", "nozzle", "filament", "bracket", "tolerance", "infill", "support",
-        "assembly", "calibrate", "extrude", "warp", "adhesion", "bed", "PETG", "PLA",
+        "print",
+        "layer",
+        "nozzle",
+        "filament",
+        "bracket",
+        "tolerance",
+        "infill",
+        "support",
+        "assembly",
+        "calibrate",
+        "extrude",
+        "warp",
+        "adhesion",
+        "bed",
+        "PETG",
+        "PLA",
     ];
     let mut s = String::from("# Build Log\n\n");
     for p in 0..paras {
@@ -409,23 +484,35 @@ struct CorpusFile {
 /// Build the full corpus. Sizes are tuned so the "big" files are genuinely many-chunk under the
 /// production-shaped CHUNK config, while the small grammar files stay realistic.
 fn corpus(seed: u64) -> Vec<CorpusFile> {
-    let f = |name, bytes, expect_multichunk| CorpusFile { name, bytes, expect_multichunk };
+    let f = |name, bytes, expect_multichunk| CorpusFile {
+        name,
+        bytes,
+        expect_multichunk,
+    };
     vec![
         f("cube.stl", stl_binary(seed + 1, 20_000), true), // ~1 MB binary STL
         f("bracket_ascii.stl", stl_ascii(seed + 2, 6_000), true), // ascii STL
-        f("widget.3mf", threemf(seed + 3), true), // zip container
-        f("flange.step", step(seed + 4, 12_000), true), // ascii STEP
-        f("gear.iges", iges(seed + 5, 9_000), true), // ascii IGES
-        f("mesh.obj", obj(seed + 6, 30_000), true), // OBJ
+        f("widget.3mf", threemf(seed + 3), true),          // zip container
+        f("flange.step", step(seed + 4, 12_000), true),    // ascii STEP
+        f("gear.iges", iges(seed + 5, 9_000), true),       // ascii IGES
+        f("mesh.obj", obj(seed + 6, 30_000), true),        // OBJ
         f("engraving.lbrn2", lbrn2(seed + 7, 1_500), true), // LightBurn xml
-        f("render.png", png(seed + 8, 40), true), // PNG (incompressible IDAT)
-        f("photo.jpg", jpeg(seed + 9, 300), true), // JPEG (~300 KB random body)
+        f("render.png", png(seed + 8, 40), true),          // PNG (incompressible IDAT)
+        f("photo.jpg", jpeg(seed + 9, 300), true),         // JPEG (~300 KB random body)
         f("benchy.gcode", gcode(seed + 10, 25_000), true), // G-code
-        f("README.md", markdown(seed + 11, 30), false), // small markdown
-        f("notes.txt", b"a short plain-text note\nwith two lines\n".to_vec(), false), // tiny text
-        f("empty.txt", Vec::new(), false), // zero-byte edge case
+        f("README.md", markdown(seed + 11, 30), false),    // small markdown
+        f(
+            "notes.txt",
+            b"a short plain-text note\nwith two lines\n".to_vec(),
+            false,
+        ), // tiny text
+        f("empty.txt", Vec::new(), false),                 // zero-byte edge case
         f("scan_random.bin", large_random(seed + 12, 12), true), // 12 MB incompressible
-        f("backup_repetitive.bin", large_repetitive(seed + 13, 16), true), // 16 MB repetitive
+        f(
+            "backup_repetitive.bin",
+            large_repetitive(seed + 13, 16),
+            true,
+        ), // 16 MB repetitive
     ]
 }
 
@@ -446,7 +533,9 @@ fn push_file(a: &SqliteProvider, ca: &ServerClient, cloud: &dyn ChunkIO, name: &
 fn pull_and_read(cb: &ServerClient, cloud: &dyn ChunkIO, name: &str) -> Vec<u8> {
     let b = dev();
     SyncEngine::pull_snapshot(&b, cb).unwrap_or_else(|e| panic!("pull_snapshot: {e}"));
-    let bf = b.lookup(ROOT_INO, name).unwrap_or_else(|_| panic!("reader missing {name}"));
+    let bf = b
+        .lookup(ROOT_INO, name)
+        .unwrap_or_else(|_| panic!("reader missing {name}"));
     if b.getattr(bf.ino).unwrap().size == 0 {
         return Vec::new();
     }
@@ -506,10 +595,19 @@ fn every_filetype_roundtrips_byte_for_byte() {
         results.push((cf.name.to_string(), cf.bytes.len(), n_chunks, pass));
     }
 
-    eprintln!("\n==== MULTI-FILETYPE CONFORMANCE MATRIX ({} types) ====", results.len());
-    eprintln!("{:<26} {:>12} {:>8}  {}", "file", "bytes", "chunks", "byte-for-byte");
+    eprintln!(
+        "\n==== MULTI-FILETYPE CONFORMANCE MATRIX ({} types) ====",
+        results.len()
+    );
+    eprintln!(
+        "{:<26} {:>12} {:>8}  {}",
+        "file", "bytes", "chunks", "byte-for-byte"
+    );
     for (name, bytes, chunks, pass) in &results {
-        eprintln!("{name:<26} {bytes:>12} {chunks:>8}  {}", if *pass { "PASS" } else { "FAIL" });
+        eprintln!(
+            "{name:<26} {bytes:>12} {chunks:>8}  {}",
+            if *pass { "PASS" } else { "FAIL" }
+        );
     }
     eprintln!(
         "TOTAL: {} files, {} bytes ({:.1} MB), {} chunks — all byte-for-byte\n",
@@ -539,7 +637,11 @@ struct CountingIO {
 }
 impl CountingIO {
     fn new(inner: SharedDirIO) -> Self {
-        Self { inner, puts: Mutex::new(Vec::new()), gets: Mutex::new(Vec::new()) }
+        Self {
+            inner,
+            puts: Mutex::new(Vec::new()),
+            gets: Mutex::new(Vec::new()),
+        }
     }
     fn put_count(&self) -> usize {
         self.puts.lock().unwrap().len()
@@ -550,7 +652,12 @@ impl CountingIO {
     }
 }
 impl ChunkIO for CountingIO {
-    fn put(&self, hash: &str, urls: &HashMap<String, String>, bytes: Vec<u8>) -> sync_engine::Result<()> {
+    fn put(
+        &self,
+        hash: &str,
+        urls: &HashMap<String, String>,
+        bytes: Vec<u8>,
+    ) -> sync_engine::Result<()> {
         self.puts.lock().unwrap().push(hash.to_string());
         self.inner.put(hash, urls, bytes)
     }
@@ -580,8 +687,14 @@ fn small_edit_to_large_file_dedups_chunks() {
     let nid = a.node_id_for(f.ino).unwrap().unwrap();
     let total_chunks = a.node_manifest_hashes(&nid).unwrap().len();
     let first_push_puts = cloud.put_count();
-    assert!(total_chunks > 50, "need a genuinely many-chunk file; got {total_chunks}");
-    assert_eq!(first_push_puts, total_chunks, "first push uploads every chunk on a fresh cloud");
+    assert!(
+        total_chunks > 50,
+        "need a genuinely many-chunk file; got {total_chunks}"
+    );
+    assert_eq!(
+        first_push_puts, total_chunks,
+        "first push uploads every chunk on a fresh cloud"
+    );
 
     // Edit a small region in the MIDDLE (overwrite 1 KB at the 8 MB mark) and re-push.
     cloud.reset();
@@ -608,7 +721,10 @@ fn small_edit_to_large_file_dedups_chunks() {
 
     // The edited file is still byte-for-byte on a fresh reader.
     let got = pull_and_read(&cb, &cloud, "scan.bin");
-    assert_eq!(got, body, "edited large file is byte-for-byte after dedup'd re-push");
+    assert_eq!(
+        got, body,
+        "edited large file is byte-for-byte after dedup'd re-push"
+    );
 }
 
 // ========================================================================================
@@ -652,7 +768,10 @@ fn repetitive_file_dedups_within_itself() {
     );
 
     let got = pull_and_read(&cb, &cloud, "repetitive.bin");
-    assert_eq!(got, body, "repetitive file byte-for-byte after intra-file dedup");
+    assert_eq!(
+        got, body,
+        "repetitive file byte-for-byte after intra-file dedup"
+    );
 }
 
 // ========================================================================================
@@ -701,7 +820,12 @@ fn concurrent_multifiletype_storm_no_corruption() {
                     Err(e) => last_err = Some(e.to_string()),
                 }
             }
-            assert!(last_err.is_none(), "{}: push failed under concurrency: {:?}", cf.name, last_err);
+            assert!(
+                last_err.is_none(),
+                "{}: push failed under concurrency: {:?}",
+                cf.name,
+                last_err
+            );
         }));
     }
     for h in handles {
@@ -725,7 +849,11 @@ fn concurrent_multifiletype_storm_no_corruption() {
                 .unwrap_or_else(|e| panic!("hydrate {} after storm: {e}", cf.name));
             read_all(&reader, bf.ino)
         };
-        assert_eq!(got, cf.bytes, "{}: corrupted under concurrent multi-type storm", cf.name);
+        assert_eq!(
+            got, cf.bytes,
+            "{}: corrupted under concurrent multi-type storm",
+            cf.name
+        );
         verified += 1;
         total_bytes += cf.bytes.len();
     }

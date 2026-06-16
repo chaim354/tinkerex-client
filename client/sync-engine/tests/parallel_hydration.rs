@@ -403,8 +403,12 @@ macro_rules! server_url {
 fn server_backed_parallel_hydrate_is_byte_for_byte() {
     let url = server_url!();
     let mut ca = ServerClient::new(&url);
-    ca.enroll(&format!("ph-{}@example.com", uniq()), "correct horse battery staple", "device-A")
-        .expect("register A");
+    ca.enroll(
+        &format!("ph-{}@example.com", uniq()),
+        "correct horse battery staple",
+        "device-A",
+    )
+    .expect("register A");
     let dev_b = ca.create_device("device-B").expect("create B");
     let cb = ServerClient::with_token(&url, dev_b.device_token);
     let cloud =
@@ -439,8 +443,12 @@ fn server_backed_parallel_hydrate_is_byte_for_byte() {
 fn server_backed_parallel_push_uploads_overlap() {
     let url = server_url!();
     let mut ca = ServerClient::new(&url);
-    ca.enroll(&format!("ph-push-{}@example.com", uniq()), "correct horse battery staple", "device-A")
-        .expect("register A");
+    ca.enroll(
+        &format!("ph-push-{}@example.com", uniq()),
+        "correct horse battery staple",
+        "device-A",
+    )
+    .expect("register A");
     let dev_b = ca.create_device("device-B").expect("create B");
     let cb = ServerClient::with_token(&url, dev_b.device_token);
     let cloud =

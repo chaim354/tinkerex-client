@@ -17,14 +17,21 @@ fn main() {
     use sync_engine::{CfApiMount, DaemonConfig};
 
     let mut args = std::env::args().skip(1);
-    let (root, db, chunk_dir, server_url, token) =
-        match (args.next(), args.next(), args.next(), args.next(), args.next()) {
-            (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
-            _ => {
-                eprintln!("usage: maker-cfsyncd <sync-root-dir> <db> <chunk_dir> <server_url> <device_token>");
-                std::process::exit(2);
-            }
-        };
+    let (root, db, chunk_dir, server_url, token) = match (
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
+        _ => {
+            eprintln!(
+                "usage: maker-cfsyncd <sync-root-dir> <db> <chunk_dir> <server_url> <device_token>"
+            );
+            std::process::exit(2);
+        }
+    };
 
     // A sibling sentinel file the caller can `touch` to request a GRACEFUL shutdown. The smoke
     // creates `<db>.stop` instead of `Stop-Process -Force` so an in-flight push completes: on
@@ -54,7 +61,10 @@ fn main() {
         // that would unmount the moment we mounted. Stay mounted until the process is terminated
         // (Ctrl-C / kill) OR the `<db>.stop` sentinel appears (graceful shutdown for the smoke).
         // `mount` is kept alive for the lifetime of the loop.
-        println!("CfAPI sync root at {mp} — running headless; touch {} or terminate to unmount.", stop_file.display());
+        println!(
+            "CfAPI sync root at {mp} — running headless; touch {} or terminate to unmount.",
+            stop_file.display()
+        );
         while !stop_file.exists() {
             std::thread::sleep(std::time::Duration::from_millis(300));
         }

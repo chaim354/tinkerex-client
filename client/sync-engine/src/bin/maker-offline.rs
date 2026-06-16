@@ -36,8 +36,14 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let (db, chunks, server_url, token, command, path) =
-        (&args[0], &args[1], &args[2], &args[3], &args[4], args.get(5));
+    let (db, chunks, server_url, token, command, path) = (
+        &args[0],
+        &args[1],
+        &args[2],
+        &args[3],
+        &args[4],
+        args.get(5),
+    );
     let path = match path {
         Some(p) => p.as_str(),
         None => {
@@ -101,7 +107,11 @@ fn run(
             let reclaimed = SyncEngine::unpin(&provider, &node_id, reclaim)?;
             println!(
                 "unpinned {path}{}",
-                if reclaim { format!(" (reclaimed {reclaimed} chunk(s))") } else { String::new() }
+                if reclaim {
+                    format!(" (reclaimed {reclaimed} chunk(s))")
+                } else {
+                    String::new()
+                }
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -109,7 +119,11 @@ fn run(
             let readiness = SyncEngine::offline_readiness(&provider, &node_id)?;
             print_status(path, &readiness);
             // Exit 0 iff fully ready — so a script can gate "safe to disconnect" on the exit code.
-            Ok(if readiness.is_ready() { ExitCode::SUCCESS } else { ExitCode::from(1) })
+            Ok(if readiness.is_ready() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
         }
         other => {
             eprintln!("unknown command `{other}` (expected: pin | unpin | offline-status)");
@@ -120,7 +134,11 @@ fn run(
 
 /// Render a readiness report as the human-facing pre-disconnect summary.
 fn print_status(path: &str, r: &OfflineReadiness) {
-    let pct = if r.total_chunks == 0 { 100 } else { r.present_chunks * 100 / r.total_chunks };
+    let pct = if r.total_chunks == 0 {
+        100
+    } else {
+        r.present_chunks * 100 / r.total_chunks
+    };
     println!(
         "offline-status {path}: {}/{} files local, {}% of chunks ({}/{}) — {}",
         r.ready_files,
@@ -128,7 +146,11 @@ fn print_status(path: &str, r: &OfflineReadiness) {
         pct,
         r.present_chunks,
         r.total_chunks,
-        if r.is_ready() { "READY for offline ✓" } else { "NOT ready — still online-only:" }
+        if r.is_ready() {
+            "READY for offline ✓"
+        } else {
+            "NOT ready — still online-only:"
+        }
     );
     for f in &r.missing_files {
         println!("  online-only: {}", f.path);
@@ -147,7 +169,9 @@ fn resolve_path(
     let mut ino = ROOT_INO;
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
     if components.is_empty() {
-        return Err(format!("path `{path}` is the library root — pin a folder or file under it").into());
+        return Err(
+            format!("path `{path}` is the library root — pin a folder or file under it").into(),
+        );
     }
     for comp in components {
         let attr = provider
@@ -155,9 +179,9 @@ fn resolve_path(
             .map_err(|_| format!("no such path: `{path}` (component `{comp}` not found)"))?;
         ino = attr.ino;
     }
-    provider
-        .node_id_for(ino)?
-        .ok_or_else(|| format!("`{path}` has no stable node_id (unexpected for a non-root node)").into())
+    provider.node_id_for(ino)?.ok_or_else(|| {
+        format!("`{path}` has no stable node_id (unexpected for a non-root node)").into()
+    })
 }
 
 #[cfg(test)]
@@ -168,7 +192,11 @@ mod tests {
     fn provider() -> SqliteProvider {
         SqliteProvider::in_memory(
             Box::new(LocalChunkStore::temp().unwrap()),
-            ChunkConfig { min: 64, avg: 256, max: 1024 },
+            ChunkConfig {
+                min: 64,
+                avg: 256,
+                max: 1024,
+            },
         )
         .unwrap()
     }
@@ -181,9 +209,21 @@ mod tests {
         let clientx = p.mkdir(jobs.ino, "ClientX").unwrap();
         let want = p.node_id_for(clientx.ino).unwrap().unwrap();
 
-        assert_eq!(resolve_path(&p, "/Jobs/ClientX").unwrap(), want, "leading slash");
-        assert_eq!(resolve_path(&p, "Jobs/ClientX").unwrap(), want, "no leading slash");
-        assert_eq!(resolve_path(&p, "Jobs/ClientX/").unwrap(), want, "trailing slash tolerated");
+        assert_eq!(
+            resolve_path(&p, "/Jobs/ClientX").unwrap(),
+            want,
+            "leading slash"
+        );
+        assert_eq!(
+            resolve_path(&p, "Jobs/ClientX").unwrap(),
+            want,
+            "no leading slash"
+        );
+        assert_eq!(
+            resolve_path(&p, "Jobs/ClientX/").unwrap(),
+            want,
+            "trailing slash tolerated"
+        );
     }
 
     /// A file path resolves too (you can make a single file available offline).

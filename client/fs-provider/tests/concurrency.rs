@@ -41,7 +41,11 @@ fn concurrent_writers_to_distinct_files_all_commit() {
         for i in 0..per_thread {
             let want: Vec<u8> = (0..(500 + i * 37)).map(|b| (b ^ (t * 7)) as u8).collect();
             let ino = p.lookup(ROOT, &format!("t{t}-f{i}.bin")).unwrap().ino;
-            assert_eq!(read_all(&p, ino), want, "t{t}-f{i} content intact under concurrency");
+            assert_eq!(
+                read_all(&p, ino),
+                want,
+                "t{t}-f{i} content intact under concurrency"
+            );
         }
     }
 }
@@ -87,7 +91,11 @@ fn concurrent_writes_and_outbox_drain_dont_deadlock_or_lose_data() {
     // Final reconciling drain (covers anything the racing syncer skipped on a missing
     // parent — here all files are under root, so this is just the tail).
     sync_to(&writer, &[&replica]);
-    assert_eq!(tree_snapshot(&replica), tree_snapshot(&writer), "replica converged after concurrent drain");
+    assert_eq!(
+        tree_snapshot(&replica),
+        tree_snapshot(&writer),
+        "replica converged after concurrent drain"
+    );
 }
 
 #[test]
@@ -105,14 +113,20 @@ fn chunkstore_tolerates_concurrent_same_hash_writes() {
         let store = Arc::clone(&store);
         let bytes = bytes.clone();
         handles.push(thread::spawn(move || {
-            store.put(hash, &bytes).expect("concurrent put of same hash must succeed");
+            store
+                .put(hash, &bytes)
+                .expect("concurrent put of same hash must succeed");
         }));
     }
     for h in handles {
         h.join().unwrap();
     }
     assert!(store.has(hash));
-    assert_eq!(store.get(hash).unwrap(), bytes, "stored bytes intact after the race");
+    assert_eq!(
+        store.get(hash).unwrap(),
+        bytes,
+        "stored bytes intact after the race"
+    );
 }
 
 #[test]

@@ -29,19 +29,28 @@ fn set_mtime_and_atime_independently_then_read_both_back() {
     p.set_mtime(ino, 1_000_000_000).unwrap();
     let a = p.getattr(ino).unwrap();
     assert_eq!(a.mtime, 1_000_000_000, "mtime updated");
-    assert_eq!(a.atime, before.atime, "atime untouched when only mtime is set");
+    assert_eq!(
+        a.atime, before.atime,
+        "atime untouched when only mtime is set"
+    );
 
     // Set atime only; mtime must be untouched (the UTIME_OMIT-on-mtime case).
     p.set_atime(ino, 2_000_000_000).unwrap();
     let a = p.getattr(ino).unwrap();
     assert_eq!(a.atime, 2_000_000_000, "atime updated");
-    assert_eq!(a.mtime, 1_000_000_000, "mtime untouched when only atime is set");
+    assert_eq!(
+        a.mtime, 1_000_000_000,
+        "mtime untouched when only atime is set"
+    );
 }
 
 #[test]
 fn set_atime_on_missing_inode_is_not_found() {
     let p = provider();
-    assert!(matches!(p.set_atime(999_999, 1), Err(fs_provider::FsError::NotFound)));
+    assert!(matches!(
+        p.set_atime(999_999, 1),
+        Err(fs_provider::FsError::NotFound)
+    ));
 }
 
 #[test]
@@ -59,5 +68,8 @@ fn atime_is_device_local_and_not_synced_but_mtime_is() {
 
     let bf = b.lookup(ROOT, "f").unwrap();
     assert_eq!(bf.mtime, 1_234_500_000_000, "mtime synced A->B");
-    assert_ne!(bf.atime, 9_999_900_000_000, "atime is device-local, NOT synced from A");
+    assert_ne!(
+        bf.atime, 9_999_900_000_000,
+        "atime is device-local, NOT synced from A"
+    );
 }

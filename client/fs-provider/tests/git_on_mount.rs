@@ -41,7 +41,12 @@ fn symlink_then_readlink_roundtrips_the_target() {
 fn symlink_shows_in_readdir_as_a_symlink() {
     let p = provider();
     p.symlink(ROOT, "link", b"elsewhere").unwrap();
-    let entry = p.readdir(ROOT).unwrap().into_iter().find(|e| e.name == "link").unwrap();
+    let entry = p
+        .readdir(ROOT)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "link")
+        .unwrap();
     assert_eq!(entry.kind, Kind::Symlink);
 }
 
@@ -49,14 +54,20 @@ fn symlink_shows_in_readdir_as_a_symlink() {
 fn readlink_on_a_regular_file_is_an_error() {
     let p = provider();
     let f = write_file(&p, ROOT, "f", b"not a link");
-    assert!(matches!(p.readlink(f), Err(FsError::NotSupported) | Err(FsError::NotFound)));
+    assert!(matches!(
+        p.readlink(f),
+        Err(FsError::NotSupported) | Err(FsError::NotFound)
+    ));
 }
 
 #[test]
 fn symlink_duplicate_name_is_already_exists() {
     let p = provider();
     p.symlink(ROOT, "link", b"a").unwrap();
-    assert!(matches!(p.symlink(ROOT, "link", b"b"), Err(FsError::AlreadyExists)));
+    assert!(matches!(
+        p.symlink(ROOT, "link", b"b"),
+        Err(FsError::AlreadyExists)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -116,12 +127,20 @@ fn apply_remote_flags_content_changed_when_symlink_target_changes() {
     replicate_tree(&a, &b);
 
     // A repoints the same link; B pulls the in-place update.
-    let node = a.export_tree().unwrap().into_iter().find(|n| n.name == "lnk").unwrap();
+    let node = a
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "lnk")
+        .unwrap();
     let mut changed = node.clone();
     changed.symlink_target = Some(b"new-target".to_vec());
     let outcome = b.apply_remote(&changed).unwrap();
 
-    assert!(outcome.content_changed, "a changed symlink target must flag content_changed");
+    assert!(
+        outcome.content_changed,
+        "a changed symlink target must flag content_changed"
+    );
     let st = b.lookup(ROOT, "lnk").unwrap();
     assert_eq!(b.readlink(st.ino).unwrap(), b"new-target");
 }
@@ -148,7 +167,10 @@ fn index_lock_atomic_rename_replaces_the_index() {
     // index now holds the new content; the lock name is gone (consumed by the rename).
     let idx = p.lookup(git, "index").unwrap();
     assert_eq!(read_all(&p, idx.ino), b"new index v2");
-    assert!(matches!(p.lookup(git, "index.lock"), Err(FsError::NotFound)));
+    assert!(matches!(
+        p.lookup(git, "index.lock"),
+        Err(FsError::NotFound)
+    ));
 }
 
 /// Git takes a lock by creating `*.lock` with O_EXCL — a second `create` of the same name
@@ -160,7 +182,10 @@ fn lockfile_create_is_exclusive() {
     let git = p.mkdir(ROOT, ".git").unwrap().ino;
     p.create(git, "config.lock").unwrap();
     // O_EXCL semantics: the second create must report EEXIST.
-    assert!(matches!(p.create(git, "config.lock"), Err(FsError::AlreadyExists)));
+    assert!(matches!(
+        p.create(git, "config.lock"),
+        Err(FsError::AlreadyExists)
+    ));
 }
 
 /// Git hooks and 100755-mode blobs must keep their executable bit on checkout, and it must
@@ -178,7 +203,11 @@ fn executable_bit_on_a_hook_survives_sync() {
 
     let dir = b.lookup(ROOT, "hooks").unwrap();
     let hook = b.lookup(dir.ino, "pre-commit").unwrap();
-    assert_eq!(hook.mode & 0o111, 0o111, "executable bits must survive sync");
+    assert_eq!(
+        hook.mode & 0o111,
+        0o111,
+        "executable bits must survive sync"
+    );
 }
 
 /// A git "object" directory layout: many small files in 2-char fanout dirs. Verifies the

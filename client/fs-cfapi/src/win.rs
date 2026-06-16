@@ -184,7 +184,11 @@ fn path_wide(p: &Path) -> U16CString {
 }
 
 /// Register + connect + populate. Returns a handle that tears everything down on drop.
-pub fn mount(provider: Arc<SqliteProvider>, root: &Path, hydrate: Option<Hydrate>) -> std::io::Result<CfApiMountHandle> {
+pub fn mount(
+    provider: Arc<SqliteProvider>,
+    root: &Path,
+    hydrate: Option<Hydrate>,
+) -> std::io::Result<CfApiMountHandle> {
     mount_with_shutdown(provider, root, hydrate, Arc::new(AtomicBool::new(false)))
 }
 
@@ -240,18 +244,39 @@ pub fn mount_full(
     // Terminated by a CF_CALLBACK_TYPE_NONE entry. On-demand population: the platform raises
     // FETCH_PLACEHOLDERS when Explorer opens a directory, and FETCH_DATA when a file is read.
     let callbacks: &'static [CF_CALLBACK_REGISTRATION] = Box::leak(Box::new([
-        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS, Callback: Some(fetch_placeholders_callback) },
-        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_FETCH_DATA, Callback: Some(fetch_data_callback) },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
+            Callback: Some(fetch_placeholders_callback),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_FETCH_DATA,
+            Callback: Some(fetch_data_callback),
+        },
         // B6.3: the kernel cancels an in-flight hydration (reading app gone / file deleted) — mark
         // the transfer key so the streaming FETCH_DATA loop stops between slices.
-        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, Callback: Some(cancel_fetch_data_callback) },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
+            Callback: Some(cancel_fetch_data_callback),
+        },
         // Phase 2: a file handle closed — capture a local edit (content changed) and push it.
-        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION, Callback: Some(notify_file_close_callback) },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
+            Callback: Some(notify_file_close_callback),
+        },
         // Phase 2b: a delete/rename is about to happen — mirror it into the Provider, then ACK
         // (pre-op variants, so we observe + allow the OS op). An unanswered pre-op hangs Explorer.
-        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NOTIFY_DELETE, Callback: Some(notify_delete_callback) },
-        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NOTIFY_RENAME, Callback: Some(notify_rename_callback) },
-        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NONE, Callback: None },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DELETE,
+            Callback: Some(notify_delete_callback),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_RENAME,
+            Callback: Some(notify_rename_callback),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NONE,
+            Callback: None,
+        },
     ]));
 
     let root_w = path_wide(root);
@@ -273,7 +298,9 @@ pub fn mount_full(
     let watcher = match spawn_new_file_watcher(root, state) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!("cfapi: new-file watcher failed to start ({e}) — new files won't be captured");
+            eprintln!(
+                "cfapi: new-file watcher failed to start ({e}) — new files won't be captured"
+            );
             None
         }
     };
@@ -321,7 +348,9 @@ fn spawn_new_file_watcher(root: &Path, state: *mut CfState) -> std::io::Result<N
 
     // Manual-reset stop event: `shutdown` signals it to break the wait promptly.
     let stop_event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(|e| {
-        unsafe { let _ = CloseHandle(dir); }
+        unsafe {
+            let _ = CloseHandle(dir);
+        }
         win_err(e)
     })?;
 
@@ -343,7 +372,12 @@ fn spawn_new_file_watcher(root: &Path, state: *mut CfState) -> std::io::Result<N
         })
     };
     eprintln!("cfapi: new-file watcher started on {}", root.display());
-    Ok(NewFileWatcher { stop, dir, stop_event, thread: Some(thread) })
+    Ok(NewFileWatcher {
+        stop,
+        dir,
+        stop_event,
+        thread: Some(thread),
+    })
 }
 
 /// The watcher thread body: issue an **overlapped** `ReadDirectoryChangesW`, then wait on
@@ -402,15 +436,19 @@ fn new_file_watch_loop(
         let waited = unsafe { WaitForMultipleObjects(&[read_event, stop_event], false, INFINITE) };
         if stop.load(Ordering::Relaxed) || waited != WAIT_OBJECT_0 {
             // Stop signalled (or wait failed): cancel the pending read and exit.
-            unsafe { let _ = windows::Win32::System::IO::CancelIoEx(dir, Some(&ov)); }
+            unsafe {
+                let _ = windows::Win32::System::IO::CancelIoEx(dir, Some(&ov));
+            }
             break;
         }
         let mut returned: u32 = 0;
-        if unsafe { GetOverlappedResult(dir, &ov, &mut returned, false) }.is_err() || returned == 0 {
+        if unsafe { GetOverlappedResult(dir, &ov, &mut returned, false) }.is_err() || returned == 0
+        {
             continue; // overflow / no info — re-arm
         }
         // Walk the variable-length FILE_NOTIFY_INFORMATION chain.
-        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, returned as usize) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, returned as usize) };
         let mut offset = 0usize;
         loop {
             if offset + std::mem::size_of::<FILE_NOTIFY_INFORMATION>() > bytes.len() {
@@ -420,7 +458,8 @@ fn new_file_watch_loop(
             let name_len = info.FileNameLength as usize / 2; // bytes → u16 count
             let name_ptr = unsafe {
                 (bytes.as_ptr().add(offset) as *const u8)
-                    .add(std::mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName)) as *const u16
+                    .add(std::mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName))
+                    as *const u16
             };
             let name: Vec<u16> = unsafe { std::slice::from_raw_parts(name_ptr, name_len) }.to_vec();
             let rel = String::from_utf16_lossy(&name);
@@ -450,7 +489,9 @@ fn new_file_watch_loop(
             offset += next;
         }
     }
-    unsafe { let _ = CloseHandle(read_event); }
+    unsafe {
+        let _ = CloseHandle(read_event);
+    }
     eprintln!("cfapi: new-file watcher stopped");
 }
 
@@ -488,8 +529,13 @@ fn register_sync_root(root: &Path) -> std::io::Result<()> {
     };
     let root_w = path_wide(root);
     unsafe {
-        CfRegisterSyncRoot(PCWSTR(root_w.as_ptr()), &registration, &policies, CF_REGISTER_FLAG_UPDATE)
-            .map_err(win_err)?;
+        CfRegisterSyncRoot(
+            PCWSTR(root_w.as_ptr()),
+            &registration,
+            &policies,
+            CF_REGISTER_FLAG_UPDATE,
+        )
+        .map_err(win_err)?;
     }
     Ok(())
 }
@@ -507,8 +553,18 @@ fn placeholders_for_children(
         let attr = provider.getattr(c.ino).ok();
         let size = attr.map(|a| a.size).unwrap_or(0);
         let mtime = attr.map(|a| a.mtime).unwrap_or(0);
-        let node_id = provider.node_id_for(c.ino).ok().flatten().unwrap_or_default();
-        holders.push(PlaceholderHolder::new(&c.name, &node_id, size, mtime, c.kind == Kind::Dir));
+        let node_id = provider
+            .node_id_for(c.ino)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        holders.push(PlaceholderHolder::new(
+            &c.name,
+            &node_id,
+            size,
+            mtime,
+            c.kind == Kind::Dir,
+        ));
     }
     holders
 }
@@ -535,7 +591,11 @@ impl PlaceholderHolder {
         }
     }
     fn info(&self) -> CF_PLACEHOLDER_CREATE_INFO {
-        let attrs = if self.is_dir { 0x10 /* FILE_ATTRIBUTE_DIRECTORY */ } else { FILE_ATTRIBUTE_NORMAL.0 };
+        let attrs = if self.is_dir {
+            0x10 /* FILE_ATTRIBUTE_DIRECTORY */
+        } else {
+            FILE_ATTRIBUTE_NORMAL.0
+        };
         CF_PLACEHOLDER_CREATE_INFO {
             RelativeFileName: PCWSTR(self.name.as_ptr()),
             FsMetadata: CF_FS_METADATA {
@@ -553,7 +613,8 @@ impl PlaceholderHolder {
             // Mark in-sync (just populated from the source of truth); a later content change
             // dehydrates it via CfUpdatePlaceholder. Disable on-demand population — Phase 1
             // fully populates up front.
-            Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC | CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
+            Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC
+                | CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
             ..Default::default()
         }
     }
@@ -566,7 +627,10 @@ unsafe fn callback_node_id(info: &CF_CALLBACK_INFO) -> Option<String> {
     if info.FileIdentity.is_null() || info.FileIdentityLength == 0 {
         return None;
     }
-    let bytes = std::slice::from_raw_parts(info.FileIdentity as *const u8, info.FileIdentityLength as usize);
+    let bytes = std::slice::from_raw_parts(
+        info.FileIdentity as *const u8,
+        info.FileIdentityLength as usize,
+    );
     FileIdentity(bytes.to_vec()).to_node_id()
 }
 
@@ -696,7 +760,10 @@ unsafe extern "system" fn fetch_data_callback(
         let bytes = match state.provider.read(ino, chunk.offset, chunk.length as u32) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("cfapi: FETCH_DATA node={node_id} read(off={}, len={}) failed: {e}", chunk.offset, chunk.length);
+                eprintln!(
+                    "cfapi: FETCH_DATA node={node_id} read(off={}, len={}) failed: {e}",
+                    chunk.offset, chunk.length
+                );
                 transfer_data_error(info, chunk.offset as i64);
                 return;
             }
@@ -715,7 +782,10 @@ unsafe extern "system" fn fetch_data_callback(
             },
         };
         if let Err(e) = CfExecute(&op_info, &mut op_params) {
-            eprintln!("cfapi: CfExecute(TRANSFER_DATA off={}) failed: {e}", chunk.offset);
+            eprintln!(
+                "cfapi: CfExecute(TRANSFER_DATA off={}) failed: {e}",
+                chunk.offset
+            );
             return; // the kernel saw an error on this slice; stop streaming
         }
         // Report progress so Explorer shows a hydration bar for a big file. Best-effort — a
@@ -727,13 +797,25 @@ unsafe extern "system" fn fetch_data_callback(
 
         // B6.3: honor a CANCEL_FETCH_DATA that arrived for this transfer — stop streaming further
         // slices (the kernel already knows the transfer is cancelled; no extra completion needed).
-        if state.cancelled_transfers.lock().unwrap().remove(&info.TransferKey) {
-            eprintln!("cfapi: FETCH_DATA node={node_id} cancelled mid-stream at off={}", chunk.offset);
+        if state
+            .cancelled_transfers
+            .lock()
+            .unwrap()
+            .remove(&info.TransferKey)
+        {
+            eprintln!(
+                "cfapi: FETCH_DATA node={node_id} cancelled mid-stream at off={}",
+                chunk.offset
+            );
             return;
         }
     }
     // Done streaming cleanly — clear any (late) cancel marker for this key so it can't leak.
-    state.cancelled_transfers.lock().unwrap().remove(&info.TransferKey);
+    state
+        .cancelled_transfers
+        .lock()
+        .unwrap()
+        .remove(&info.TransferKey);
 }
 
 /// CANCEL_FETCH_DATA: the platform aborts an in-flight hydration (the reading app closed the
@@ -754,7 +836,11 @@ unsafe extern "system" fn cancel_fetch_data_callback(
     }
     let state = &*state;
     eprintln!("cfapi: CANCEL_FETCH_DATA transfer_key={}", info.TransferKey);
-    state.cancelled_transfers.lock().unwrap().insert(info.TransferKey);
+    state
+        .cancelled_transfers
+        .lock()
+        .unwrap()
+        .insert(info.TransferKey);
 }
 
 /// B6.1 — reconcile a placeholder's **pin state** to its local bytes ("Always keep on this device"
@@ -877,7 +963,10 @@ unsafe extern "system" fn fetch_placeholders_callback(
     }
     let holders = placeholders_for_children(&state.provider, &children);
     let mut infos: Vec<CF_PLACEHOLDER_CREATE_INFO> = holders.iter().map(|h| h.info()).collect();
-    eprintln!("cfapi: FETCH_PLACEHOLDERS dir_ino={dir_ino} → {} entries", infos.len());
+    eprintln!(
+        "cfapi: FETCH_PLACEHOLDERS dir_ino={dir_ino} → {} entries",
+        infos.len()
+    );
 
     let op_info = op_info_for(info, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
     let mut op_params = CF_OPERATION_PARAMETERS {
@@ -892,7 +981,11 @@ unsafe extern "system" fn fetch_placeholders_callback(
                 // `Vec::as_mut_ptr()` returns for a zero-length Vec — CfExecute rejects the
                 // latter with 0x8007017C ("the cloud operation is invalid"), which broke
                 // enumeration of any empty folder / a fresh (empty) library.
-                PlaceholderArray: if infos.is_empty() { std::ptr::null_mut() } else { infos.as_mut_ptr() },
+                PlaceholderArray: if infos.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    infos.as_mut_ptr()
+                },
                 PlaceholderCount: infos.len() as u32,
                 EntriesProcessed: 0,
             },
@@ -940,7 +1033,11 @@ unsafe extern "system" fn notify_file_close_callback(
     let state = &*state;
 
     // Full on-disk path = VolumeDosName ("C:") + NormalizedPath ("\Users\…\file").
-    let path = format!("{}{}", pcwstr_string(info.VolumeDosName), pcwstr_string(info.NormalizedPath));
+    let path = format!(
+        "{}{}",
+        pcwstr_string(info.VolumeDosName),
+        pcwstr_string(info.NormalizedPath)
+    );
 
     // A placeholder carries its node_id; a brand-new file the user dropped in does not.
     let node_id = match callback_node_id(info) {
@@ -967,7 +1064,10 @@ unsafe extern "system" fn notify_file_close_callback(
     if current.as_deref() == Some(on_disk.as_slice()) {
         return; // unchanged — our own hydration write or a plain read
     }
-    eprintln!("cfapi: local edit captured node={node_id} ({} bytes) → ingest + push", on_disk.len());
+    eprintln!(
+        "cfapi: local edit captured node={node_id} ({} bytes) → ingest + push",
+        on_disk.len()
+    );
     if let Err(e) = state.provider.ingest_bytes(ino, &on_disk) {
         eprintln!("cfapi: ingest_bytes(node={node_id}) failed: {e}");
         return;
@@ -989,7 +1089,12 @@ unsafe extern "system" fn notify_file_close_callback(
         None,
     ) {
         let mut usn: i64 = 0;
-        let _ = CfSetInSyncState(handle, CF_IN_SYNC_STATE_IN_SYNC, CF_SET_IN_SYNC_FLAG_NONE, Some(&mut usn));
+        let _ = CfSetInSyncState(
+            handle,
+            CF_IN_SYNC_STATE_IN_SYNC,
+            CF_SET_IN_SYNC_FLAG_NONE,
+            Some(&mut usn),
+        );
         let _ = CloseHandle(handle);
     }
 }
@@ -1024,7 +1129,9 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
     let rel = match library_relative(&root_str, path) {
         Some(r) if !r.is_empty() => r,
         _ => {
-            eprintln!("cfapi: new file {path} — not under root {root_str} (or is the root), skipping");
+            eprintln!(
+                "cfapi: new file {path} — not under root {root_str} (or is the root), skipping"
+            );
             return; // outside the root (or the root itself) — nothing to capture
         }
     };
@@ -1074,9 +1181,16 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
                 return; // unchanged — nothing to capture (our own write or a no-op touch)
             }
             if let Err(e) = state.provider.ingest_bytes(a.ino, &bytes) {
-                eprintln!("cfapi: capture edit ingest_bytes(ino={}) failed: {e}", a.ino);
+                eprintln!(
+                    "cfapi: capture edit ingest_bytes(ino={}) failed: {e}",
+                    a.ino
+                );
             } else {
-                eprintln!("cfapi: edit captured rel={rel} ino={} ({} bytes)", a.ino, bytes.len());
+                eprintln!(
+                    "cfapi: edit captured rel={rel} ino={} ({} bytes)",
+                    a.ino,
+                    bytes.len()
+                );
             }
             return; // already a placeholder; no convert needed
         }
@@ -1099,7 +1213,10 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
         eprintln!("cfapi: new file ingest_bytes(node={node_id}) failed: {e}");
         return;
     }
-    eprintln!("cfapi: new file captured rel={rel} node={node_id} ({} bytes)", bytes.len());
+    eprintln!(
+        "cfapi: new file captured rel={rel} node={node_id} ({} bytes)",
+        bytes.len()
+    );
 
     // During teardown, skip the re-entrant CfAPI convert (it can deadlock the closing
     // connection). The node + bytes are already in the provider/outbox, so the shutdown drain
@@ -1112,7 +1229,11 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
     // Convert the real on-disk file into a placeholder carrying our identity so future closes
     // take the edit path (content-compare). Mark in-sync — the bytes are already correct locally
     // and the sync loop will push them. Guard the echo (our convert fires another close).
-    state.self_writes.lock().unwrap().insert(path.to_string(), std::time::Instant::now());
+    state
+        .self_writes
+        .lock()
+        .unwrap()
+        .insert(path.to_string(), std::time::Instant::now());
     let identity = FileIdentity::from_node_id(&node_id);
     let path_w = path_wide(Path::new(path));
     match CreateFileW(
@@ -1187,7 +1308,11 @@ unsafe extern "system" fn notify_delete_callback(
     // via `CfApiInvalidate::removed`/`moved`), this NOTIFY_DELETE is our own echo. Mirroring it would
     // re-enqueue a spurious `delete` to the outbox (or, mid-move, delete the relocated node). Consume
     // the mark and skip the mirror — but still ACK below so the OS delete proceeds.
-    let path = format!("{}{}", pcwstr_string(info.VolumeDosName), pcwstr_string(info.NormalizedPath));
+    let path = format!(
+        "{}{}",
+        pcwstr_string(info.VolumeDosName),
+        pcwstr_string(info.NormalizedPath)
+    );
     let is_echo = state.self_removes.take(&path);
     if is_echo {
         eprintln!("cfapi: delete at {path} — echo of our own remove, not mirrored");
@@ -1251,43 +1376,52 @@ unsafe extern "system" fn notify_rename_callback(
     // Echo guard: a daemon-applied move is done as remove-old + create-new (not a `MoveFileEx`), so
     // it should NOT surface here — but if a future path or the OS coalesces it into a rename, the
     // SOURCE path carries our mark. Consume it and skip the mirror (still ACK below).
-    let src_path = format!("{}{}", pcwstr_string(info.VolumeDosName), pcwstr_string(info.NormalizedPath));
+    let src_path = format!(
+        "{}{}",
+        pcwstr_string(info.VolumeDosName),
+        pcwstr_string(info.NormalizedPath)
+    );
     let is_echo = state.self_removes.take(&src_path);
     if !is_echo {
-    if let Some(node_id) = callback_node_id(info) {
-        // The target path is volume-relative (e.g. `\Users\…\new`); prefix the volume DOS name
-        // (e.g. `C:`) to form the full on-disk path, mirroring the close callback.
-        if !params.is_null() {
-            let params = &*params;
-            let target = format!(
-                "{}{}",
-                pcwstr_string(info.VolumeDosName),
-                pcwstr_string(params.Anonymous.Rename.TargetPath),
-            );
-            let root_str = state.root.to_string_lossy();
-            match library_relative(&root_str, &target) {
-                Some(rel) if !rel.is_empty() => match state.provider.resolve_path(&rel) {
-                    Ok((new_parent, new_name)) => {
-                        // B6.4: the node's cached path (and, for a moved dir, its whole subtree)
-                        // is now stale. Drop the node's entry; subtree children are re-learned on
-                        // the next enumeration (a miss falls back to the tree walk meanwhile).
-                        if let Ok(Some(ino)) = state.provider.ino_for_node_id(&node_id) {
-                            state.path_index.invalidate(ino);
+        if let Some(node_id) = callback_node_id(info) {
+            // The target path is volume-relative (e.g. `\Users\…\new`); prefix the volume DOS name
+            // (e.g. `C:`) to form the full on-disk path, mirroring the close callback.
+            if !params.is_null() {
+                let params = &*params;
+                let target = format!(
+                    "{}{}",
+                    pcwstr_string(info.VolumeDosName),
+                    pcwstr_string(params.Anonymous.Rename.TargetPath),
+                );
+                let root_str = state.root.to_string_lossy();
+                match library_relative(&root_str, &target) {
+                    Some(rel) if !rel.is_empty() => match state.provider.resolve_path(&rel) {
+                        Ok((new_parent, new_name)) => {
+                            // B6.4: the node's cached path (and, for a moved dir, its whole subtree)
+                            // is now stale. Drop the node's entry; subtree children are re-learned on
+                            // the next enumeration (a miss falls back to the tree walk meanwhile).
+                            if let Ok(Some(ino)) = state.provider.ino_for_node_id(&node_id) {
+                                state.path_index.invalidate(ino);
+                            }
+                            if let Err(e) = state
+                                .provider
+                                .rename_by_node_id(&node_id, new_parent, &new_name)
+                            {
+                                eprintln!("cfapi: rename_by_node_id(node={node_id}) failed: {e}");
+                            } else {
+                                eprintln!("cfapi: rename captured node={node_id} -> {rel}");
+                            }
                         }
-                        if let Err(e) = state.provider.rename_by_node_id(&node_id, new_parent, &new_name) {
-                            eprintln!("cfapi: rename_by_node_id(node={node_id}) failed: {e}");
-                        } else {
-                            eprintln!("cfapi: rename captured node={node_id} -> {rel}");
-                        }
-                    }
-                    Err(e) => eprintln!("cfapi: rename resolve_path(rel={rel}) failed: {e}"),
-                },
-                // Target outside the sync root (or the root itself): nothing to mirror as a
-                // rename — just ACK below so the OS op isn't blocked.
-                _ => eprintln!("cfapi: rename target outside root for node={node_id} — not mirrored"),
+                        Err(e) => eprintln!("cfapi: rename resolve_path(rel={rel}) failed: {e}"),
+                    },
+                    // Target outside the sync root (or the root itself): nothing to mirror as a
+                    // rename — just ACK below so the OS op isn't blocked.
+                    _ => eprintln!(
+                        "cfapi: rename target outside root for node={node_id} — not mirrored"
+                    ),
+                }
             }
         }
-    }
     } else {
         eprintln!("cfapi: rename of {src_path} — echo of our own move, not mirrored");
     }
@@ -1377,7 +1511,10 @@ impl CfApiMountHandle {
         let root_w = path_wide(&self.root);
         let unregister = unsafe { CfUnregisterSyncRoot(PCWSTR(root_w.as_ptr())) };
         if let Err(e) = &unregister {
-            eprintln!("cfapi: CfUnregisterSyncRoot({}) failed: {e}", self.root.display());
+            eprintln!(
+                "cfapi: CfUnregisterSyncRoot({}) failed: {e}",
+                self.root.display()
+            );
         } else {
             eprintln!("cfapi: unregistered sync root {}", self.root.display());
         }
@@ -1393,7 +1530,9 @@ impl CfApiMountHandle {
         }
         // Mark torn down + reclaim the state box, so Drop is a no-op.
         self.torn_down = true;
-        unsafe { drop(Box::from_raw(self.state)); }
+        unsafe {
+            drop(Box::from_raw(self.state));
+        }
         // Surface a failure (unregister first, then folder delete) so a caller/UI can report it.
         unregister.map_err(win_err)?;
         if let Some(e) = folder_err {
@@ -1488,7 +1627,13 @@ impl CfApiInvalidate {
         path_index: Arc<crate::PathIndex>,
         self_removes: Arc<crate::SelfOps>,
     ) -> Self {
-        Self { provider, root, path_index, shutdown, self_removes }
+        Self {
+            provider,
+            root,
+            path_index,
+            shutdown,
+            self_removes,
+        }
     }
 
     /// Resolve an ino to its absolute path under the sync root. **O(1)** on an index hit (the
@@ -1570,7 +1715,10 @@ impl CfApiInvalidate {
             ) {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("cfapi: invalidate ino={ino} open {} failed: {e}", path.display());
+                    eprintln!(
+                        "cfapi: invalidate ino={ino} open {} failed: {e}",
+                        path.display()
+                    );
                     return;
                 }
             };
@@ -1588,18 +1736,36 @@ impl CfApiInvalidate {
                 None,
             );
             match &r {
-                Ok(()) => eprintln!("cfapi: invalidated ino={ino} size={} — update+dehydrate OK", attr.size),
+                Ok(()) => eprintln!(
+                    "cfapi: invalidated ino={ino} size={} — update+dehydrate OK",
+                    attr.size
+                ),
                 Err(e) => {
                     // The combined flag can be rejected depending on the file's state. Fall back
                     // to the dedicated steps: stamp metadata, then dehydrate explicitly — the
                     // dehydrate is what actually forces the re-fetch, so it must run.
-                    eprintln!("cfapi: invalidate ino={ino} update+dehydrate failed: {e} — splitting");
+                    eprintln!(
+                        "cfapi: invalidate ino={ino} update+dehydrate failed: {e} — splitting"
+                    );
                     let mut usn2: i64 = 0;
                     let r_meta = CfUpdatePlaceholder(
-                        handle, Some(&metadata), None, 0, None, CF_UPDATE_FLAG_MARK_IN_SYNC, Some(&mut usn2), None,
+                        handle,
+                        Some(&metadata),
+                        None,
+                        0,
+                        None,
+                        CF_UPDATE_FLAG_MARK_IN_SYNC,
+                        Some(&mut usn2),
+                        None,
                     );
                     eprintln!("cfapi: invalidate ino={ino} metadata update: {r_meta:?}");
-                    let r_dehy = CfDehydratePlaceholder(handle, 0, attr.size as i64, CF_DEHYDRATE_FLAG_NONE, None);
+                    let r_dehy = CfDehydratePlaceholder(
+                        handle,
+                        0,
+                        attr.size as i64,
+                        CF_DEHYDRATE_FLAG_NONE,
+                        None,
+                    );
                     eprintln!("cfapi: invalidate ino={ino} CfDehydratePlaceholder: {r_dehy:?}");
                 }
             }
@@ -1644,7 +1810,9 @@ impl CfApiInvalidate {
         let chain = match chain {
             Some(c) => c,
             None => {
-                eprintln!("cfapi: created ino={ino} — ancestor chain unresolvable (cycle?), skipping");
+                eprintln!(
+                    "cfapi: created ino={ino} — ancestor chain unresolvable (cycle?), skipping"
+                );
                 return;
             }
         };
@@ -1700,7 +1868,9 @@ impl CfApiInvalidate {
             Some(p) => p,
             None => {
                 // Never enumerated → no on-disk placeholder to remove (Explorer never created one).
-                eprintln!("cfapi: removed ino={ino} — no cached path (not enumerated), nothing on disk");
+                eprintln!(
+                    "cfapi: removed ino={ino} — no cached path (not enumerated), nothing on disk"
+                );
                 return;
             }
         };
@@ -1714,7 +1884,10 @@ impl CfApiInvalidate {
         };
         match removed {
             Ok(()) => eprintln!("cfapi: removed placeholder ino={ino} at {}", path.display()),
-            Err(e) => eprintln!("cfapi: removed ino={ino} remove {} failed: {e}", path.display()),
+            Err(e) => eprintln!(
+                "cfapi: removed ino={ino} remove {} failed: {e}",
+                path.display()
+            ),
         }
         // Drop the stale index entry regardless (the path no longer maps to this ino).
         self.path_index.invalidate(ino);
@@ -1755,8 +1928,14 @@ impl CfApiInvalidate {
                 Err(_) => Ok(()), // already gone — fine
             };
             match removed {
-                Ok(()) => eprintln!("cfapi: moved ino={ino} — removed old placeholder at {}", old.display()),
-                Err(e) => eprintln!("cfapi: moved ino={ino} remove old {} failed: {e}", old.display()),
+                Ok(()) => eprintln!(
+                    "cfapi: moved ino={ino} — removed old placeholder at {}",
+                    old.display()
+                ),
+                Err(e) => eprintln!(
+                    "cfapi: moved ino={ino} remove old {} failed: {e}",
+                    old.display()
+                ),
             }
         } else {
             eprintln!("cfapi: moved ino={ino} — no cached old path (not enumerated); new placeholder created");
@@ -1775,9 +1954,19 @@ impl CfApiInvalidate {
                 return;
             }
         };
-        let node_id = self.provider.node_id_for(ino).ok().flatten().unwrap_or_default();
-        let holder =
-            PlaceholderHolder::new(name, &node_id, attr.size, attr.mtime, attr.kind == Kind::Dir);
+        let node_id = self
+            .provider
+            .node_id_for(ino)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let holder = PlaceholderHolder::new(
+            name,
+            &node_id,
+            attr.size,
+            attr.mtime,
+            attr.kind == Kind::Dir,
+        );
         let mut infos = [holder.info()];
 
         let base_w = path_wide(parent_path);
@@ -1786,7 +1975,8 @@ impl CfApiInvalidate {
         // surface it either as the call's HRESULT OR in the per-entry `infos[0].Result`, so check
         // both. A pre-existing placeholder (e.g. a re-pull, or a dir we already made this pass) is
         // success, not a failure.
-        const HRESULT_ALREADY_EXISTS: windows::core::HRESULT = windows::core::HRESULT(0x8007_00B7u32 as i32);
+        const HRESULT_ALREADY_EXISTS: windows::core::HRESULT =
+            windows::core::HRESULT(0x8007_00B7u32 as i32);
         unsafe {
             let call = CfCreatePlaceholders(
                 PCWSTR(base_w.as_ptr()),

@@ -35,13 +35,22 @@ fn run_convergence(seed: u64, n_replicas: usize, iters: usize) -> usize {
     let mut ctr = 0u64;
     let mut state = seed ^ 0x9e3779b97f4a7c15;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as usize
     };
 
     for iter in 0..iters {
-        let dirs: Vec<u64> = std::iter::once(ROOT).chain(entries.iter().filter(|e| e.dir).map(|e| e.ino)).collect();
-        let files: Vec<usize> = entries.iter().enumerate().filter(|(_, e)| !e.dir).map(|(i, _)| i).collect();
+        let dirs: Vec<u64> = std::iter::once(ROOT)
+            .chain(entries.iter().filter(|e| e.dir).map(|e| e.ino))
+            .collect();
+        let files: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.dir)
+            .map(|(i, _)| i)
+            .collect();
 
         match next() % 7 {
             0 => {
@@ -49,22 +58,39 @@ fn run_convergence(seed: u64, n_replicas: usize, iters: usize) -> usize {
                 ctr += 1;
                 let name = format!("d{ctr}");
                 let a = writer.mkdir(parent, &name).unwrap();
-                entries.push(Entry { ino: a.ino, parent, name, dir: true });
+                entries.push(Entry {
+                    ino: a.ino,
+                    parent,
+                    name,
+                    dir: true,
+                });
             }
             1 => {
                 let parent = dirs[next() % dirs.len()];
                 ctr += 1;
                 let name = format!("f{ctr}");
                 let a = writer.create(parent, &name).unwrap();
-                let body: Vec<u8> = (0..(40 + next() % 500)).map(|i| (i ^ ctr as usize) as u8).collect();
+                let body: Vec<u8> = (0..(40 + next() % 500))
+                    .map(|i| (i ^ ctr as usize) as u8)
+                    .collect();
                 writer.write(a.ino, 0, &body).unwrap();
                 writer.flush(a.ino).unwrap();
-                entries.push(Entry { ino: a.ino, parent, name, dir: false });
+                entries.push(Entry {
+                    ino: a.ino,
+                    parent,
+                    name,
+                    dir: false,
+                });
             }
             2 => {
-                if let Some(&i) = files.get(next() % files.len().max(1)).filter(|_| !files.is_empty()) {
+                if let Some(&i) = files
+                    .get(next() % files.len().max(1))
+                    .filter(|_| !files.is_empty())
+                {
                     let e = &entries[i];
-                    let body: Vec<u8> = (0..(20 + next() % 300)).map(|j| j.wrapping_add(iter) as u8).collect();
+                    let body: Vec<u8> = (0..(20 + next() % 300))
+                        .map(|j| j.wrapping_add(iter) as u8)
+                        .collect();
                     writer.truncate(e.ino, 0).unwrap();
                     writer.write(e.ino, 0, &body).unwrap();
                     writer.flush(e.ino).unwrap();
@@ -107,7 +133,8 @@ fn run_convergence(seed: u64, n_replicas: usize, iters: usize) -> usize {
                     let si = files[next() % files.len()];
                     let mut di = files[next() % files.len()];
                     if di == si {
-                        di = files[(files.iter().position(|&x| x == si).unwrap() + 1) % files.len()];
+                        di =
+                            files[(files.iter().position(|&x| x == si).unwrap() + 1) % files.len()];
                     }
                     if di != si {
                         let src_ino = entries[si].ino;
@@ -128,7 +155,11 @@ fn run_convergence(seed: u64, n_replicas: usize, iters: usize) -> usize {
         sync_to(&writer, &refs);
         let w = tree_snapshot(&writer);
         for (k, r) in replicas.iter().enumerate() {
-            assert_eq!(tree_snapshot(r), w, "replica {k} diverged after iter {iter} (seed {seed})");
+            assert_eq!(
+                tree_snapshot(r),
+                w,
+                "replica {k} diverged after iter {iter} (seed {seed})"
+            );
         }
     }
     entries.len()
@@ -154,7 +185,10 @@ fn convergence_does_nontrivial_work() {
             built_something = true;
         }
     }
-    assert!(built_something, "harness should leave a surviving tree for at least one seed");
+    assert!(
+        built_something,
+        "harness should leave a surviving tree for at least one seed"
+    );
 }
 
 // ---- idempotency / durability ------------------------------------------------------
@@ -175,7 +209,11 @@ fn apply_remote_is_idempotent() {
     for n in &nodes {
         b.apply_remote(n).unwrap();
     }
-    assert_eq!(tree_snapshot(&b), once, "re-applying the same nodes is idempotent");
+    assert_eq!(
+        tree_snapshot(&b),
+        once,
+        "re-applying the same nodes is idempotent"
+    );
 }
 
 #[test]
@@ -193,18 +231,33 @@ fn apply_remote_displaces_a_name_collision() {
     let b = provider();
     write_file(&b, ROOT, "doc.txt", b"stale local");
     let stale_id = node_named(&b, "doc.txt").node_id;
-    assert_ne!(stale_id, incoming.node_id, "the two doc.txt nodes are distinct");
+    assert_ne!(
+        stale_id, incoming.node_id,
+        "the two doc.txt nodes are distinct"
+    );
 
     // Applying the remote node must succeed (no UNIQUE error) and replace the stale one.
-    b.apply_remote(&incoming).expect("apply_remote must displace the colliding node, not error");
+    b.apply_remote(&incoming)
+        .expect("apply_remote must displace the colliding node, not error");
 
     let after = node_named(&b, "doc.txt");
-    assert_eq!(after.node_id, incoming.node_id, "the incoming node_id now owns the name");
+    assert_eq!(
+        after.node_id, incoming.node_id,
+        "the incoming node_id now owns the name"
+    );
     let ino = b.lookup(ROOT, "doc.txt").unwrap().ino;
-    assert_eq!(read_all(&b, ino), b"incoming wins", "content is the incoming node's");
+    assert_eq!(
+        read_all(&b, ino),
+        b"incoming wins",
+        "content is the incoming node's"
+    );
     // Exactly one node holds the name (the stale row is gone).
     assert_eq!(
-        b.export_tree().unwrap().iter().filter(|n| n.name == "doc.txt").count(),
+        b.export_tree()
+            .unwrap()
+            .iter()
+            .filter(|n| n.name == "doc.txt")
+            .count(),
         1,
         "no duplicate (parent, name) rows remain"
     );
@@ -221,19 +274,35 @@ fn state_persists_across_reopen() {
 
     let body: Vec<u8> = (0..5000u32).map(|i| (i % 97) as u8).collect();
     let (proj_id, file_id) = {
-        let p = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
+        let p =
+            SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
         let d = p.mkdir(ROOT, "proj").unwrap();
         let ino = write_file(&p, d.ino, "part.bin", &body);
-        (p.node_id_for(d.ino).unwrap().unwrap(), p.node_id_for(ino).unwrap().unwrap())
+        (
+            p.node_id_for(d.ino).unwrap().unwrap(),
+            p.node_id_for(ino).unwrap().unwrap(),
+        )
     };
 
     // Reopen from the same files.
     let p2 = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
     let proj = p2.lookup(ROOT, "proj").unwrap();
-    assert_eq!(p2.node_id_for(proj.ino).unwrap().unwrap(), proj_id, "dir id survives restart");
+    assert_eq!(
+        p2.node_id_for(proj.ino).unwrap().unwrap(),
+        proj_id,
+        "dir id survives restart"
+    );
     let f = p2.lookup(proj.ino, "part.bin").unwrap();
-    assert_eq!(p2.node_id_for(f.ino).unwrap().unwrap(), file_id, "file id survives restart");
-    assert_eq!(read_all(&p2, f.ino), body, "content survives restart (chunks on disk)");
+    assert_eq!(
+        p2.node_id_for(f.ino).unwrap().unwrap(),
+        file_id,
+        "file id survives restart"
+    );
+    assert_eq!(
+        read_all(&p2, f.ino),
+        body,
+        "content survives restart (chunks on disk)"
+    );
 }
 
 #[test]
@@ -250,15 +319,24 @@ fn truncate_to_zero_works_on_unhydrated_placeholder() {
     let dir = tempdir::Dir::new();
     let replica = SqliteProvider::in_memory(
         Box::new(LocalChunkStore::new(dir.path()).unwrap()),
-        fs_provider::ChunkConfig { min: 64, avg: 256, max: 1024 },
+        fs_provider::ChunkConfig {
+            min: 64,
+            avg: 256,
+            max: 1024,
+        },
     )
     .unwrap();
     replica.apply_remote(&node).unwrap();
     let ino = replica.lookup(ROOT, "f.bin").unwrap().ino;
-    assert!(replica.read(ino, 0, 10).is_err(), "placeholder bytes are genuinely absent");
+    assert!(
+        replica.read(ino, 0, 10).is_err(),
+        "placeholder bytes are genuinely absent"
+    );
 
     // O_TRUNC overwrite: truncate to empty (must succeed without the base), then write.
-    replica.truncate(ino, 0).expect("truncate(0) must not require hydration");
+    replica
+        .truncate(ino, 0)
+        .expect("truncate(0) must not require hydration");
     replica.write(ino, 0, b"rewritten").unwrap();
     replica.flush(ino).unwrap();
     assert_eq!(read_all(&replica, ino), b"rewritten");
@@ -275,11 +353,25 @@ fn replica_converges_on_replace_rename() {
     sync_to(&writer, &[&replica]);
     assert_eq!(tree_snapshot(&replica), tree_snapshot(&writer));
 
-    writer.rename(ROOT, "note.txt.tmp", ROOT, "note.txt").unwrap();
+    writer
+        .rename(ROOT, "note.txt.tmp", ROOT, "note.txt")
+        .unwrap();
     sync_to(&writer, &[&replica]);
 
-    assert_eq!(tree_snapshot(&replica), tree_snapshot(&writer), "replica converged on the replace");
-    let n = replica.readdir(ROOT).unwrap().iter().filter(|e| e.name == "note.txt").count();
+    assert_eq!(
+        tree_snapshot(&replica),
+        tree_snapshot(&writer),
+        "replica converged on the replace"
+    );
+    let n = replica
+        .readdir(ROOT)
+        .unwrap()
+        .iter()
+        .filter(|e| e.name == "note.txt")
+        .count();
     assert_eq!(n, 1, "no duplicate note.txt on the replica");
-    assert!(replica.lookup(ROOT, "note.txt.tmp").is_err(), "tmp gone on replica");
+    assert!(
+        replica.lookup(ROOT, "note.txt.tmp").is_err(),
+        "tmp gone on replica"
+    );
 }

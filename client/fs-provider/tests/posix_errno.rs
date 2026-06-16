@@ -48,7 +48,10 @@ fn rename_file_onto_existing_directory_is_eisdir() {
     let p = provider();
     write_file(&p, ROOT, "src", b"s");
     p.mkdir(ROOT, "dstdir").unwrap();
-    assert!(matches!(p.rename(ROOT, "src", ROOT, "dstdir"), Err(FsError::IsADirectory)));
+    assert!(matches!(
+        p.rename(ROOT, "src", ROOT, "dstdir"),
+        Err(FsError::IsADirectory)
+    ));
     // Both survive: nothing was replaced.
     assert_eq!(read_all(&p, p.lookup(ROOT, "src").unwrap().ino), b"s");
     assert_eq!(p.lookup(ROOT, "dstdir").unwrap().kind, Kind::Dir);
@@ -61,7 +64,10 @@ fn rename_directory_onto_existing_file_is_enotdir() {
     let p = provider();
     p.mkdir(ROOT, "srcdir").unwrap();
     write_file(&p, ROOT, "dstfile", b"d");
-    assert!(matches!(p.rename(ROOT, "srcdir", ROOT, "dstfile"), Err(FsError::NotADirectory)));
+    assert!(matches!(
+        p.rename(ROOT, "srcdir", ROOT, "dstfile"),
+        Err(FsError::NotADirectory)
+    ));
     assert_eq!(p.lookup(ROOT, "srcdir").unwrap().kind, Kind::Dir);
     assert_eq!(read_all(&p, p.lookup(ROOT, "dstfile").unwrap().ino), b"d");
 }
@@ -74,7 +80,10 @@ fn rename_into_missing_parent_is_enoent() {
     // rename/03.
     let p = provider();
     write_file(&p, ROOT, "src", b"s");
-    assert!(matches!(p.rename(ROOT, "src", 999_999, "x"), Err(FsError::NotFound)));
+    assert!(matches!(
+        p.rename(ROOT, "src", 999_999, "x"),
+        Err(FsError::NotFound)
+    ));
     // The source is still where it was — the failed rename was a no-op.
     assert_eq!(read_all(&p, p.lookup(ROOT, "src").unwrap().ino), b"s");
 }
@@ -86,7 +95,10 @@ fn rename_into_a_file_as_parent_is_enotdir() {
     let p = provider();
     let f = write_file(&p, ROOT, "afile", b"x");
     write_file(&p, ROOT, "src", b"s");
-    assert!(matches!(p.rename(ROOT, "src", f, "x"), Err(FsError::NotADirectory)));
+    assert!(matches!(
+        p.rename(ROOT, "src", f, "x"),
+        Err(FsError::NotADirectory)
+    ));
     assert_eq!(read_all(&p, p.lookup(ROOT, "src").unwrap().ino), b"s");
 }
 
@@ -99,9 +111,15 @@ fn rename_directory_into_its_own_subtree_is_einval() {
     let a = p.mkdir(ROOT, "a").unwrap();
     let b = p.mkdir(a.ino, "b").unwrap();
     // Try to move `a` to be `a/b/a` — `a` would contain itself.
-    assert!(matches!(p.rename(ROOT, "a", b.ino, "a"), Err(FsError::InvalidArgument)));
+    assert!(matches!(
+        p.rename(ROOT, "a", b.ino, "a"),
+        Err(FsError::InvalidArgument)
+    ));
     // The tree is intact: a/b still resolves from root.
-    assert_eq!(p.lookup(p.lookup(ROOT, "a").unwrap().ino, "b").unwrap().ino, b.ino);
+    assert_eq!(
+        p.lookup(p.lookup(ROOT, "a").unwrap().ino, "b").unwrap().ino,
+        b.ino
+    );
 }
 
 #[test]
@@ -113,7 +131,10 @@ fn rename_directory_onto_nonempty_directory_is_enotempty() {
     write_file(&p, src.ino, "x", b"x");
     let dst = p.mkdir(ROOT, "dst").unwrap();
     write_file(&p, dst.ino, "y", b"y");
-    assert!(matches!(p.rename(ROOT, "src", ROOT, "dst"), Err(FsError::NotEmpty)));
+    assert!(matches!(
+        p.rename(ROOT, "src", ROOT, "dst"),
+        Err(FsError::NotEmpty)
+    ));
 }
 
 #[test]
@@ -123,7 +144,8 @@ fn rename_directory_onto_empty_directory_succeeds() {
     let src = p.mkdir(ROOT, "src").unwrap();
     write_file(&p, src.ino, "kid", b"k");
     p.mkdir(ROOT, "dst").unwrap(); // empty
-    p.rename(ROOT, "src", ROOT, "dst").expect("dir over empty dir replaces");
+    p.rename(ROOT, "src", ROOT, "dst")
+        .expect("dir over empty dir replaces");
     assert!(matches!(p.lookup(ROOT, "src"), Err(FsError::NotFound)));
     // The moved directory keeps its child.
     let dst = p.lookup(ROOT, "dst").unwrap();
@@ -141,7 +163,8 @@ fn rename_directory_into_a_sibling_subtree_is_allowed() {
     write_file(&p, src.ino, "kid", b"k");
     let other = p.mkdir(ROOT, "other").unwrap();
     let deep = p.mkdir(other.ino, "deep").unwrap();
-    p.rename(ROOT, "src", deep.ino, "moved").expect("move into an unrelated subtree is legal");
+    p.rename(ROOT, "src", deep.ino, "moved")
+        .expect("move into an unrelated subtree is legal");
     assert!(matches!(p.lookup(ROOT, "src"), Err(FsError::NotFound)));
     let moved = p.lookup(deep.ino, "moved").unwrap();
     assert_eq!(moved.kind, Kind::Dir);
@@ -153,7 +176,8 @@ fn rename_onto_self_is_a_noop() {
     // POSIX: rename(x, x) when both resolve to the same node succeeds and changes nothing.
     let p = provider();
     let ino = write_file(&p, ROOT, "f", b"data");
-    p.rename(ROOT, "f", ROOT, "f").expect("rename onto self is a no-op");
+    p.rename(ROOT, "f", ROOT, "f")
+        .expect("rename onto self is a no-op");
     assert_eq!(read_all(&p, p.lookup(ROOT, "f").unwrap().ino), b"data");
     assert_eq!(p.lookup(ROOT, "f").unwrap().ino, ino);
 }
@@ -188,7 +212,10 @@ fn rename_to_256_byte_name_is_enametoolong() {
     let p = provider();
     write_file(&p, ROOT, "src", b"s");
     let long = "z".repeat(256);
-    assert!(matches!(p.rename(ROOT, "src", ROOT, &long), Err(FsError::NameTooLong)));
+    assert!(matches!(
+        p.rename(ROOT, "src", ROOT, &long),
+        Err(FsError::NameTooLong)
+    ));
     // The source is untouched (the failed rename was a no-op).
     assert_eq!(read_all(&p, p.lookup(ROOT, "src").unwrap().ino), b"s");
 }
@@ -201,7 +228,10 @@ fn name_length_limit_counts_bytes_not_chars() {
     let p = provider();
     let multibyte = "é".repeat(128); // 256 bytes, 128 chars
     assert_eq!(multibyte.len(), 256);
-    assert!(matches!(p.create(ROOT, &multibyte), Err(FsError::NameTooLong)));
+    assert!(matches!(
+        p.create(ROOT, &multibyte),
+        Err(FsError::NameTooLong)
+    ));
 }
 
 // ---- chmod: full 12-bit permission round-trip ------------------------------------------
@@ -213,9 +243,18 @@ fn chmod_preserves_all_permission_bits_including_special() {
     // value using every group survives a round-trip (it must not drop setuid/setgid/sticky).
     let p = provider();
     let ino = write_file(&p, ROOT, "f", b"x");
-    for &mode in &[0o644u32, 0o600, 0o755, 0o4755 /*setuid*/, 0o2755 /*setgid*/, 0o1777 /*sticky*/, 0o7777] {
+    for &mode in &[
+        0o644u32, 0o600, 0o755, 0o4755, /*setuid*/
+        0o2755, /*setgid*/
+        0o1777, /*sticky*/
+        0o7777,
+    ] {
         p.set_mode(ino, mode).unwrap();
-        assert_eq!(p.getattr(ino).unwrap().mode, mode, "mode {mode:o} round-trips");
+        assert_eq!(
+            p.getattr(ino).unwrap().mode,
+            mode,
+            "mode {mode:o} round-trips"
+        );
     }
 }
 
@@ -226,7 +265,11 @@ fn chmod_ignores_non_permission_high_bits() {
     let p = provider();
     let ino = write_file(&p, ROOT, "f", b"x");
     p.set_mode(ino, 0o100644 /* S_IFREG | 0644 */).unwrap();
-    assert_eq!(p.getattr(ino).unwrap().mode, 0o644, "type bits stripped, perms kept");
+    assert_eq!(
+        p.getattr(ino).unwrap().mode,
+        0o644,
+        "type bits stripped, perms kept"
+    );
 }
 
 #[test]

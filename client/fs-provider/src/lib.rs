@@ -196,7 +196,10 @@ pub struct SearchOpts {
 
 impl Default for SearchOpts {
     fn default() -> Self {
-        Self { limit: 200, offset: 0 }
+        Self {
+            limit: 200,
+            offset: 0,
+        }
     }
 }
 
@@ -472,12 +475,21 @@ impl SqliteProvider {
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN version_id TEXT", []);
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN mode INTEGER", []);
         // atime column on an existing DB (device-local access time; 0 → falls back to mtime).
-        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN atime INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE nodes ADD COLUMN atime INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // Symlink support (git checkout of a symlinked path); NULL on older rows + non-links.
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN symlink_target BLOB", []);
         // G5 debounce columns on an existing outbox (no-op on a fresh DB).
-        let _ = conn.execute("ALTER TABLE outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0", []);
-        let _ = conn.execute("ALTER TABLE outbox ADD COLUMN first_enqueued_at INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE outbox ADD COLUMN first_enqueued_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // Selective-sync subscription state (per-device hydration policy; never synced).
         Self::init_subscriptions(&conn)?;
         // Ensure the root directory (ino 1) exists.
@@ -514,7 +526,10 @@ impl SqliteProvider {
                     size: r.get::<_, i64>(2)? as u64,
                     mtime,
                     atime,
-                    mode: r.get::<_, Option<i64>>(4)?.map(|m| m as u32).unwrap_or_else(|| default_mode(kind)),
+                    mode: r
+                        .get::<_, Option<i64>>(4)?
+                        .map(|m| m as u32)
+                        .unwrap_or_else(|| default_mode(kind)),
                 })
             },
         )
@@ -533,7 +548,10 @@ impl SqliteProvider {
         let mut out = Vec::new();
         for row in rows {
             let (hash, len) = row?;
-            let bytes = self.store.get(&hash).map_err(|_| FsError::ChunkMissing(hash))?;
+            let bytes = self
+                .store
+                .get(&hash)
+                .map_err(|_| FsError::ChunkMissing(hash))?;
             // Trust the manifest length; chunk store returns the whole chunk.
             out.extend_from_slice(&bytes[..len.min(bytes.len())]);
         }
@@ -549,7 +567,13 @@ impl SqliteProvider {
     /// A `ChunkMissing` for an overlapping chunk propagates (the read path hydrates that range
     /// and retries — same contract as before, just scoped to the range). Bytes past EOF are
     /// simply absent from the result (the caller clamps).
-    fn assemble_range(&self, conn: &Connection, manifest_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
+    fn assemble_range(
+        &self,
+        conn: &Connection,
+        manifest_id: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>> {
         if size == 0 {
             return Ok(Vec::new());
         }
@@ -573,7 +597,10 @@ impl SqliteProvider {
             if c_end <= offset || c_off >= req_end {
                 continue;
             }
-            let bytes = self.store.get(&hash).map_err(|_| FsError::ChunkMissing(hash))?;
+            let bytes = self
+                .store
+                .get(&hash)
+                .map_err(|_| FsError::ChunkMissing(hash))?;
             let bytes = &bytes[..c_len.min(bytes.len())];
             // Overlap of [c_off, c_end) with [offset, req_end), copied into the output buffer.
             let copy_start = c_off.max(offset);
@@ -642,7 +669,9 @@ impl SqliteProvider {
         );
         match res {
             Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
                 return Err(FsError::AlreadyExists)
             }
             Err(e) => return Err(e.into()),
@@ -678,7 +707,11 @@ impl SqliteProvider {
     pub fn node_id_for(&self, ino: u64) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
-            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .query_row(
+                "SELECT node_id FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -709,7 +742,17 @@ impl SqliteProvider {
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (node_id, name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime, symlink_target) = row?;
+            let (
+                node_id,
+                name,
+                kind_s,
+                manifest_id,
+                parent_node_id,
+                version_id,
+                mode,
+                mtime,
+                symlink_target,
+            ) = row?;
             let kind = Kind::from_str(&kind_s);
             let chunks = match &manifest_id {
                 Some(m) => Self::manifest_rows(&conn, m)?,
@@ -778,7 +821,12 @@ impl SqliteProvider {
              LIMIT ?3 OFFSET ?4",
         )?;
         let rows = stmt.query_map(
-            params![ROOT_INO as i64, pattern, opts.limit as i64, opts.offset as i64],
+            params![
+                ROOT_INO as i64,
+                pattern,
+                opts.limit as i64,
+                opts.offset as i64
+            ],
             |r| {
                 let kind = Kind::from_str(&r.get::<_, String>(3)?);
                 Ok(SearchHit {
@@ -809,7 +857,11 @@ impl SqliteProvider {
         let parent_ino: i64 = match &node.parent_node_id {
             None => ROOT_INO as i64,
             Some(pid) => conn
-                .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![pid], |r| r.get(0))
+                .query_row(
+                    "SELECT ino FROM nodes WHERE node_id = ?1",
+                    params![pid],
+                    |r| r.get(0),
+                )
                 .optional()?
                 .ok_or(FsError::NotFound)?,
         };
@@ -858,7 +910,9 @@ impl SqliteProvider {
         // ancestor"). New INSERTs can't form a cycle (a fresh node has no descendants yet), so we
         // only check on a re-parent of an existing node.
         if let Some((self_ino, _, old_parent, _, _)) = &prior {
-            if *old_parent != parent_ino && self.ino_is_ancestor_or_self(&conn, *self_ino, parent_ino)? {
+            if *old_parent != parent_ino
+                && self.ino_is_ancestor_or_self(&conn, *self_ino, parent_ino)?
+            {
                 return Err(FsError::InvalidArgument);
             }
         }
@@ -877,9 +931,8 @@ impl SqliteProvider {
         // delta can never re-add it. We still let the authoritative remote win the name, but we
         // signal `displaced_pending` so the pull caller triggers the reconcile backstop that
         // re-adds the displaced node (still live on the server under its prior name).
-        let displaced_pending: bool = conn
-            .query_row(
-                "SELECT EXISTS(
+        let displaced_pending: bool = conn.query_row(
+            "SELECT EXISTS(
                      SELECT 1 FROM outbox WHERE node_id IN (
                          WITH RECURSIVE sub(ino, node_id) AS (
                              SELECT ino, node_id FROM nodes
@@ -890,9 +943,9 @@ impl SqliteProvider {
                          SELECT node_id FROM sub
                      )
                  )",
-                params![parent_ino, node.name, node.node_id],
-                |r| r.get(0),
-            )?;
+            params![parent_ino, node.name, node.node_id],
+            |r| r.get(0),
+        )?;
         conn.execute(
             "DELETE FROM nodes WHERE ino IN (
                  WITH RECURSIVE sub(ino) AS (
@@ -931,11 +984,19 @@ impl SqliteProvider {
         // changelog models a move as an upsert on the same stable node_id, so this is the only
         // signal that an on-demand-population adapter's old-path placeholder is now stale.
         let moved = match &prior {
-            Some((_, _, old_parent, old_name, _)) => *old_parent != parent_ino || *old_name != node.name,
+            Some((_, _, old_parent, old_name, _)) => {
+                *old_parent != parent_ino || *old_name != node.name
+            }
             None => false,
         };
         let inserted = prior.is_none();
-        Ok(ApplyOutcome { ino, content_changed, inserted, moved, displaced_pending })
+        Ok(ApplyOutcome {
+            ino,
+            content_changed,
+            inserted,
+            moved,
+            displaced_pending,
+        })
     }
 
     /// Would re-parenting a node under `cand` (the proposed new parent ino) create a cycle —
@@ -959,7 +1020,11 @@ impl SqliteProvider {
                 return Ok(false);
             }
             let parent: Option<i64> = conn
-                .query_row("SELECT parent_ino FROM nodes WHERE ino = ?1", params![cur], |r| r.get(0))
+                .query_row(
+                    "SELECT parent_ino FROM nodes WHERE ino = ?1",
+                    params![cur],
+                    |r| r.get(0),
+                )
                 .optional()?
                 .flatten();
             match parent {
@@ -1030,9 +1095,11 @@ impl SqliteProvider {
     pub fn ino_for_node_id(&self, node_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
-            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT ino FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get::<_, i64>(0),
+            )
             .optional()?
             .map(|i| i as u64))
     }
@@ -1051,15 +1118,22 @@ impl SqliteProvider {
     /// → empty. A range past EOF → empty (no chunk overlaps). The whole-file case is just
     /// `manifest_range_hashes(id, 0, u64::MAX)` and returns every distinct chunk, matching
     /// [`node_manifest_hashes`](Self::node_manifest_hashes) (modulo dedup).
-    pub fn manifest_range_hashes(&self, node_id: &str, offset: u64, size: u64) -> Result<Vec<String>> {
+    pub fn manifest_range_hashes(
+        &self,
+        node_id: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<String>> {
         if size == 0 {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
         let mid: Option<String> = conn
-            .query_row("SELECT manifest_id FROM nodes WHERE node_id = ?1", params![node_id], |r| {
-                r.get::<_, Option<String>>(0)
-            })
+            .query_row(
+                "SELECT manifest_id FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
             .optional()?
             .flatten();
         let mid = match mid {
@@ -1095,16 +1169,19 @@ impl SqliteProvider {
     pub fn node_manifest_hashes(&self, node_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mid: Option<String> = conn
-            .query_row("SELECT manifest_id FROM nodes WHERE node_id = ?1", params![node_id], |r| {
-                r.get::<_, Option<String>>(0)
-            })
+            .query_row(
+                "SELECT manifest_id FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
             .optional()?
             .flatten();
         match mid {
             None => Ok(Vec::new()),
             Some(m) => {
-                let mut stmt =
-                    conn.prepare("SELECT chunk_hash FROM manifest_chunks WHERE manifest_id = ?1 ORDER BY seq")?;
+                let mut stmt = conn.prepare(
+                    "SELECT chunk_hash FROM manifest_chunks WHERE manifest_id = ?1 ORDER BY seq",
+                )?;
                 let rows = stmt.query_map(params![m], |r| r.get::<_, String>(0))?;
                 Ok(rows.collect::<std::result::Result<_, _>>()?)
             }
@@ -1124,7 +1201,11 @@ impl SqliteProvider {
     pub fn subtree_files(&self, node_id: &str) -> Result<Vec<SubtreeFile>> {
         let conn = self.conn.lock().unwrap();
         let root_ino: Option<i64> = conn
-            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| r.get(0))
+            .query_row(
+                "SELECT ino FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )
             .optional()?;
         let root_ino = match root_ino {
             None => return Ok(Vec::new()),
@@ -1146,7 +1227,10 @@ impl SqliteProvider {
              ORDER BY path",
         )?;
         let rows = stmt.query_map(params![root_ino], |r| {
-            Ok(SubtreeFile { node_id: r.get::<_, String>(0)?, path: r.get::<_, String>(1)? })
+            Ok(SubtreeFile {
+                node_id: r.get::<_, String>(0)?,
+                path: r.get::<_, String>(1)?,
+            })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -1290,7 +1374,11 @@ impl SqliteProvider {
     /// never drained ahead of a parent that's still debouncing). `window_ms == 0` disables
     /// the debounce entirely (identical to `outbox_list_topo`). A `0` timestamp (older-DB
     /// row) counts as "ready now".
-    pub fn outbox_ready_topo(&self, window_ms: i64, max_age_ms: i64) -> Result<Vec<(String, String)>> {
+    pub fn outbox_ready_topo(
+        &self,
+        window_ms: i64,
+        max_age_ms: i64,
+    ) -> Result<Vec<(String, String)>> {
         if window_ms <= 0 {
             return self.outbox_list_topo();
         }
@@ -1363,7 +1451,11 @@ impl SqliteProvider {
     pub fn cursor(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
-            .query_row("SELECT value FROM sync_state WHERE key = 'cursor'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'cursor'",
+                [],
+                |r| r.get(0),
+            )
             .optional()?
             .unwrap_or(0))
     }
@@ -1377,18 +1469,28 @@ impl SqliteProvider {
     pub fn bind_library(&self, library_id: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let current: Option<i64> = conn
-            .query_row("SELECT value FROM sync_state WHERE key = 'library'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'library'",
+                [],
+                |r| r.get(0),
+            )
             .optional()?;
         if current == Some(library_id) {
             return Ok(false); // same library — keep the local cache + cursor
         }
-        let had_nodes: i64 =
-            conn.query_row("SELECT COUNT(*) FROM nodes WHERE parent_ino IS NOT NULL", [], |r| r.get(0))?;
+        let had_nodes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE parent_ino IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
         conn.execute("DELETE FROM nodes WHERE parent_ino IS NOT NULL", [])?;
         conn.execute("DELETE FROM manifest_chunks", [])?;
         conn.execute("DELETE FROM outbox", [])?;
         conn.execute("DELETE FROM sync_state", [])?; // clears the old cursor too
-        conn.execute("INSERT INTO sync_state(key, value) VALUES ('library', ?1)", params![library_id])?;
+        conn.execute(
+            "INSERT INTO sync_state(key, value) VALUES ('library', ?1)",
+            params![library_id],
+        )?;
         Ok(had_nodes > 0)
     }
 
@@ -1413,7 +1515,11 @@ impl SqliteProvider {
     pub fn needs_resync(&self) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
-            .query_row("SELECT value FROM sync_state WHERE key = 'needs_resync'", [], |r| r.get::<_, i64>(0))
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'needs_resync'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
             .optional()?
             .unwrap_or(0)
             != 0)
@@ -1455,10 +1561,11 @@ impl SqliteProvider {
                 },
             )
             .optional()?;
-        let (name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime, symlink_target) = match row {
-            Some(r) => r,
-            None => return Ok(None),
-        };
+        let (name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime, symlink_target) =
+            match row {
+                Some(r) => r,
+                None => return Ok(None),
+            };
         let kind = Kind::from_str(&kind_s);
         let chunks = match &manifest_id {
             Some(m) => Self::manifest_rows(&conn, m)?,
@@ -1682,7 +1789,11 @@ impl Provider for SqliteProvider {
         // read-path hydrates *that range* and retries (instead of needing the whole file).
         let conn = self.conn.lock().unwrap();
         let manifest: Option<String> = conn
-            .query_row("SELECT manifest_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .query_row(
+                "SELECT manifest_id FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| r.get(0),
+            )
             .optional()?
             .ok_or(FsError::NotFound)?;
         match manifest {
@@ -1729,8 +1840,12 @@ impl Provider for SqliteProvider {
 
         // Chunk with FastCDC, store + dedup, build a content-addressed manifest.
         let mut chunk_rows: Vec<(usize, String, usize, usize)> = Vec::new(); // seq, hash, offset, len
-        let chunker =
-            fastcdc::v2020::FastCDC::new(&buf, self.chunk_cfg.min, self.chunk_cfg.avg, self.chunk_cfg.max);
+        let chunker = fastcdc::v2020::FastCDC::new(
+            &buf,
+            self.chunk_cfg.min,
+            self.chunk_cfg.avg,
+            self.chunk_cfg.max,
+        );
         for (seq, c) in chunker.enumerate() {
             let bytes = &buf[c.offset..c.offset + c.length];
             let hash = hex::encode(Sha256::digest(bytes));
@@ -1762,10 +1877,12 @@ impl Provider for SqliteProvider {
             params![buf.len() as i64, manifest_id, ino as i64, now_nanos()],
         )?;
         // Mark the file dirty for sync, atomically with its new manifest.
-        if let Some(node_id) =
-            tx.query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| {
-                r.get::<_, Option<String>>(0)
-            })
+        if let Some(node_id) = tx
+            .query_row(
+                "SELECT node_id FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| r.get::<_, Option<String>>(0),
+            )
             .optional()?
             .flatten()
         {
@@ -1782,7 +1899,11 @@ impl Provider for SqliteProvider {
         {
             let conn = self.conn.lock().unwrap();
             let kind: Option<String> = conn
-                .query_row("SELECT kind FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+                .query_row(
+                    "SELECT kind FROM nodes WHERE ino = ?1",
+                    params![ino as i64],
+                    |r| r.get(0),
+                )
                 .optional()?;
             match kind {
                 None => return Err(FsError::NotFound),
@@ -1861,15 +1982,20 @@ impl Provider for SqliteProvider {
         if Kind::from_str(&kind) != Kind::Dir {
             return Err(FsError::NotADirectory);
         }
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM nodes WHERE parent_ino = ?1", params![ino], |r| {
-                r.get(0)
-            })?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE parent_ino = ?1",
+            params![ino],
+            |r| r.get(0),
+        )?;
         if count > 0 {
             return Err(FsError::NotEmpty);
         }
         let node_id: Option<String> = conn
-            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino], |r| r.get(0))
+            .query_row(
+                "SELECT node_id FROM nodes WHERE ino = ?1",
+                params![ino],
+                |r| r.get(0),
+            )
             .optional()?;
         conn.execute("DELETE FROM nodes WHERE ino = ?1", params![ino])?;
         if let Some(id) = node_id {
@@ -1894,11 +2020,11 @@ impl Provider for SqliteProvider {
             )
             .optional()?;
         let (src_ino, src_id) = src.ok_or(FsError::NotFound)?;
-        let src_kind = Kind::from_str(
-            &tx.query_row("SELECT kind FROM nodes WHERE ino = ?1", params![src_ino], |r| {
-                r.get::<_, String>(0)
-            })?,
-        );
+        let src_kind = Kind::from_str(&tx.query_row(
+            "SELECT kind FROM nodes WHERE ino = ?1",
+            params![src_ino],
+            |r| r.get::<_, String>(0),
+        )?);
 
         // The destination *parent* must exist and be a directory — otherwise the bare
         // UPDATE below would reparent the node under a non-existent or non-directory ino,
@@ -1906,7 +2032,11 @@ impl Provider for SqliteProvider {
         // row). POSIX: a missing prefix component is ENOENT; a file used as a directory is
         // ENOTDIR.
         let pkind: Option<String> = tx
-            .query_row("SELECT kind FROM nodes WHERE ino = ?1", params![newparent as i64], |r| r.get(0))
+            .query_row(
+                "SELECT kind FROM nodes WHERE ino = ?1",
+                params![newparent as i64],
+                |r| r.get(0),
+            )
             .optional()?;
         match pkind {
             None => return Err(FsError::NotFound),
@@ -1924,7 +2054,11 @@ impl Provider for SqliteProvider {
                     return Err(FsError::InvalidArgument);
                 }
                 let parent: Option<i64> = tx
-                    .query_row("SELECT parent_ino FROM nodes WHERE ino = ?1", params![cur], |r| r.get(0))
+                    .query_row(
+                        "SELECT parent_ino FROM nodes WHERE ino = ?1",
+                        params![cur],
+                        |r| r.get(0),
+                    )
                     .optional()?
                     .flatten();
                 match parent {
@@ -1992,7 +2126,11 @@ impl Provider for SqliteProvider {
     fn symlink(&self, parent: u64, name: &str, target: &[u8]) -> Result<Attr> {
         let conn = self.conn.lock().unwrap();
         let pkind: String = conn
-            .query_row("SELECT kind FROM nodes WHERE ino = ?1", params![parent as i64], |r| r.get(0))
+            .query_row(
+                "SELECT kind FROM nodes WHERE ino = ?1",
+                params![parent as i64],
+                |r| r.get(0),
+            )
             .optional()?
             .ok_or(FsError::NotFound)?;
         if Kind::from_str(&pkind) != Kind::Dir {
@@ -2005,18 +2143,35 @@ impl Provider for SqliteProvider {
         let res = conn.execute(
             "INSERT INTO nodes(parent_ino, name, kind, node_id, mode, mtime, size, symlink_target)
              VALUES (?1, ?2, 'symlink', ?3, ?4, ?5, ?6, ?7)",
-            params![parent as i64, name, node_id, mode as i64, mtime, size, target],
+            params![
+                parent as i64,
+                name,
+                node_id,
+                mode as i64,
+                mtime,
+                size,
+                target
+            ],
         );
         match res {
             Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
                 return Err(FsError::AlreadyExists)
             }
             Err(e) => return Err(e.into()),
         }
         let ino = conn.last_insert_rowid() as u64;
         Self::enqueue(&conn, &node_id, "upsert")?;
-        Ok(Attr { ino, kind: Kind::Symlink, size: size as u64, mtime, atime: mtime, mode })
+        Ok(Attr {
+            ino,
+            kind: Kind::Symlink,
+            size: size as u64,
+            mtime,
+            atime: mtime,
+            mode,
+        })
     }
 
     /// Read a symlink's target bytes (the `readlink(2)` path). `NotSupported` if the inode is
@@ -2040,7 +2195,11 @@ impl Provider for SqliteProvider {
     fn set_mode(&self, ino: u64, mode: u32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let node_id: Option<String> = conn
-            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .query_row(
+                "SELECT node_id FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| r.get(0),
+            )
             .optional()?;
         let n = conn.execute(
             "UPDATE nodes SET mode = ?1 WHERE ino = ?2",
@@ -2059,7 +2218,11 @@ impl Provider for SqliteProvider {
     fn set_mtime(&self, ino: u64, mtime: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let node_id: Option<String> = conn
-            .query_row("SELECT node_id FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+            .query_row(
+                "SELECT node_id FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| r.get(0),
+            )
             .optional()?;
         let n = conn.execute(
             "UPDATE nodes SET mtime = ?1 WHERE ino = ?2",
@@ -2078,7 +2241,10 @@ impl Provider for SqliteProvider {
 
     fn set_atime(&self, ino: u64, atime: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let n = conn.execute("UPDATE nodes SET atime = ?1 WHERE ino = ?2", params![atime, ino as i64])?;
+        let n = conn.execute(
+            "UPDATE nodes SET atime = ?1 WHERE ino = ?2",
+            params![atime, ino as i64],
+        )?;
         if n == 0 {
             return Err(FsError::NotFound);
         }
@@ -2180,7 +2346,15 @@ mod tests {
     fn provider() -> SqliteProvider {
         // Tiny chunks so small test files split into many chunks.
         let store = Box::new(LocalChunkStore::temp().unwrap());
-        SqliteProvider::in_memory(store, ChunkConfig { min: 64, avg: 256, max: 1024 }).unwrap()
+        SqliteProvider::in_memory(
+            store,
+            ChunkConfig {
+                min: 64,
+                avg: 256,
+                max: 1024,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2228,10 +2402,18 @@ mod tests {
 
         let conn = p.conn.lock().unwrap();
         let ma: String = conn
-            .query_row("SELECT manifest_id FROM nodes WHERE ino=?1", params![a.ino as i64], |r| r.get(0))
+            .query_row(
+                "SELECT manifest_id FROM nodes WHERE ino=?1",
+                params![a.ino as i64],
+                |r| r.get(0),
+            )
             .unwrap();
         let mb: String = conn
-            .query_row("SELECT manifest_id FROM nodes WHERE ino=?1", params![b.ino as i64], |r| r.get(0))
+            .query_row(
+                "SELECT manifest_id FROM nodes WHERE ino=?1",
+                params![b.ino as i64],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(ma, mb, "identical content → identical (deduped) manifest");
     }
@@ -2269,7 +2451,11 @@ mod tests {
         p.write(f.ino, 0, &vec![9u8; 100]).unwrap();
         p.flush(f.ino).unwrap();
 
-        assert_eq!(p.getattr(f.ino).unwrap().size, 100, "size reflects only the new content");
+        assert_eq!(
+            p.getattr(f.ino).unwrap().size,
+            100,
+            "size reflects only the new content"
+        );
         // A generous read returns *exactly* the new 100 bytes — no stale tail past EOF.
         let out = p.read(f.ino, 0, 4096).unwrap();
         assert_eq!(out.len(), 100, "no chunks past the new EOF");
@@ -2294,7 +2480,11 @@ mod tests {
         let out = p.read(f.ino, 0, 4096).unwrap();
         assert_eq!(out.len(), 350);
         assert_eq!(&out[..200], &vec![7u8; 200][..]);
-        assert_eq!(&out[200..], &vec![0u8; 150][..], "grown region reads back as zeros");
+        assert_eq!(
+            &out[200..],
+            &vec![0u8; 150][..],
+            "grown region reads back as zeros"
+        );
     }
 
     #[test]
@@ -2309,14 +2499,23 @@ mod tests {
         assert_eq!(nodes.len(), 2);
 
         let dir_n = nodes.iter().find(|n| n.name == "proj").unwrap();
-        assert!(dir_n.parent_node_id.is_none(), "top-level dir has no parent");
+        assert!(
+            dir_n.parent_node_id.is_none(),
+            "top-level dir has no parent"
+        );
         assert_eq!(dir_n.kind, Kind::Dir);
 
         let file_n = nodes.iter().find(|n| n.name == "part.bin").unwrap();
-        assert_eq!(file_n.parent_node_id.as_ref(), Some(&dir_n.node_id),
-                   "file's parent_node_id is the dir's node_id");
+        assert_eq!(
+            file_n.parent_node_id.as_ref(),
+            Some(&dir_n.node_id),
+            "file's parent_node_id is the dir's node_id"
+        );
         assert!(file_n.manifest_id.is_some());
-        assert!(!file_n.chunks.is_empty(), "file carries its manifest chunks");
+        assert!(
+            !file_n.chunks.is_empty(),
+            "file carries its manifest chunks"
+        );
     }
 
     #[test]
@@ -2359,7 +2558,11 @@ mod tests {
         let ida = p.node_id_for(a.ino).unwrap().unwrap();
         let idb = p.node_id_for(b.ino).unwrap().unwrap();
         assert_ne!(ida, idb);
-        assert_eq!(p.node_id_for(a.ino).unwrap().unwrap(), ida, "stable across calls");
+        assert_eq!(
+            p.node_id_for(a.ino).unwrap().unwrap(),
+            ida,
+            "stable across calls"
+        );
     }
 
     #[test]
@@ -2371,19 +2574,28 @@ mod tests {
         // create alone does NOT enqueue (no manifest yet); flush does.
         let f = p.create(dir.ino, "part.bin").unwrap();
         let file_id = p.node_id_for(f.ino).unwrap().unwrap();
-        assert_eq!(p.outbox_list().unwrap(), vec![(dir_id.clone(), "upsert".into())]);
+        assert_eq!(
+            p.outbox_list().unwrap(),
+            vec![(dir_id.clone(), "upsert".into())]
+        );
         p.write(f.ino, 0, &vec![1u8; 1000]).unwrap();
         p.flush(f.ino).unwrap();
         // Parent dir enqueued before the file (insertion order preserved).
         assert_eq!(
             p.outbox_list().unwrap(),
-            vec![(dir_id.clone(), "upsert".into()), (file_id.clone(), "upsert".into())]
+            vec![
+                (dir_id.clone(), "upsert".into()),
+                (file_id.clone(), "upsert".into())
+            ]
         );
         // A delete coalesces the file's entry to 'delete' (no duplicate row).
         p.unlink(dir.ino, "part.bin").unwrap();
         assert_eq!(
             p.outbox_list().unwrap(),
-            vec![(dir_id.clone(), "upsert".into()), (file_id.clone(), "delete".into())]
+            vec![
+                (dir_id.clone(), "upsert".into()),
+                (file_id.clone(), "delete".into())
+            ]
         );
         // Draining clears entries.
         p.outbox_clear(&dir_id).unwrap();
@@ -2409,9 +2621,17 @@ mod tests {
         p.write(f.ino, 0, &vec![5u8; 1500]).unwrap();
         p.flush(f.ino).unwrap();
         let file_id = p.node_id_for(f.ino).unwrap().unwrap();
-        let from_export = p.export_tree().unwrap().into_iter().find(|n| n.node_id == file_id).unwrap();
+        let from_export = p
+            .export_tree()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.node_id == file_id)
+            .unwrap();
         let from_single = p.sync_node(&file_id).unwrap().unwrap();
-        assert_eq!(from_single, from_export, "single-node export equals whole-tree export");
+        assert_eq!(
+            from_single, from_export,
+            "single-node export equals whole-tree export"
+        );
         assert!(p.sync_node("does-not-exist").unwrap().is_none());
     }
 
@@ -2420,7 +2640,8 @@ mod tests {
         let p = provider();
         p.create(ROOT_INO, "tmp.bin").unwrap();
         p.flush(p.lookup(ROOT_INO, "tmp.bin").unwrap().ino).unwrap();
-        p.rename(ROOT_INO, "tmp.bin", ROOT_INO, "final.bin").unwrap();
+        p.rename(ROOT_INO, "tmp.bin", ROOT_INO, "final.bin")
+            .unwrap();
         assert!(p.lookup(ROOT_INO, "tmp.bin").is_err());
         assert!(p.lookup(ROOT_INO, "final.bin").is_ok());
         p.unlink(ROOT_INO, "final.bin").unwrap();
@@ -2452,7 +2673,10 @@ mod tests {
         // Delete a single file: gone on B, siblings untouched.
         b.apply_remote_delete(&x_id).unwrap();
         assert!(b.ino_for_node_id(&x_id).unwrap().is_none());
-        assert!(b.ino_for_node_id(&y_id).unwrap().is_some(), "sibling subtree intact");
+        assert!(
+            b.ino_for_node_id(&y_id).unwrap().is_some(),
+            "sibling subtree intact"
+        );
 
         // Idempotent: deleting again (and deleting an unknown id) is a no-op.
         b.apply_remote_delete(&x_id).unwrap();
@@ -2462,8 +2686,14 @@ mod tests {
         // even though no per-child delete was applied — no orphaned rows.
         b.apply_remote_delete(&proj_id).unwrap();
         assert!(b.ino_for_node_id(&proj_id).unwrap().is_none());
-        assert!(b.ino_for_node_id(&sub_id).unwrap().is_none(), "nested dir swept");
-        assert!(b.ino_for_node_id(&y_id).unwrap().is_none(), "nested file swept");
+        assert!(
+            b.ino_for_node_id(&sub_id).unwrap().is_none(),
+            "nested dir swept"
+        );
+        assert!(
+            b.ino_for_node_id(&y_id).unwrap().is_none(),
+            "nested file swept"
+        );
         assert!(b.export_tree().unwrap().is_empty(), "tree fully emptied");
     }
 
@@ -2500,11 +2730,24 @@ mod tests {
         // Exactly the three files under Jobs (no dirs, nothing from Archive).
         let mut paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         paths.sort();
-        assert_eq!(paths, vec!["Jobs/ClientX/part.step", "Jobs/ClientX/sub/deep.bin", "Jobs/a.stl"]);
+        assert_eq!(
+            paths,
+            vec![
+                "Jobs/ClientX/part.step",
+                "Jobs/ClientX/sub/deep.bin",
+                "Jobs/a.stl"
+            ]
+        );
         // Each carries the real file node_id (resolvable back to an inode).
         for f in &files {
-            assert!(p.ino_for_node_id(&f.node_id).unwrap().is_some(), "file node_id resolves");
-            assert!(!p.node_manifest_hashes(&f.node_id).unwrap().is_empty(), "file has a manifest");
+            assert!(
+                p.ino_for_node_id(&f.node_id).unwrap().is_some(),
+                "file node_id resolves"
+            );
+            assert!(
+                !p.node_manifest_hashes(&f.node_id).unwrap().is_empty(),
+                "file has a manifest"
+            );
         }
     }
 
@@ -2529,8 +2772,14 @@ mod tests {
         let p = provider();
         let empty = p.mkdir(ROOT_INO, "Empty").unwrap();
         let empty_id = p.node_id_for(empty.ino).unwrap().unwrap();
-        assert!(p.subtree_files(&empty_id).unwrap().is_empty(), "no files under an empty dir");
-        assert!(p.subtree_files("never-existed").unwrap().is_empty(), "unknown id → empty");
+        assert!(
+            p.subtree_files(&empty_id).unwrap().is_empty(),
+            "no files under an empty dir"
+        );
+        assert!(
+            p.subtree_files("never-existed").unwrap().is_empty(),
+            "unknown id → empty"
+        );
     }
 
     /// A pull whose collision sweep would clobber a locally-renamed-but-not-yet-pushed node
@@ -2551,7 +2800,10 @@ mod tests {
         let f_id = p.node_id_for(f.ino).unwrap().unwrap();
         p.rename(dir.ino, "f", dir.ino, "g").unwrap();
         assert!(
-            p.outbox_list().unwrap().iter().any(|(id, op)| id == &f_id && op == "upsert"),
+            p.outbox_list()
+                .unwrap()
+                .iter()
+                .any(|(id, op)| id == &f_id && op == "upsert"),
             "precondition: F's local rename is queued (un-pushed)"
         );
 
@@ -2573,9 +2825,18 @@ mod tests {
 
         // The remote won the name (authoritative) — and we were told the displaced local node
         // had pending state, so the caller knows to reconcile.
-        assert!(outcome.displaced_pending, "must flag that a pending local node was clobbered");
-        assert!(p.ino_for_node_id("remote-R").unwrap().is_some(), "remote node present at the path");
-        assert!(p.ino_for_node_id(&f_id).unwrap().is_none(), "displaced local node is gone from the tree");
+        assert!(
+            outcome.displaced_pending,
+            "must flag that a pending local node was clobbered"
+        );
+        assert!(
+            p.ino_for_node_id("remote-R").unwrap().is_some(),
+            "remote node present at the path"
+        );
+        assert!(
+            p.ino_for_node_id(&f_id).unwrap().is_none(),
+            "displaced local node is gone from the tree"
+        );
 
         // A plain collision over a node with NO pending outbox state must NOT raise the flag
         // (the ordinary authoritative name-reuse case — no local intent was lost).
@@ -2595,10 +2856,16 @@ mod tests {
         };
         p.apply_remote(&pulled).unwrap();
         p.outbox_clear("remote-S").unwrap(); // simulate it being a clean (non-local) row
-        // A re-pull at the same path with a different id, no pending outbox entry on remote-S:
-        let pulled2 = SyncNode { node_id: "remote-T".into(), ..pulled.clone() };
+                                             // A re-pull at the same path with a different id, no pending outbox entry on remote-S:
+        let pulled2 = SyncNode {
+            node_id: "remote-T".into(),
+            ..pulled.clone()
+        };
         let o2 = p.apply_remote(&pulled2).unwrap();
-        assert!(!o2.displaced_pending, "no pending local state → no displaced_pending signal");
+        assert!(
+            !o2.displaced_pending,
+            "no pending local state → no displaced_pending signal"
+        );
     }
 
     /// `apply_remote` must flag `moved` when a pulled upsert relocates an EXISTING node
@@ -2632,16 +2899,26 @@ mod tests {
 
         // In-place metadata change (same parent + name): not a move.
         let o_same = p.apply_remote(&mk("R", &d1_id, "a.txt")).unwrap();
-        assert!(!o_same.inserted && !o_same.moved, "same (parent,name) is not a move");
+        assert!(
+            !o_same.inserted && !o_same.moved,
+            "same (parent,name) is not a move"
+        );
 
         // RENAME (same parent, new name): moved.
         let o_rename = p.apply_remote(&mk("R", &d1_id, "b.txt")).unwrap();
-        assert!(!o_rename.inserted && o_rename.moved, "rename within a dir is a move");
+        assert!(
+            !o_rename.inserted && o_rename.moved,
+            "rename within a dir is a move"
+        );
 
         // MOVE (new parent, possibly same name): moved.
         let o_move = p.apply_remote(&mk("R", &d2_id, "b.txt")).unwrap();
         assert!(!o_move.inserted && o_move.moved, "reparent is a move");
-        assert_eq!(p.parent_and_name(o_move.ino).unwrap().unwrap().0, d2.ino, "now under d2");
+        assert_eq!(
+            p.parent_and_name(o_move.ino).unwrap().unwrap().0,
+            d2.ino,
+            "now under d2"
+        );
     }
 
     /// Convergence harness: drive a deterministic pseudo-random stream of create /
@@ -2659,12 +2936,22 @@ mod tests {
             dir: bool,
         }
 
-        fn snapshot(p: &SqliteProvider) -> Vec<(String, Option<String>, String, String, Option<String>)> {
+        fn snapshot(
+            p: &SqliteProvider,
+        ) -> Vec<(String, Option<String>, String, String, Option<String>)> {
             let mut v: Vec<_> = p
                 .export_tree()
                 .unwrap()
                 .into_iter()
-                .map(|n| (n.node_id, n.parent_node_id, n.name, n.kind.as_str().to_string(), n.manifest_id))
+                .map(|n| {
+                    (
+                        n.node_id,
+                        n.parent_node_id,
+                        n.name,
+                        n.kind.as_str().to_string(),
+                        n.manifest_id,
+                    )
+                })
                 .collect();
             v.sort();
             v
@@ -2687,7 +2974,9 @@ mod tests {
         let mut ctr = 0u64;
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as usize
         };
 
@@ -2696,7 +2985,12 @@ mod tests {
             let dirs: Vec<u64> = std::iter::once(ROOT_INO)
                 .chain(entries.iter().filter(|e| e.dir).map(|e| e.ino))
                 .collect();
-            let files: Vec<usize> = entries.iter().enumerate().filter(|(_, e)| !e.dir).map(|(i, _)| i).collect();
+            let files: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.dir)
+                .map(|(i, _)| i)
+                .collect();
 
             match next() % 6 {
                 0 => {
@@ -2705,7 +2999,12 @@ mod tests {
                     ctr += 1;
                     let name = format!("d{ctr}");
                     let a = src.mkdir(parent, &name).unwrap();
-                    entries.push(E { ino: a.ino, parent, name, dir: true });
+                    entries.push(E {
+                        ino: a.ino,
+                        parent,
+                        name,
+                        dir: true,
+                    });
                 }
                 1 => {
                     // create + write + flush (a committed file)
@@ -2717,7 +3016,12 @@ mod tests {
                     let data: Vec<u8> = (0..len).map(|i| (i ^ ctr as usize) as u8).collect();
                     src.write(a.ino, 0, &data).unwrap();
                     src.flush(a.ino).unwrap();
-                    entries.push(E { ino: a.ino, parent, name, dir: false });
+                    entries.push(E {
+                        ino: a.ino,
+                        parent,
+                        name,
+                        dir: false,
+                    });
                 }
                 2 => {
                     // overwrite an existing file with a *new, often shorter* body, the
@@ -2729,7 +3033,8 @@ mod tests {
                     if !files.is_empty() {
                         let e = &entries[files[next() % files.len()]];
                         let len = 16 + next() % 200;
-                        let data: Vec<u8> = (0..len).map(|i| (i.wrapping_add(iter)) as u8).collect();
+                        let data: Vec<u8> =
+                            (0..len).map(|i| (i.wrapping_add(iter)) as u8).collect();
                         src.truncate(e.ino, 0).unwrap();
                         src.write(e.ino, 0, &data).unwrap();
                         src.flush(e.ino).unwrap();
@@ -2776,7 +3081,11 @@ mod tests {
             }
 
             mirror(&src, &dst);
-            assert_eq!(snapshot(&src), snapshot(&dst), "replicas diverged after iter {iter}");
+            assert_eq!(
+                snapshot(&src),
+                snapshot(&dst),
+                "replicas diverged after iter {iter}"
+            );
         }
 
         // Sanity: the harness actually built and tore down a non-trivial tree.

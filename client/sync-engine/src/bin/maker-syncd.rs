@@ -26,16 +26,21 @@ use sync_engine::{Daemon, DaemonConfig};
 #[cfg(target_os = "linux")]
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mountpoint, db, chunk_dir, server_url, token) =
-        match (args.next(), args.next(), args.next(), args.next(), args.next()) {
-            (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
-            _ => {
-                eprintln!(
-                    "usage: maker-syncd <mountpoint> <db> <chunk_dir> <server_url> <device_token>"
-                );
-                std::process::exit(2);
-            }
-        };
+    let (mountpoint, db, chunk_dir, server_url, token) = match (
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
+        _ => {
+            eprintln!(
+                "usage: maker-syncd <mountpoint> <db> <chunk_dir> <server_url> <device_token>"
+            );
+            std::process::exit(2);
+        }
+    };
 
     let cfg = DaemonConfig::new(mountpoint, db, chunk_dir, server_url, token);
     let mp = cfg.mountpoint.display().to_string();
@@ -90,7 +95,12 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn mount_is_present(path: &str) -> bool {
     use std::process::Command;
-    match Command::new("findmnt").arg("--noheadings").arg("--target").arg(path).output() {
+    match Command::new("findmnt")
+        .arg("--noheadings")
+        .arg("--target")
+        .arg(path)
+        .output()
+    {
         // `findmnt --target` prints the mount covering `path`; a 0 exit with non-empty output
         // means something is mounted at/above it. We additionally require the mountpoint column
         // to equal `path` so a mount on a *parent* dir doesn't read as a false positive.

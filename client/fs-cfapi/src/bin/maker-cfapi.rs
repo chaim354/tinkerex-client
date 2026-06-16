@@ -16,17 +16,23 @@ fn main() {
     let chunks = PathBuf::from(args.next().expect(usage));
 
     let store = Box::new(fs_provider::LocalChunkStore::new(&chunks).expect("chunk store"));
-    let provider = std::sync::Arc::new(fs_provider::SqliteProvider::open(&db, store).expect("open db"));
+    let provider =
+        std::sync::Arc::new(fs_provider::SqliteProvider::open(&db, store).expect("open db"));
 
     // No hydrator here: a bare local mount serves whatever chunks are already cached (a
     // miss errors). The daemon wires a presigned-GET hydrator — see sync-engine::CfApiMount.
     let handle = fs_cfapi::win::mount(provider, &root, None).expect("cfapi mount");
-    println!("CfAPI sync root mounted at {} — Ctrl-C to stop", root.display());
+    println!(
+        "CfAPI sync root mounted at {} — Ctrl-C to stop",
+        root.display()
+    );
     handle.run_until_ctrl_c();
 }
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("maker-cfapi is Windows-only (Cloud Filter API). This is an inert stub on this platform.");
+    eprintln!(
+        "maker-cfapi is Windows-only (Cloud Filter API). This is an inert stub on this platform."
+    );
     std::process::exit(1);
 }

@@ -44,7 +44,11 @@ fn placeholder_replica(body: &[u8]) -> (SqliteProvider, tempdir::Dir, String, Ve
     let dir = tempdir::Dir::new();
     let replica = SqliteProvider::in_memory(
         Box::new(LocalChunkStore::new(dir.path()).unwrap()),
-        ChunkConfig { min: 64, avg: 256, max: 1024 },
+        ChunkConfig {
+            min: 64,
+            avg: 256,
+            max: 1024,
+        },
     )
     .unwrap();
     replica.apply_remote(&node).unwrap();
@@ -88,7 +92,10 @@ fn range_read_overlapping_missing_chunk_reports_chunk_missing_not_zerofill() {
     let src = provider();
     write_file(&src, ROOT, "big.bin", &body);
     let node = node_named(&src, "big.bin");
-    assert!(node.chunks.len() >= 3, "need a multi-chunk file for this probe");
+    assert!(
+        node.chunks.len() >= 3,
+        "need a multi-chunk file for this probe"
+    );
     let first_hash = node.chunks[0].hash.clone();
     let first_bytes = src.chunk_get(&first_hash).unwrap();
 
@@ -126,8 +133,14 @@ fn read_far_past_eof_returns_empty_not_panic() {
     let ino = write_file(&p, ROOT, "f.bin", &vec![9u8; 500]);
     // Offset past EOF, and an offset near u64::MAX (overflow bait for `offset + size`).
     for off in [500u64, 10_000, u64::MAX - 10, u64::MAX] {
-        let got = p.read(ino, off, 4096).expect("read past EOF must not error/panic");
-        assert!(got.is_empty(), "read at offset {off} past EOF returns empty, got {} bytes", got.len());
+        let got = p
+            .read(ino, off, 4096)
+            .expect("read past EOF must not error/panic");
+        assert!(
+            got.is_empty(),
+            "read at offset {off} past EOF returns empty, got {} bytes",
+            got.len()
+        );
     }
 }
 
@@ -137,7 +150,9 @@ fn read_size_overflow_offset_plus_size_does_not_wrap() {
     // a large size; must clamp to EOF (empty here), never panic.
     let p = provider();
     let ino = write_file(&p, ROOT, "f.bin", &vec![1u8; 1000]);
-    let got = p.read(ino, u64::MAX - 5, u32::MAX).expect("must not panic on offset+size overflow");
+    let got = p
+        .read(ino, u64::MAX - 5, u32::MAX)
+        .expect("must not panic on offset+size overflow");
     assert!(got.is_empty());
 }
 
@@ -181,19 +196,25 @@ fn uncommitted_write_does_not_corrupt_last_committed_content_after_reopen() {
     let v1 = b"committed-version-one".to_vec();
     let ino;
     {
-        let p = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
+        let p =
+            SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
         let f = p.create(ROOT, "doc.txt").unwrap();
         p.write(f.ino, 0, &v1).unwrap();
         p.flush(f.ino).unwrap(); // v1 durable
         ino = f.ino;
         // Begin v2 but DO NOT flush (simulated crash: just drop p with staging dirty).
-        p.write(ino, 0, b"HALF-WRITTEN-version-two-never-flushed").unwrap();
+        p.write(ino, 0, b"HALF-WRITTEN-version-two-never-flushed")
+            .unwrap();
     } // p dropped — staging lost, no flush
 
     // Reopen: the durable state must be exactly v1.
     let p2 = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
     let f2 = p2.lookup(ROOT, "doc.txt").unwrap();
-    assert_eq!(read_all(&p2, f2.ino), v1, "reopened file shows last committed (v1), not torn v2");
+    assert_eq!(
+        read_all(&p2, f2.ino),
+        v1,
+        "reopened file shows last committed (v1), not torn v2"
+    );
 }
 
 #[test]
@@ -207,7 +228,11 @@ fn flush_is_all_or_nothing_no_partial_manifest_visible() {
     let attr = p.getattr(ino).unwrap();
     assert_eq!(attr.size, body.len() as u64);
     // Re-read must equal body exactly (assembled from committed chunks).
-    assert_eq!(read_all(&p, ino), body, "committed content assembles back identically");
+    assert_eq!(
+        read_all(&p, ino),
+        body,
+        "committed content assembles back identically"
+    );
 }
 
 // =======================================================================================
@@ -276,28 +301,41 @@ fn rename_dir_into_its_own_descendant_is_rejected_with_einval() {
 
     // Move `a` under its child `b` (one level): must be EINVAL.
     assert!(
-        matches!(p.rename(ROOT, "a", b.ino, "a"), Err(FsError::InvalidArgument)),
+        matches!(
+            p.rename(ROOT, "a", b.ino, "a"),
+            Err(FsError::InvalidArgument)
+        ),
         "moving a dir into its direct child must be rejected (EINVAL)"
     );
     // Move `a` under its grandchild `c` (deeper descendant): also EINVAL.
     assert!(
-        matches!(p.rename(ROOT, "a", c.ino, "a"), Err(FsError::InvalidArgument)),
+        matches!(
+            p.rename(ROOT, "a", c.ino, "a"),
+            Err(FsError::InvalidArgument)
+        ),
         "moving a dir into a deeper descendant must be rejected (EINVAL)"
     );
     // Moving a dir onto a path that is NOT a descendant is still allowed.
     let sib = p.mkdir(ROOT, "sib").unwrap();
-    p.rename(ROOT, "a", sib.ino, "a").expect("move into a non-descendant dir is fine");
+    p.rename(ROOT, "a", sib.ino, "a")
+        .expect("move into a non-descendant dir is fine");
 
     // The tree must remain a forest rooted at ROOT with no cycle.
     let nodes = p.export_tree().unwrap();
-    let by_id: std::collections::HashMap<String, Option<String>> =
-        nodes.iter().map(|n| (n.node_id.clone(), n.parent_node_id.clone())).collect();
+    let by_id: std::collections::HashMap<String, Option<String>> = nodes
+        .iter()
+        .map(|n| (n.node_id.clone(), n.parent_node_id.clone()))
+        .collect();
     for n in &nodes {
         let mut cur = n.parent_node_id.clone();
         let mut hops = 0;
         while let Some(pid) = cur {
             hops += 1;
-            assert!(hops < 1000, "BUG: cycle detected reaching root from node {}", n.node_id);
+            assert!(
+                hops < 1000,
+                "BUG: cycle detected reaching root from node {}",
+                n.node_id
+            );
             cur = by_id.get(&pid).cloned().flatten();
         }
     }
@@ -317,8 +355,10 @@ fn rename_dir_into_its_own_descendant_is_rejected_with_einval() {
 /// (i.e. it's in a cycle or orphaned). Returns the set of node_ids reachable from ROOT.
 fn assert_acyclic_reachable(p: &SqliteProvider, ctx: &str) {
     let nodes = p.export_tree().unwrap();
-    let by_id: std::collections::HashMap<String, Option<String>> =
-        nodes.iter().map(|n| (n.node_id.clone(), n.parent_node_id.clone())).collect();
+    let by_id: std::collections::HashMap<String, Option<String>> = nodes
+        .iter()
+        .map(|n| (n.node_id.clone(), n.parent_node_id.clone()))
+        .collect();
     for n in &nodes {
         let mut cur = n.parent_node_id.clone();
         let mut hops = 0;
@@ -340,8 +380,18 @@ fn apply_remote_cyclic_reparent_must_not_orphan_subtree() {
     let src = provider();
     let x = src.mkdir(ROOT, "X").unwrap();
     let y = src.mkdir(ROOT, "Y").unwrap();
-    let x_node = src.export_tree().unwrap().into_iter().find(|n| n.name == "X").unwrap();
-    let y_node = src.export_tree().unwrap().into_iter().find(|n| n.name == "Y").unwrap();
+    let x_node = src
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "X")
+        .unwrap();
+    let y_node = src
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "Y")
+        .unwrap();
     let _ = (x, y);
 
     // Replica applies both as-is (siblings under ROOT) — fine.
@@ -395,7 +445,10 @@ fn remote_delete_of_a_locally_edited_node_drops_the_pending_edit_silently() {
     p.write(f.ino, 0, b"my important local edit").unwrap();
     p.flush(f.ino).unwrap();
     assert!(
-        p.outbox_list().unwrap().iter().any(|(nid, op)| nid == &node_id && op == "upsert"),
+        p.outbox_list()
+            .unwrap()
+            .iter()
+            .any(|(nid, op)| nid == &node_id && op == "upsert"),
         "the local edit is queued as a pending upsert"
     );
 
@@ -407,8 +460,14 @@ fn remote_delete_of_a_locally_edited_node_drops_the_pending_edit_silently() {
     //  - no reconcile signal is raised for the target node (design: delete authorizes it),
     //  - the queued outbox upsert now references a vanished node → it will push as a no-op,
     //    so the local edit is silently discarded.
-    assert!(p.lookup(ROOT, "doc.txt").is_err(), "remote delete removed the node locally");
-    assert!(!signaled, "no reconcile signal for the target node itself (current design)");
+    assert!(
+        p.lookup(ROOT, "doc.txt").is_err(),
+        "remote delete removed the node locally"
+    );
+    assert!(
+        !signaled,
+        "no reconcile signal for the target node itself (current design)"
+    );
     // The pending upsert's node is gone, so a drain finds nothing to push.
     assert!(
         p.sync_node(&node_id).unwrap().is_none(),
@@ -433,9 +492,20 @@ fn set_mtime_persists_and_enqueues_without_changing_content() {
     let mid_before = node_named(&p, "f.bin").manifest_id.clone();
 
     p.set_mtime(ino, 1_700_000_000_000_000_000).unwrap();
-    assert_eq!(p.getattr(ino).unwrap().mtime, 1_700_000_000_000_000_000, "mtime persisted in nanos");
+    assert_eq!(
+        p.getattr(ino).unwrap().mtime,
+        1_700_000_000_000_000_000,
+        "mtime persisted in nanos"
+    );
     assert_eq!(read_all(&p, ino), body, "content unchanged by set_mtime");
-    assert_eq!(node_named(&p, "f.bin").manifest_id, mid_before, "manifest (content addr) unchanged");
+    assert_eq!(
+        node_named(&p, "f.bin").manifest_id,
+        mid_before,
+        "manifest (content addr) unchanged"
+    );
     // The metadata change is queued for sync.
-    assert!(!p.outbox_list().unwrap().is_empty(), "set_mtime enqueues an upsert for propagation");
+    assert!(
+        !p.outbox_list().unwrap().is_empty(),
+        "set_mtime enqueues an upsert for propagation"
+    );
 }

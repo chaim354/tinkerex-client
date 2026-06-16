@@ -16,7 +16,13 @@ use sync_client::ServerClient;
 use sync_engine::{PresignedIO, SyncEngine};
 
 fn uniq() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 fn provider(tag: &str) -> SqliteProvider {
@@ -34,15 +40,26 @@ fn main() {
     let a = provider("A");
     let dir = a.mkdir(ROOT_INO, "Projects").unwrap();
     let f = a.create(dir.ino, "box.lbrn2").unwrap();
-    let content: Vec<u8> =
-        b"LightBurn over real S3 \x00\x01\x02\x03 ".iter().cycle().take(40_000).copied().collect();
+    let content: Vec<u8> = b"LightBurn over real S3 \x00\x01\x02\x03 "
+        .iter()
+        .cycle()
+        .take(40_000)
+        .copied()
+        .collect();
     a.write(f.ino, 0, &content).unwrap();
     a.flush(f.ino).unwrap();
 
     let mut client_a = ServerClient::new(&server);
-    client_a.enroll(&format!("presigned-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
+    client_a
+        .enroll(
+            &format!("presigned-{}@example.com", uniq()),
+            "correct horse battery staple",
+            "device-A",
+        )
+        .expect("register A");
     let io_a = PresignedIO::new(&client_a);
-    let cursor_a = SyncEngine::sync_tick(&a, &client_a, &io_a, a.cursor().unwrap()).expect("A sync_tick");
+    let cursor_a =
+        SyncEngine::sync_tick(&a, &client_a, &io_a, a.cursor().unwrap()).expect("A sync_tick");
     a.set_cursor(cursor_a).unwrap();
     println!("✓ A: pushed via presigned PUT to live storage (cursor {cursor_a})");
 
@@ -52,7 +69,8 @@ fn main() {
     let client_b = ServerClient::with_token(&server, dev_b.device_token);
     let io_b = PresignedIO::new(&client_b);
 
-    let cursor_b = SyncEngine::sync_tick(&b, &client_b, &io_b, b.cursor().unwrap()).expect("B sync_tick");
+    let cursor_b =
+        SyncEngine::sync_tick(&b, &client_b, &io_b, b.cursor().unwrap()).expect("B sync_tick");
     b.set_cursor(cursor_b).unwrap();
     let proj = b.lookup(ROOT_INO, "Projects").expect("B pulled Projects");
     let bf = b.lookup(proj.ino, "box.lbrn2").expect("B pulled box.lbrn2");
@@ -61,7 +79,10 @@ fn main() {
     SyncEngine::hydrate(&b, &client_b, &io_b, &node_id).expect("hydrate via presigned GET");
     let got = b.read(bf.ino, 0, content.len() as u32).expect("read on B");
     assert_eq!(got, content, "A -> live S3 -> B byte-for-byte");
-    println!("✓ B: hydrated via presigned GET — {} bytes match A exactly", got.len());
+    println!(
+        "✓ B: hydrated via presigned GET — {} bytes match A exactly",
+        got.len()
+    );
 
     println!("\nPRESIGNED ROUNDTRIP OK — real bytes through live S3-compatible storage.");
 }

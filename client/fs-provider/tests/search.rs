@@ -40,9 +40,18 @@ fn matches_on_path_component() {
     // "robotarm" matches the file under it (by path) but not the loose one
     let hits = p.search("robotarm", &SearchOpts::default()).unwrap();
     let paths: Vec<_> = hits.iter().map(|h| h.path.clone()).collect();
-    assert!(paths.contains(&"/RobotArm".to_string()), "the dir itself matches: {paths:?}");
-    assert!(paths.contains(&"/RobotArm/servo.step".to_string()), "child matches by path: {paths:?}");
-    assert!(!paths.contains(&"/loose.step".to_string()), "unrelated file excluded");
+    assert!(
+        paths.contains(&"/RobotArm".to_string()),
+        "the dir itself matches: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/RobotArm/servo.step".to_string()),
+        "child matches by path: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"/loose.step".to_string()),
+        "unrelated file excluded"
+    );
 }
 
 /// A directory is matchable and returned with kind=Dir and size 0.
@@ -65,7 +74,11 @@ fn excludes_deleted_nodes() {
     assert_eq!(p.search("gone", &SearchOpts::default()).unwrap().len(), 1);
 
     p.delete_by_node_id(&node_id).unwrap();
-    assert_eq!(p.search("gone", &SearchOpts::default()).unwrap().len(), 0, "deleted node not found");
+    assert_eq!(
+        p.search("gone", &SearchOpts::default()).unwrap().len(),
+        0,
+        "deleted node not found"
+    );
 }
 
 /// Works on a deeply nested tree and reconstructs the whole path.
@@ -104,7 +117,10 @@ fn never_returns_root() {
     write_file(&p, ROOT, "x.txt", b"a");
     // An empty query would otherwise match everything including root.
     let hits = p.search("", &SearchOpts::default()).unwrap();
-    assert!(hits.iter().all(|h| h.node_id != "root"), "root excluded: {hits:?}");
+    assert!(
+        hits.iter().all(|h| h.node_id != "root"),
+        "root excluded: {hits:?}"
+    );
     assert!(hits.iter().all(|h| !h.path.is_empty()));
 }
 
@@ -115,10 +131,28 @@ fn respects_limit_and_offset() {
     for i in 0..10 {
         write_file(&p, ROOT, &format!("part{i:02}.bin"), b"x");
     }
-    let page1 = p.search("part", &SearchOpts { limit: 3, offset: 0, ..Default::default() }).unwrap();
+    let page1 = p
+        .search(
+            "part",
+            &SearchOpts {
+                limit: 3,
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(page1.len(), 3, "limit respected");
 
-    let page2 = p.search("part", &SearchOpts { limit: 3, offset: 3, ..Default::default() }).unwrap();
+    let page2 = p
+        .search(
+            "part",
+            &SearchOpts {
+                limit: 3,
+                offset: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(page2.len(), 3);
 
     // No overlap between the two pages (stable ordering).

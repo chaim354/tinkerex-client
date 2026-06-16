@@ -12,7 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sync_client::{ChunkRef, CommitBegin, ServerClient};
 
 fn uniq() -> String {
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("{n:x}")
 }
 
@@ -21,7 +24,9 @@ fn main() {
     let mut c = ServerClient::new(&base);
 
     let email = format!("e2e-{}@example.com", uniq());
-    let reg = c.enroll(&email, "correct horse battery staple", "rust-client").expect("register");
+    let reg = c
+        .enroll(&email, "correct horse battery staple", "rust-client")
+        .expect("register");
     assert_eq!(reg.head_seq, 0, "fresh user starts at seq 0");
     println!("✓ registered {} (device {})", reg.user_id, reg.device_id);
 
@@ -34,7 +39,11 @@ fn main() {
     // commit a file under Projects
     let node = format!("node-{}", uniq());
     let hash = "a".repeat(64);
-    let manifest = vec![ChunkRef { hash: hash.clone(), offset: 0, length: 12 }];
+    let manifest = vec![ChunkRef {
+        hash: hash.clone(),
+        offset: 0,
+        length: 12,
+    }];
     let commit_id = format!("commit-{}", uniq());
     let begin = c
         .commit_begin(&CommitBegin {
@@ -44,12 +53,24 @@ fn main() {
             name: "box.lbrn2".into(),
             base_version_id: None,
             size: 12,
-            manifest: manifest.clone(), mode: 0o644, mtime: 0,
+            manifest: manifest.clone(),
+            mode: 0o644,
+            mtime: 0,
         })
         .expect("commit begin");
-    assert_eq!(begin.missing, vec![hash.clone()], "the one chunk is missing");
-    assert!(begin.put_urls.contains_key(&hash), "got a presigned PUT url");
-    println!("✓ commit begin: {} missing, presigned PUTs returned", begin.missing.len());
+    assert_eq!(
+        begin.missing,
+        vec![hash.clone()],
+        "the one chunk is missing"
+    );
+    assert!(
+        begin.put_urls.contains_key(&hash),
+        "got a presigned PUT url"
+    );
+    println!(
+        "✓ commit begin: {} missing, presigned PUTs returned",
+        begin.missing.len()
+    );
 
     // (a real client would PUT the chunk to begin.put_urls[hash] here)
 
@@ -60,7 +81,11 @@ fn main() {
 
     // second version of the same file
     let commit_id2 = format!("commit-{}", uniq());
-    let manifest2 = vec![ChunkRef { hash: "b".repeat(64), offset: 0, length: 20 }];
+    let manifest2 = vec![ChunkRef {
+        hash: "b".repeat(64),
+        offset: 0,
+        length: 20,
+    }];
     c.commit_begin(&CommitBegin {
         commit_id: commit_id2.clone(),
         node_id: node.clone(),
@@ -68,7 +93,9 @@ fn main() {
         name: "box.lbrn2".into(),
         base_version_id: Some(fin1.version_id.clone()),
         size: 20,
-        manifest: manifest2, mode: 0o644, mtime: 0,
+        manifest: manifest2,
+        mode: 0o644,
+        mtime: 0,
     })
     .expect("begin2");
     let fin2 = c.commit_finalize(&commit_id2).expect("finalize2");
@@ -77,20 +104,42 @@ fn main() {
     // pull changes from 0
     let changes = c.changes(0).expect("changes");
     assert_eq!(changes.head_seq, 3);
-    let put = changes.changes.iter().find(|ch| ch.node_id == node && ch.op == "put").expect("file change present");
+    let put = changes
+        .changes
+        .iter()
+        .find(|ch| ch.node_id == node && ch.op == "put")
+        .expect("file change present");
     assert!(put.manifest.is_some(), "put change carries a manifest");
-    println!("✓ pulled {} changes (head_seq {})", changes.changes.len(), changes.head_seq);
+    println!(
+        "✓ pulled {} changes (head_seq {})",
+        changes.changes.len(),
+        changes.head_seq
+    );
 
     // full tree
     let tree = c.tree(0).expect("tree");
-    assert!(tree.nodes.iter().any(|n| n.name == "Projects" && n.kind == "dir"));
-    let file = tree.nodes.iter().find(|n| n.node_id == node).expect("file in tree");
+    assert!(tree
+        .nodes
+        .iter()
+        .any(|n| n.name == "Projects" && n.kind == "dir"));
+    let file = tree
+        .nodes
+        .iter()
+        .find(|n| n.node_id == node)
+        .expect("file in tree");
     assert_eq!(file.size, Some(20), "tree shows the latest version size");
-    println!("✓ tree snapshot has Projects/ and box.lbrn2 (size {:?})", file.size);
+    println!(
+        "✓ tree snapshot has Projects/ and box.lbrn2 (size {:?})",
+        file.size
+    );
 
     // restore v1
     let restored = c.restore(&node, &fin1.version_id).expect("restore");
-    println!("✓ restored v1 -> new version {} (seq {})", &restored.version_id[..8], restored.seq);
+    println!(
+        "✓ restored v1 -> new version {} (seq {})",
+        &restored.version_id[..8],
+        restored.seq
+    );
 
     println!("\nE2E OK — Rust client and Rails server speak the same protocol.");
 }

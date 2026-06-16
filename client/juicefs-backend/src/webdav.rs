@@ -362,7 +362,11 @@ mod tests {
         let entries = parse_multistatus(SAMPLE).expect("parse");
         let listing = into_dir_listing(entries, "/Projects");
 
-        assert_eq!(listing.len(), 1, "the directory's own entry must be dropped");
+        assert_eq!(
+            listing.len(),
+            1,
+            "the directory's own entry must be dropped"
+        );
         assert_eq!(listing[0].name, "part one.stl"); // percent-decoded
         assert_eq!(listing[0].size, 2048);
     }
@@ -371,7 +375,10 @@ mod tests {
     fn href_path_handles_absolute_urls_and_paths() {
         assert_eq!(href_path("http://127.0.0.1:9007/Projects/"), "/Projects");
         assert_eq!(href_path("/Projects/"), "/Projects");
-        assert_eq!(href_path("/Projects/part%20one.stl"), "/Projects/part one.stl");
+        assert_eq!(
+            href_path("/Projects/part%20one.stl"),
+            "/Projects/part one.stl"
+        );
     }
 
     #[test]

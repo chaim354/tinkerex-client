@@ -31,7 +31,7 @@ use crate::{ChunkIO, Result};
 /// have accrued.
 #[derive(Debug)]
 pub struct RateLimiter {
-    rate: f64, // bytes/sec; 0.0 = unlimited
+    rate: f64,  // bytes/sec; 0.0 = unlimited
     burst: f64, // max tokens (bytes) the bucket holds
     state: Mutex<Bucket>,
 }
@@ -55,7 +55,10 @@ impl RateLimiter {
         Self {
             rate,
             burst,
-            state: Mutex::new(Bucket { tokens: burst, last: Instant::now() }),
+            state: Mutex::new(Bucket {
+                tokens: burst,
+                last: Instant::now(),
+            }),
         }
     }
 
@@ -131,8 +134,12 @@ impl<I: ChunkIO> ThrottledChunkIO<I> {
 
     /// Convenience: build directly from optional byte/sec caps (`None`/`0` = unlimited).
     pub fn from_caps(inner: I, up_bps: Option<u64>, down_bps: Option<u64>) -> Self {
-        let up = up_bps.filter(|&b| b > 0).map(|b| Arc::new(RateLimiter::new(b)));
-        let down = down_bps.filter(|&b| b > 0).map(|b| Arc::new(RateLimiter::new(b)));
+        let up = up_bps
+            .filter(|&b| b > 0)
+            .map(|b| Arc::new(RateLimiter::new(b)));
+        let down = down_bps
+            .filter(|&b| b > 0)
+            .map(|b| Arc::new(RateLimiter::new(b)));
         Self::new(inner, up, down)
     }
 
@@ -181,7 +188,11 @@ mod tests {
     }
     impl FakeIO {
         fn new(blob_len: usize) -> Self {
-            Self { blob: vec![0u8; blob_len], puts: AtomicUsize::new(0), gets: AtomicUsize::new(0) }
+            Self {
+                blob: vec![0u8; blob_len],
+                puts: AtomicUsize::new(0),
+                gets: AtomicUsize::new(0),
+            }
         }
     }
     impl ChunkIO for FakeIO {
@@ -210,7 +221,11 @@ mod tests {
             assert_eq!(got.len(), 1 << 20);
         }
         // 32 MB through with no cap should be effectively instant.
-        assert!(start.elapsed() < Duration::from_millis(200), "unlimited path slept: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "unlimited path slept: {:?}",
+            start.elapsed()
+        );
         assert_eq!(io.inner().puts.load(Ordering::Relaxed), 16 << 20);
         assert_eq!(io.inner().gets.load(Ordering::Relaxed), 16 << 20);
     }
@@ -223,7 +238,11 @@ mod tests {
         for _ in 0..8 {
             io.put("h", &no_urls(), vec![0u8; 1 << 20]).unwrap();
         }
-        assert!(start.elapsed() < Duration::from_millis(200), "0-cap slept: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "0-cap slept: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -246,7 +265,10 @@ mod tests {
             "upload finished too fast: {elapsed:?} < {expected:?} (cap not enforced)"
         );
         // And it shouldn't take absurdly longer than ~total/rate either.
-        assert!(elapsed < Duration::from_secs_f64(total as f64 / rate as f64 + 2.0), "too slow: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs_f64(total as f64 / rate as f64 + 2.0),
+            "too slow: {elapsed:?}"
+        );
         assert_eq!(io.inner().puts.load(Ordering::Relaxed), total);
     }
 

@@ -22,10 +22,13 @@ fn main() {
         .parse()
         .expect("addr like 127.0.0.1:9988");
     let db = args.next().unwrap_or_else(|| "/tmp/maker-webdav.db".into());
-    let chunk_dir = args.next().unwrap_or_else(|| "/tmp/maker-webdav-chunks".into());
+    let chunk_dir = args
+        .next()
+        .unwrap_or_else(|| "/tmp/maker-webdav-chunks".into());
 
     let store = Box::new(LocalChunkStore::new(chunk_dir).expect("chunk dir"));
-    let provider = Arc::new(SqliteProvider::open(&PathBuf::from(db), store).expect("open provider"));
+    let provider =
+        Arc::new(SqliteProvider::open(&PathBuf::from(db), store).expect("open provider"));
 
     println!("WebDAV serving on http://{addr}/");
     println!("mount (macOS): mkdir -p ~/Maker && mount_webdav -S -v Maker http://{addr}/ ~/Maker");

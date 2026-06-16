@@ -35,7 +35,13 @@ use sha2::{Digest, Sha256};
 use sync_client::{ChunkRef, CommitBegin, ServerClient};
 
 fn uniq() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 /// Distinct, incompressible bytes per (size, index) so every op is a genuine round-trip
@@ -80,7 +86,11 @@ struct Stats {
 fn summarize(label: &'static str, mut samples: Vec<f64>) -> Stats {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = samples.len();
-    let mean = if n == 0 { 0.0 } else { samples.iter().sum::<f64>() / n as f64 };
+    let mean = if n == 0 {
+        0.0
+    } else {
+        samples.iter().sum::<f64>() / n as f64
+    };
     Stats {
         label,
         min: samples.first().copied().unwrap_or(0.0),
@@ -110,7 +120,11 @@ fn bench_size(client: &ServerClient, size_kb: usize, batch: usize) {
 
         // --- (1) presign PUT: a commit_begin that returns a presigned PUT for this chunk
         let commit_id = uniq();
-        let manifest = vec![ChunkRef { hash: hash.clone(), offset: 0, length: size as u64 }];
+        let manifest = vec![ChunkRef {
+            hash: hash.clone(),
+            offset: 0,
+            length: size as u64,
+        }];
         let t = Instant::now();
         let begin = client
             .commit_begin(&CommitBegin {
@@ -135,7 +149,9 @@ fn bench_size(client: &ServerClient, size_kb: usize, batch: usize) {
 
         // --- (2) PUT round-trip: upload the bytes to storage directly
         let t = Instant::now();
-        client.upload_chunk(&put_url, bytes.clone()).expect("upload_chunk");
+        client
+            .upload_chunk(&put_url, bytes.clone())
+            .expect("upload_chunk");
         put_rt.push(ms(t.elapsed()));
 
         // Finalize so the chunk is owned by this user (commit_download is ownership-gated).
@@ -143,10 +159,16 @@ fn bench_size(client: &ServerClient, size_kb: usize, batch: usize) {
 
         // --- (3) presign GET: mint a presigned download URL for the chunk
         let t = Instant::now();
-        let dl = client.download_urls(std::slice::from_ref(&hash)).expect("download_urls");
+        let dl = client
+            .download_urls(std::slice::from_ref(&hash))
+            .expect("download_urls");
         let presign_get_ms = ms(t.elapsed());
         presign_get.push(presign_get_ms);
-        let get_url = dl.urls.get(&hash).cloned().expect("server should presign a GET");
+        let get_url = dl
+            .urls
+            .get(&hash)
+            .cloned()
+            .expect("server should presign a GET");
 
         // --- (4) GET round-trip: download the bytes from storage directly
         let t = Instant::now();
@@ -154,7 +176,11 @@ fn bench_size(client: &ServerClient, size_kb: usize, batch: usize) {
         let get_ms = ms(t.elapsed());
         get_rt.push(get_ms);
         assert_eq!(got.len(), size, "round-tripped byte count must match");
-        assert_eq!(hash_hex(&got), hash, "round-tripped bytes must be identical");
+        assert_eq!(
+            hash_hex(&got),
+            hash,
+            "round-tripped bytes must be identical"
+        );
 
         // --- (5) end-to-end hydrate = presign-GET call + GET (the read-on-miss cost)
         hydrate_e2e.push(presign_get_ms + get_ms);
@@ -200,8 +226,10 @@ fn main() {
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect();
-    let batch: usize =
-        std::env::var("BENCH_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let batch: usize = std::env::var("BENCH_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
 
     println!("chunk_latency: server={server}  sizes={sizes:?} KB  batch={batch}");
     println!("(measures the presigned PUT/GET data plane the server is configured for —");
@@ -209,7 +237,11 @@ fn main() {
 
     let mut client = ServerClient::new(&server);
     let reg = client
-        .enroll(&format!("bench-{}@example.com", uniq()), "correct horse battery staple", "bench-device")
+        .enroll(
+            &format!("bench-{}@example.com", uniq()),
+            "correct horse battery staple",
+            "bench-device",
+        )
         .expect("register (is the server up at SERVER_URL?)");
     println!("registered user_id={} (fresh library)", reg.user_id);
 

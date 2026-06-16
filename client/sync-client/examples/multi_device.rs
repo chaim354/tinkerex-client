@@ -10,10 +10,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sync_client::{ChunkRef, CommitBegin, LocalTree, ServerClient};
 
 fn uniq() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
-fn commit_file(c: &ServerClient, node_id: &str, parent: Option<&str>, name: &str, hash: &str, size: u64) {
+fn commit_file(
+    c: &ServerClient,
+    node_id: &str,
+    parent: Option<&str>,
+    name: &str,
+    hash: &str,
+    size: u64,
+) {
     let commit_id = format!("c-{}", uniq());
     c.commit_begin(&CommitBegin {
         commit_id: commit_id.clone(),
@@ -22,7 +35,13 @@ fn commit_file(c: &ServerClient, node_id: &str, parent: Option<&str>, name: &str
         name: name.into(),
         base_version_id: None,
         size,
-        manifest: vec![ChunkRef { hash: hash.into(), offset: 0, length: size }], mode: 0o644, mtime: 0,
+        manifest: vec![ChunkRef {
+            hash: hash.into(),
+            offset: 0,
+            length: size,
+        }],
+        mode: 0o644,
+        mtime: 0,
     })
     .expect("begin");
     c.commit_finalize(&commit_id).expect("finalize");
@@ -33,7 +52,12 @@ fn main() {
 
     // --- Device A: build a tree -------------------------------------------------
     let mut a = ServerClient::new(&base);
-    a.enroll(&format!("multi-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
+    a.enroll(
+        &format!("multi-{}@example.com", uniq()),
+        "correct horse battery staple",
+        "device-A",
+    )
+    .expect("register A");
 
     let dir = format!("d-{}", uniq());
     a.mkdir(&dir, None, "Projects", 0o755, 0).expect("mkdir");
@@ -53,7 +77,11 @@ fn main() {
     assert!(tree.live().any(|n| n.name == "Projects" && n.kind == "dir"));
     assert_eq!(tree.path_of(&f1).as_deref(), Some("/Projects/box.lbrn2"));
     assert!(tree.get(&f2).expect("readme present").manifest.is_some());
-    println!("✓ device B initial-synced {} nodes (cursor {})", tree.nodes.len(), tree.cursor);
+    println!(
+        "✓ device B initial-synced {} nodes (cursor {})",
+        tree.nodes.len(),
+        tree.cursor
+    );
 
     // --- Device A changes; Device B converges via a delta pull ------------------
     a.delete_node(&f2).expect("delete on A");
@@ -61,8 +89,15 @@ fn main() {
     tree.apply_all(&delta.changes);
     assert!(tree.get(&f2).is_none(), "B converged: README.txt is gone");
     assert_eq!(tree.cursor, delta.head_seq);
-    assert_eq!(tree.path_of(&f1).as_deref(), Some("/Projects/box.lbrn2"), "the rest of the tree is intact");
-    println!("✓ device B converged on A's delete (cursor {} == head_seq {})", tree.cursor, delta.head_seq);
+    assert_eq!(
+        tree.path_of(&f1).as_deref(),
+        Some("/Projects/box.lbrn2"),
+        "the rest of the tree is intact"
+    );
+    println!(
+        "✓ device B converged on A's delete (cursor {} == head_seq {})",
+        tree.cursor, delta.head_seq
+    );
 
     println!("\nMULTI-DEVICE OK — two devices converge through the server changelog.");
 }
