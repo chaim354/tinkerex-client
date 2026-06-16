@@ -21,6 +21,78 @@ use tauri::State;
 type Mount = sync_engine::WebdavMount;
 #[cfg(target_os = "linux")]
 type Mount = sync_engine::Daemon;
+
+// ---- WKWebView stale-cache eviction on app update (macOS) ---------------------------
+//
+// The frontend is the bundled static site (`frontendDist = ../src`) served by WKWebView
+// from `tauri://localhost`. WKWebView keeps a persistent on-disk cache (under
+// `~/Library/Caches/<bundle-id>` + `~/Library/WebKit/<bundle-id>`) keyed by URL. Across an
+// app update the asset bytes change but the URLs (`/index.html`, `/main.js`, …) AND the
+// bundle id stay the same — so the webview serves the OLD cached UI until the user manually
+// clears the caches dir. We do that purge automatically, exactly once per version bump.
+//
+// Implementation: a tiny "last-run version" stamp file. On startup (before any window is
+// created) compare the running build's version to the stamp; on a mismatch (or first run)
+// evict the on-disk WKWebView data for this bundle id, then rewrite the stamp. Everything
+// degrades safely — any IO error just logs and lets the app boot (worst case: the user is
+// back to the manual clear, never a crash). macOS-only; a no-op everywhere else.
+#[cfg(target_os = "macos")]
+mod webview_cache {
+    use std::path::PathBuf;
+
+    /// Where the "last successfully launched" version stamp lives. Kept next to the app's
+    /// other local state (the same `maker-app` base the creds/account dirs use) so it's
+    /// per-install and survives across launches but not a full uninstall.
+    fn stamp_path() -> PathBuf {
+        super::app_base().join("webview-version")
+    }
+
+    /// The WKWebView on-disk locations Apple keys by bundle id. Clearing these is exactly the
+    /// manual `rm -rf ~/Library/Caches/<bundle-id>` fix, plus the WebKit website-data store
+    /// (local/session storage, the back/forward disk cache) so nothing stale survives.
+    fn webkit_dirs(bundle_id: &str) -> Vec<PathBuf> {
+        let home = match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h),
+            None => return Vec::new(),
+        };
+        let lib = home.join("Library");
+        vec![
+            lib.join("Caches").join(bundle_id),
+            lib.join("WebKit").join(bundle_id),
+        ]
+    }
+
+    /// Run once on startup, before the window loads. Evicts the WKWebView disk cache iff the
+    /// build version changed since the last launch (the update case), then records the current
+    /// version. `bundle_id` is the app identifier (`com.chaim.maker-app`); `version` is the
+    /// build's `tauri.conf.json` version (`CARGO_PKG_VERSION`, kept in lockstep).
+    pub fn evict_if_version_changed(bundle_id: &str, version: &str) {
+        let stamp = stamp_path();
+        let last = std::fs::read_to_string(&stamp).ok();
+        // First run with the stamp absent counts as "changed": harmless (cache is empty or
+        // a pre-stamp build's) and self-healing — we just write the stamp and move on.
+        if last.as_deref().map(str::trim) == Some(version) {
+            return; // same version as last launch — nothing to do, keep the warm cache
+        }
+
+        for dir in webkit_dirs(bundle_id) {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => eprintln!("webview-cache: evicted {} on update -> {version}", dir.display()),
+                // Not-found is the normal case (clean install / dir never created) — not an error.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("webview-cache: could not evict {} ({e}); continuing", dir.display()),
+            }
+        }
+
+        if let Some(parent) = stamp.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&stamp, version) {
+            // Couldn't persist the stamp → we'd re-evict next launch. Annoying, not unsafe.
+            eprintln!("webview-cache: could not write version stamp ({e}); continuing");
+        }
+    }
+}
 // Windows default: CfAPI — the driverless Cloud Filter path (no WinFsp/GPL driver, mount point is
 // a folder not a drive letter). Flipped from WinfspMount after the live smoke + byte-for-byte
 // conformance went green (Phase 2b B5). WinFsp stays reachable behind the `winfsp-backend` feature
@@ -608,6 +680,14 @@ fn platform() -> &'static str {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Evict the WKWebView on-disk cache when the app has been updated to a new version, so the
+    // new bundled UI shows without a manual `~/Library/Caches/<bundle-id>` clear. Must run
+    // BEFORE the window is created (i.e. before `Builder::run`), so the webview never loads the
+    // stale assets in the first place. macOS-only; the bundle id + version come from
+    // `tauri.conf.json` (`CARGO_PKG_VERSION` is kept in lockstep with the config `version`).
+    #[cfg(target_os = "macos")]
+    webview_cache::evict_if_version_changed("com.chaim.maker-app", env!("CARGO_PKG_VERSION"));
+
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
