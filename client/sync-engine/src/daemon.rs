@@ -63,6 +63,13 @@ pub struct DaemonConfig {
     pub down_bps: Option<u64>,
     /// G5 outbox debounce/coalesce window (default disabled). See [`Debounce`].
     pub debounce: Debounce,
+    /// How many chunk fetches to run **concurrently** when hydrating a file (a bounded worker
+    /// pool over the pooled HTTP client — see
+    /// [`SyncEngine::hydrate_concurrent`](crate::SyncEngine::hydrate_concurrent)). The serial
+    /// per-chunk round-trip to object storage (~80 ms to R2) is the data-plane bottleneck;
+    /// `P` in flight cuts a cold hydrate to ≈ serial/`P`. Defaults to
+    /// [`DEFAULT_HYDRATE_CONCURRENCY`]. `0`/`1` = serial (one chunk at a time).
+    pub hydrate_concurrency: usize,
 }
 
 /// **G5 outbox debounce** parameters (millis). A push of an `upsert` is held while the node
@@ -88,6 +95,11 @@ impl Debounce {
     /// (`docs/torn-writes-and-batching.md` §4 — D = 2-3 s, M = 30 s).
     pub const MAKER_DEFAULT: Debounce = Debounce { window_ms: 2_500, max_age_ms: 30_000 };
 }
+
+/// Default chunk-fetch concurrency for hydration. 8 in-flight GETs balances throughput
+/// against per-host connection limits (reqwest's pool defaults) and memory (we hold at most
+/// `P` chunk buffers at once). Tune via [`DaemonConfig::with_hydrate_concurrency`].
+pub const DEFAULT_HYDRATE_CONCURRENCY: usize = 8;
 
 /// A shared pair of token-bucket limiters (upload + download), built once per `Daemon` and
 /// cloned (`Arc`) into the sync loop so the cap is **global per direction**. Either side
@@ -130,6 +142,7 @@ impl DaemonConfig {
             up_bps: None,
             down_bps: None,
             debounce: Debounce::default(),
+            hydrate_concurrency: DEFAULT_HYDRATE_CONCURRENCY,
         }
     }
 
@@ -137,6 +150,12 @@ impl DaemonConfig {
     /// for chaining: `DaemonConfig::new(..).with_debounce(Debounce::MAKER_DEFAULT)`.
     pub fn with_debounce(mut self, debounce: Debounce) -> Self {
         self.debounce = debounce;
+        self
+    }
+
+    /// Set the chunk-fetch concurrency for hydration (`0`/`1` = serial). Returns `self`.
+    pub fn with_hydrate_concurrency(mut self, concurrency: usize) -> Self {
+        self.hydrate_concurrency = concurrency;
         self
     }
 
@@ -206,7 +225,11 @@ impl Daemon {
             thread::spawn(move || nudge_loop(client, stop, nudge_tx));
         }
 
-        let hydrator = Arc::new(EngineHydrator::new(provider.clone(), client.clone()));
+        let hydrator = Arc::new(EngineHydrator::with_concurrency(
+            provider.clone(),
+            client.clone(),
+            cfg.hydrate_concurrency,
+        ));
         let freshness = Arc::new(crate::EngineFreshness::new(provider.clone(), client.clone(), Some(inval_dyn.clone())));
         let remote_lock = Arc::new(crate::EngineRemoteLock::new(provider.clone(), client.clone()));
         let fs = FuseAdapter::with_hydrator(provider.clone(), hydrator)
@@ -366,10 +389,11 @@ impl WebdavMount {
         let hydrate: fs_webdav::Hydrate = {
             let p = provider.clone();
             let c = client.clone();
+            let concurrency = cfg.hydrate_concurrency;
             Arc::new(move |ino: u64| {
                 if let Ok(Some(node_id)) = p.node_id_for(ino) {
                     let io = PresignedIO::new(&c);
-                    if let Err(e) = SyncEngine::hydrate(&p, &c, &io, &node_id) {
+                    if let Err(e) = SyncEngine::hydrate_concurrent(&p, &c, &io, &node_id, concurrency) {
                         eprintln!("webdav hydrate ino {ino}: {e}");
                     }
                 }
@@ -483,10 +507,11 @@ impl WinfspMount {
         let hydrate: fs_winfsp::Hydrate = {
             let p = provider.clone();
             let c = client.clone();
+            let concurrency = cfg.hydrate_concurrency;
             Arc::new(move |ino: u64| {
                 if let Ok(Some(node_id)) = p.node_id_for(ino) {
                     let io = PresignedIO::new(&c);
-                    if let Err(e) = SyncEngine::hydrate(&p, &c, &io, &node_id) {
+                    if let Err(e) = SyncEngine::hydrate_concurrent(&p, &c, &io, &node_id, concurrency) {
                         eprintln!("winfsp hydrate ino {ino}: {e}");
                     }
                 }
@@ -698,9 +723,12 @@ impl CfApiMount {
         let hydrate: fs_cfapi::Hydrate = {
             let p = provider.clone();
             let c = client.clone();
+            let concurrency = cfg.hydrate_concurrency;
             Arc::new(move |node_id: &str, offset: u64, length: u64| {
                 let io = PresignedIO::new(&c);
-                if let Err(e) = SyncEngine::hydrate_range(&p, &c, &io, node_id, offset, length) {
+                if let Err(e) =
+                    SyncEngine::hydrate_range_concurrent(&p, &c, &io, node_id, offset, length, concurrency)
+                {
                     eprintln!("cfapi hydrate_range {node_id} off={offset} len={length}: {e}");
                 }
             })

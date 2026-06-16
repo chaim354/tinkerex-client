@@ -159,6 +159,12 @@ impl<I: ChunkIO> ChunkIO for ThrottledChunkIO<I> {
         }
         Ok(bytes)
     }
+
+    /// Transparent: defer to the wrapped transport (a throttled `SharedDirIO` still needs
+    /// no URLs; a throttled `PresignedIO` still does).
+    fn needs_urls(&self) -> bool {
+        self.inner.needs_urls()
+    }
 }
 
 #[cfg(test)]

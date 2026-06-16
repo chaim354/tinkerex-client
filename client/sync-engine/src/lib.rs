@@ -17,7 +17,7 @@ use fs_provider::{ChunkLoc, Kind, SqliteProvider, SyncNode};
 use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
 
 mod daemon;
-pub use daemon::{DaemonConfig, Debounce, WebdavMount, DEFAULT_POLL};
+pub use daemon::{DaemonConfig, Debounce, WebdavMount, DEFAULT_HYDRATE_CONCURRENCY, DEFAULT_POLL};
 
 /// Client-side bandwidth throttling: a [`ThrottledChunkIO`](throttle::ThrottledChunkIO)
 /// decorator that token-bucket rate-limits the bytes any [`ChunkIO`] transfers (separate
@@ -82,11 +82,27 @@ pub trait Invalidate: Send + Sync {
 }
 
 /// Moves chunk bytes to/from "the cloud".
-pub trait ChunkIO {
+///
+/// **`Send + Sync`** is required so the engine can move a file's chunks **concurrently** over
+/// a bounded worker pool (see [`hydrate_concurrent`](SyncEngine::hydrate_concurrent) /
+/// parallel push): every production transport already is (`PresignedIO` borrows a `Send +
+/// Sync` `ServerClient`; `SharedDirIO` is a path; `ThrottledChunkIO` adds `Arc<RateLimiter>`),
+/// and a test transport just needs interior mutability via `Mutex`/atomics rather than
+/// `RefCell`.
+pub trait ChunkIO: Send + Sync {
     /// Upload `hash`'s bytes. `put_urls` are from `commit_begin` (presigned PUTs).
     fn put(&self, hash: &str, put_urls: &HashMap<String, String>, bytes: Vec<u8>) -> Result<()>;
     /// Download `hash`'s bytes. `get_url` is from `/chunks/download` (or `None`).
     fn get(&self, hash: &str, get_url: Option<&str>) -> Result<Vec<u8>>;
+
+    /// Whether `get`/`put` need the per-chunk presigned URLs from the server. The production
+    /// [`PresignedIO`] does (default `true`); a content-addressed local store ([`SharedDirIO`])
+    /// ignores the URL and overrides this to `false`, which lets a hydrate **skip the
+    /// `/chunks/download` presign round-trip entirely** (and lets the engine be exercised
+    /// hermetically, with no server, in tests).
+    fn needs_urls(&self) -> bool {
+        true
+    }
 }
 
 /// The cloud is a local directory. Stand-in for R2/SeaweedFS in tests/dev; ignores
@@ -113,6 +129,10 @@ impl ChunkIO for SharedDirIO {
     }
     fn get(&self, hash: &str, _url: Option<&str>) -> Result<Vec<u8>> {
         Ok(std::fs::read(self.path(hash))?)
+    }
+    /// Keyed by content hash; the presigned URL is ignored, so skip the presign call.
+    fn needs_urls(&self) -> bool {
+        false
     }
 }
 
@@ -377,6 +397,18 @@ impl SyncEngine {
         Self::hydrate_range(provider, client, io, node_id, 0, u64::MAX)
     }
 
+    /// [`hydrate`](Self::hydrate) over a **bounded worker pool** of `concurrency` threads —
+    /// the whole-file case of [`hydrate_range_concurrent`](Self::hydrate_range_concurrent).
+    pub fn hydrate_concurrent(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        node_id: &str,
+        concurrency: usize,
+    ) -> Result<()> {
+        Self::hydrate_range_concurrent(provider, client, io, node_id, 0, u64::MAX, concurrency)
+    }
+
     /// **Progressive / range hydration**: fetch only the chunks overlapping `[offset, offset +
     /// size)` — the subset a read at that range actually needs — instead of the whole file. A
     /// header read of a multi-GB file thus pulls a handful of chunks, not gigabytes.
@@ -398,17 +430,61 @@ impl SyncEngine {
         offset: u64,
         size: u64,
     ) -> Result<()> {
+        // The serial path is just the concurrent one with a pool of 1.
+        Self::hydrate_range_concurrent(provider, client, io, node_id, offset, size, 1)
+    }
+
+    /// **Parallel range hydration.** Fetch the chunks overlapping `[offset, offset + size)`
+    /// over a **bounded worker pool** of `concurrency` threads instead of one at a time, then
+    /// write each into the local content-addressed cache. The serial round-trip latency to
+    /// object storage (~80 ms/chunk to R2) is the bottleneck a 100-chunk file pays serially
+    /// (~10 s); overlapping `P` fetches cuts that to ≈ serial/`P` (see `docs/r2-migration.md`
+    /// §5). `concurrency <= 1` (or a single missing chunk) runs inline with no thread spawn.
+    ///
+    /// **Correctness is identical to the serial path:**
+    /// - *Order doesn't matter for hydration* — chunks are content-addressed and cached by
+    ///   hash; the file is assembled in manifest order later by [`Provider::read`]. Each worker
+    ///   independently fetches a hash and writes it to the cache (the chunk store is `Send +
+    ///   Sync`; the provider's cache writes don't take the SQLite tree lock).
+    /// - *All-or-nothing* — if ANY chunk fails (or a worker panics), the whole call returns
+    ///   `Err` and we never claim success on a partially-hydrated file (a read would otherwise
+    ///   serve wrong/short bytes). The first error wins; remaining work is abandoned.
+    /// - *Dedup / idempotency* — already-cached chunks are filtered out up front, so a repeat
+    ///   hydrate fetches nothing; a duplicate hash in the range is fetched once.
+    /// - *Throttle* — `io` carries its own (shared `Arc<RateLimiter>`) token bucket, so all
+    ///   workers draw from one global bucket and the aggregate download rate still respects the
+    ///   cap (it is NOT multiplied by `P`).
+    ///
+    /// The presign step (`/chunks/download`) is **batched once** for all missing chunks (one
+    /// round-trip), exactly as before — only the byte transfers are parallelized.
+    pub fn hydrate_range_concurrent(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        node_id: &str,
+        offset: u64,
+        size: u64,
+        concurrency: usize,
+    ) -> Result<()> {
         let hashes = provider.manifest_range_hashes(node_id, offset, size)?;
         let missing: Vec<String> = hashes.into_iter().filter(|h| !provider.has_chunk(h)).collect();
         if missing.is_empty() {
             return Ok(());
         }
-        let urls = client.download_urls(&missing)?.urls;
-        for h in &missing {
+        // One batched presign for every missing chunk (unchanged) — unless the transport is a
+        // content-addressed local store that ignores URLs (SharedDirIO / hermetic tests).
+        let urls = if io.needs_urls() {
+            client.download_urls(&missing)?.urls
+        } else {
+            HashMap::new()
+        };
+        // Each item fetches → writes its chunk to the local cache → drops the bytes (so we hold
+        // at most `P` chunk buffers at once). Order is irrelevant; assembly is by hash.
+        parallel_for_each(&missing, concurrency, |h| {
             let bytes = io.get(h, urls.get(h).map(String::as_str))?;
             provider.chunk_put(h, &bytes)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// **Proactive (selective-sync-gated) hydration.** After a pull, eagerly hydrate the
@@ -522,6 +598,92 @@ impl SyncEngine {
     }
 }
 
+/// Default concurrency for parallel chunk **uploads** during a push (mirrors
+/// [`daemon::DEFAULT_HYDRATE_CONCURRENCY`] on the download side). A push commits one file at a
+/// time, so this bounds the in-flight PUTs of that file's missing chunks.
+const DEFAULT_PUSH_CONCURRENCY: usize = 8;
+
+/// Run `f` over every item of `items` across a **bounded worker pool** of `concurrency`
+/// threads, with all-or-nothing error + panic semantics. The single concurrency primitive
+/// shared by parallel hydrate (chunk GETs) and parallel push (chunk PUTs).
+///
+/// Guarantees:
+/// - **Bounded:** at most `min(concurrency, items.len())` items run at once; `<= 1` (or a
+///   single item) runs **inline** with no thread spawn.
+/// - **All-or-nothing:** the FIRST item to error stops new work being claimed (a cooperative
+///   `failed` flag) and that error is returned; on success every item ran.
+/// - **Panic-safe:** an item closure that panics is caught and surfaced as an `Err`, never a
+///   parent-thread unwind or a hang (which a raw `thread::scope` re-raise would be).
+/// - **Borrow-friendly:** uses `thread::scope`, so `f` may borrow non-`'static` state (the
+///   provider, the io, the URL map) without `Arc` cloning. `f` must be `Sync` (shared `&f`).
+fn parallel_for_each<T, F>(items: &[T], concurrency: usize, f: F) -> Result<()>
+where
+    T: Sync,
+    F: Fn(&T) -> Result<()> + Sync,
+{
+    if items.is_empty() {
+        return Ok(());
+    }
+    let workers = concurrency.max(1).min(items.len());
+    // One item / no real pool → run inline (preserves the exact serial behavior + error).
+    if workers <= 1 {
+        for it in items {
+            f(it)?;
+        }
+        return Ok(());
+    }
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+    let n = items.len();
+
+    // Run one item, catching a panic so a misbehaving closure fails the batch as an `Err`
+    // rather than unwinding into the parent (which `thread::scope` would otherwise re-raise).
+    let run_one = |idx: usize| -> Result<()> {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&items[idx])));
+        match caught {
+            Ok(r) => r,
+            Err(_) => Err(Error::Io(std::io::Error::other(format!(
+                "parallel worker panicked on item {idx}"
+            )))),
+        }
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next;
+            let failed = &failed;
+            let first_err = &first_err;
+            let run_one = &run_one;
+            scope.spawn(move || loop {
+                // Stop claiming work once any worker has failed (cooperative early-out).
+                if failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= n {
+                    return;
+                }
+                if let Err(e) = run_one(idx) {
+                    failed.store(true, Ordering::Relaxed);
+                    let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                    return;
+                }
+            });
+        }
+    });
+
+    if let Some(e) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Push a single node (dir → `mkdir`; file → commit_begin → upload missing chunks →
 /// finalize). Shared by whole-tree [`push`](SyncEngine::push) and incremental
 /// [`push_outbox`](SyncEngine::push_outbox).
@@ -556,10 +718,18 @@ fn push_node(
                 mode: node.mode,
                 mtime: node.mtime,
             })?;
-            for hash in &begin.missing {
+            // Upload the missing chunks **in parallel** over the same bounded worker pool as
+            // hydration. The uploads are independent and content-addressed (a re-PUT of
+            // identical bytes is idempotent), and conflict handling lives entirely in
+            // `commit_begin`/`commit_finalize` — the byte transfers between them have no
+            // ordering or conflict semantics — so parallelizing them is safe and symmetric with
+            // the download path. `begin.put_urls` is read-only and shared; the throttle's shared
+            // token bucket still caps the aggregate UPLOAD rate.
+            parallel_for_each(&begin.missing, DEFAULT_PUSH_CONCURRENCY, |hash| {
                 let bytes = provider.chunk_get(hash)?;
                 io.put(hash, &begin.put_urls, bytes)?;
-            }
+                Ok(())
+            })?;
             let fin = client.commit_finalize(&commit_id)?;
             // Record the new server version so a follow-up edit bases on it (not the now
             // stale prior version, which would falsely conflict with our own push).
@@ -577,12 +747,20 @@ fn push_node(
 pub struct EngineHydrator {
     provider: Arc<SqliteProvider>,
     client: ServerClient,
+    /// Chunk-fetch concurrency (bounded worker pool); 0/1 = serial.
+    concurrency: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl EngineHydrator {
+    /// Serial hydrator (back-compat; one chunk at a time).
     pub fn new(provider: Arc<SqliteProvider>, client: ServerClient) -> Self {
-        Self { provider, client }
+        Self::with_concurrency(provider, client, 1)
+    }
+
+    /// Hydrator with a bounded chunk-fetch worker pool of `concurrency` (0/1 = serial).
+    pub fn with_concurrency(provider: Arc<SqliteProvider>, client: ServerClient, concurrency: usize) -> Self {
+        Self { provider, client, concurrency }
     }
 }
 
@@ -607,19 +785,27 @@ impl fs_fuse::Hydrate for EngineHydrator {
     fn hydrate(&self, ino: u64) {
         let Some(node_id) = self.node_id_or_log(ino) else { return };
         let io = PresignedIO::new(&self.client);
-        if let Err(e) = SyncEngine::hydrate(&self.provider, &self.client, &io, &node_id) {
+        if let Err(e) =
+            SyncEngine::hydrate_concurrent(&self.provider, &self.client, &io, &node_id, self.concurrency)
+        {
             eprintln!("hydrate: ino {ino} (node {node_id}) failed: {e}");
         }
     }
 
     /// Range hydration: fetch only the chunks overlapping the read's `[offset, size)` (the
-    /// header-of-a-huge-file case), not the whole file.
+    /// header-of-a-huge-file case), not the whole file — also over the bounded worker pool.
     fn hydrate_range(&self, ino: u64, offset: u64, size: u32) {
         let Some(node_id) = self.node_id_or_log(ino) else { return };
         let io = PresignedIO::new(&self.client);
-        if let Err(e) =
-            SyncEngine::hydrate_range(&self.provider, &self.client, &io, &node_id, offset, size as u64)
-        {
+        if let Err(e) = SyncEngine::hydrate_range_concurrent(
+            &self.provider,
+            &self.client,
+            &io,
+            &node_id,
+            offset,
+            size as u64,
+            self.concurrency,
+        ) {
             eprintln!("hydrate_range: ino {ino} (node {node_id}) off={offset} len={size} failed: {e}");
         }
     }

@@ -52,7 +52,6 @@
 
 #![allow(clippy::type_complexity)]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -137,7 +136,9 @@ enum FailKind {
 
 struct FaultPlan {
     /// Number of times to fail before succeeding (transient). `u64::MAX` = persistent.
-    budget: RefCell<HashMap<(String, FailKind), u64>>,
+    // `Mutex` (not `RefCell`) so `FaultyChunkIO` is `Sync` — required by the `ChunkIO`
+    // trait bound (the engine now fetches/uploads chunks across a parallel worker pool).
+    budget: std::sync::Mutex<HashMap<(String, FailKind), u64>>,
     puts: AtomicU64,
     gets: AtomicU64,
     injected: AtomicU64,
@@ -146,7 +147,7 @@ struct FaultPlan {
 impl FaultPlan {
     fn new() -> Self {
         Self {
-            budget: RefCell::new(HashMap::new()),
+            budget: std::sync::Mutex::new(HashMap::new()),
             puts: AtomicU64::new(0),
             gets: AtomicU64::new(0),
             injected: AtomicU64::new(0),
@@ -154,11 +155,11 @@ impl FaultPlan {
     }
     /// Schedule `count` failures of `kind` for `hash` (count = u64::MAX → persistent).
     fn fail(&self, hash: &str, kind: FailKind, count: u64) {
-        self.budget.borrow_mut().insert((hash.to_string(), kind), count);
+        self.budget.lock().unwrap().insert((hash.to_string(), kind), count);
     }
     /// Consume one failure of `kind` for `hash` if budgeted; returns true if we should fail.
     fn should_fail(&self, hash: &str, kind: FailKind) -> bool {
-        let mut b = self.budget.borrow_mut();
+        let mut b = self.budget.lock().unwrap();
         let key = (hash.to_string(), kind);
         match b.get_mut(&key) {
             Some(n) if *n > 0 => {
