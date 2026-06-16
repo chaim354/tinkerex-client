@@ -142,16 +142,16 @@ impl DeviceCtx {
 fn register_and_pair(url: &str) -> (DeviceCtx, DeviceCtx, SharedDirIO) {
     let email = format!("e2e-{}@example.com", uniq());
 
-    // Device A registers — creates the account/library (the app's `sync_start` first-run path).
+    // Device A creates the (confirmed) account + enrolls (the app's `sync_login` first-run path).
+    let password = "correct horse battery staple";
     let mut ca = ServerClient::new(url);
-    let reg_a: RegisterResponse = ca.register(&email, "device-A").expect("register A");
+    let reg_a: RegisterResponse = ca.enroll(&email, password, "device-A").expect("enroll A");
     let a = DeviceCtx::new("A", url, reg_a.device_token);
 
-    // Device A mints a single-use pairing code; brand-new device B redeems it (never sees A's
-    // token) — the secure multi-device join (`DevicePairing`, Syncthing/Plex model).
-    let code = ca.create_pairing().expect("A issues a pairing code").code;
+    // Brand-new device B enrolls by logging in with the SAME account credentials (the Dropbox
+    // model — each device authenticates independently; no pairing codes).
     let mut cb = ServerClient::new(url);
-    let reg_b: RegisterResponse = cb.pair(&email, &code, "device-B").expect("B pairs into the library");
+    let reg_b: RegisterResponse = cb.device_login(&email, password, "device-B").expect("B logs in");
     let b = DeviceCtx::new("B", url, reg_b.device_token);
 
     let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("e2e-cloud-{}", uniq()))).unwrap();

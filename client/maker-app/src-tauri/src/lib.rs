@@ -1,10 +1,10 @@
 //! Tauri backend for the Maker client.
 //!
-//! Commands drive the native sync daemon. Auth is **token-persisted**: a device
-//! registers (or pairs) once, the bearer token is saved under the app dir, and later
-//! starts reuse it — we never re-register (which the hardened server refuses for an
-//! existing email anyway). Additional devices join via a pairing code:
-//! `create_pairing` on a signed-in device → `sync_pair` on the new one.
+//! Commands drive the native sync daemon. Auth is **token-persisted**: a device enrolls
+//! once via device-login (`sync_login`: email + password → a device token, authenticated by
+//! Devise on the server), the bearer token is saved under the app dir, and later starts
+//! reuse it — we never re-login. Every device of an account logs in independently (the
+//! Dropbox model); there are no pairing codes.
 //!
 //! The mount backend is chosen per-OS — all expose the same `start`/`stop`/`is_running`/
 //! `mountpoint` API:
@@ -142,70 +142,33 @@ fn mount_with_token(
     Ok(format!("mounted at {mp}"))
 }
 
-/// Register this device (first ever, on this server+email) or reuse a saved token, then
-/// mount + sync against `server_url`. If the account already exists elsewhere, instructs
-/// the user to pair instead (the secure multi-device path).
+/// Enroll this device by logging in (email + password) — the Dropbox model — or reuse a
+/// saved token, then mount + sync against `server_url`. The server authenticates the human
+/// credentials via Devise (a confirmed, unlocked account is required) and returns a device
+/// token; the password is sent once over TLS and never stored — only the token is saved.
+/// Every device of an account logs in independently (no pairing codes).
 #[tauri::command]
-fn sync_start(
+fn sync_login(
     state: State<AppState>,
     server_url: String,
     email: String,
+    password: String,
     mountpoint: String,
 ) -> Result<String, String> {
-    use sync_client::{Error, ServerClient};
+    use sync_client::ServerClient;
 
     let token = if let Some(t) = load_token(&server_url, &email) {
-        t // already registered/paired on this device — reuse the token, never re-register
+        t // already enrolled on this device — reuse the saved token, never re-login
     } else {
         let mut client = ServerClient::new(&server_url);
-        match client.register(&email, "maker-app") {
-            Ok(reg) => {
-                save_token(&server_url, &email, &reg.device_token);
-                reg.device_token
-            }
-            Err(Error::Server { status: 409, .. }) => {
-                return Err("This account already exists on another device. On a signed-in \
-                            device choose “Add a device” to get a pairing code, then use \
-                            “Pair this device” here with that code."
-                    .into());
-            }
-            Err(e) => return Err(format!("register failed: {e}")),
-        }
+        let reg = client
+            .device_login(&email, &password, "maker-app")
+            .map_err(|e| format!("login failed: {e}"))?;
+        save_token(&server_url, &email, &reg.device_token);
+        reg.device_token
     };
 
     mount_with_token(&state, &server_url, &email, &mountpoint, token)
-}
-
-/// Redeem a pairing code to join an existing library on this (new) device, then mount.
-#[tauri::command]
-fn sync_pair(
-    state: State<AppState>,
-    server_url: String,
-    email: String,
-    code: String,
-    mountpoint: String,
-) -> Result<String, String> {
-    use sync_client::ServerClient;
-
-    let mut client = ServerClient::new(&server_url);
-    let reg = client
-        .pair(&email, &code, "maker-app")
-        .map_err(|e| format!("pairing failed: {e}"))?;
-    save_token(&server_url, &email, &reg.device_token);
-    mount_with_token(&state, &server_url, &email, &mountpoint, reg.device_token)
-}
-
-/// On a signed-in device, mint a pairing code for adding another device. Returns the
-/// code to display to the user.
-#[tauri::command]
-fn create_pairing(server_url: String, email: String) -> Result<String, String> {
-    use sync_client::ServerClient;
-
-    let token = load_token(&server_url, &email)
-        .ok_or("this device isn't signed in yet — start syncing first")?;
-    let client = ServerClient::with_token(&server_url, token);
-    let p = client.create_pairing().map_err(|e| format!("couldn't create a code: {e}"))?;
-    Ok(p.code)
 }
 
 // ---- file browser + versioning (queries the server's synced tree) ------------------
@@ -390,9 +353,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
-            sync_start,
-            sync_pair,
-            create_pairing,
+            sync_login,
             sync_stop,
             sync_status,
             platform,

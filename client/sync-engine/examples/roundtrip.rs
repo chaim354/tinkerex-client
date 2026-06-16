@@ -41,7 +41,7 @@ fn main() {
 
     // --- Device A: register + push (uploads chunks to the cloud) ---------------
     let mut client_a = ServerClient::new(&server);
-    client_a.register(&format!("rt-{}@example.com", uniq()), "device-A").expect("register A");
+    client_a.enroll(&format!("rt-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     SyncEngine::push(&a, &client_a, &io).expect("push");
     let n_chunks = std::fs::read_dir(&cloud_dir).unwrap().count();
     println!("✓ device A pushed tree + uploaded {n_chunks} chunk(s) to the cloud");

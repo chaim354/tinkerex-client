@@ -21,7 +21,7 @@ fn main() {
     let mut c = ServerClient::new(&base);
 
     let email = format!("e2e-{}@example.com", uniq());
-    let reg = c.register(&email, "rust-client").expect("register");
+    let reg = c.enroll(&email, "correct horse battery staple", "rust-client").expect("register");
     assert_eq!(reg.head_seq, 0, "fresh user starts at seq 0");
     println!("✓ registered {} (device {})", reg.user_id, reg.device_id);
 

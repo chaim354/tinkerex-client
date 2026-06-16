@@ -33,7 +33,7 @@ fn main() {
 
     // --- Device A: build a tree -------------------------------------------------
     let mut a = ServerClient::new(&base);
-    a.register(&format!("multi-{}@example.com", uniq()), "device-A").expect("register A");
+    a.enroll(&format!("multi-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
 
     let dir = format!("d-{}", uniq());
     a.mkdir(&dir, None, "Projects", 0o755, 0).expect("mkdir");

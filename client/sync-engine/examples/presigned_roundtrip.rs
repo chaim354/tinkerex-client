@@ -40,7 +40,7 @@ fn main() {
     a.flush(f.ino).unwrap();
 
     let mut client_a = ServerClient::new(&server);
-    client_a.register(&format!("presigned-{}@example.com", uniq()), "device-A").expect("register A");
+    client_a.enroll(&format!("presigned-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     let io_a = PresignedIO::new(&client_a);
     let cursor_a = SyncEngine::sync_tick(&a, &client_a, &io_a, a.cursor().unwrap()).expect("A sync_tick");
     a.set_cursor(cursor_a).unwrap();

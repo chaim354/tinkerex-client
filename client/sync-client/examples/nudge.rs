@@ -18,7 +18,7 @@ fn main() {
     let server = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://localhost:3001".into());
 
     let mut client = ServerClient::new(&server);
-    client.register(&format!("nudge-{}@example.com", uniq()), "device-A").expect("register");
+    client.enroll(&format!("nudge-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register");
 
     // Subscribe in a background thread; forward each head_seq nudge over a channel.
     let (tx, rx) = mpsc::channel::<i64>();

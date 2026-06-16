@@ -59,7 +59,7 @@ fn read_all(p: &SqliteProvider, ino: u64) -> Vec<u8> {
 /// and a shared "cloud" chunk store between them.
 fn two_devices(url: &str) -> (ServerClient, ServerClient, SharedDirIO) {
     let mut a = ServerClient::new(url);
-    a.register(&format!("it-{}@example.com", uniq()), "device-A").expect("register A");
+    a.enroll(&format!("it-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     let dev_b = a.create_device("device-B").expect("create device B");
     let b = ServerClient::with_token(url, dev_b.device_token);
     let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("it-cloud-{}", uniq()))).unwrap();
@@ -321,35 +321,39 @@ fn re_push_of_identical_content_dedups_and_stays_consistent() {
     assert_eq!(read_all(&b, bf.ino), body);
 }
 
-// ---- auth: pairing a second device into an existing library ------------------------
+// ---- auth: a second device joins a library via device-login ------------------------
 
 #[test]
-fn pairing_adds_a_device_to_an_existing_library() {
+fn device_login_adds_a_device_to_an_existing_library() {
     let url = server_url!();
-    let email = format!("pair-{}@example.com", uniq());
+    let email = format!("login-{}@example.com", uniq());
+    let password = "correct horse battery staple";
 
-    // Device A registers (creates the account) and pushes a file.
+    // Device A creates the (confirmed) account + enrolls, then pushes a file.
     let mut ca = ServerClient::new(&url);
-    ca.register(&email, "device-A").expect("register A");
-    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("pair-cloud-{}", uniq()))).unwrap();
+    ca.enroll(&email, password, "device-A").expect("enroll A");
+    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("login-cloud-{}", uniq()))).unwrap();
     let a = dev();
-    let f = a.create(ROOT_INO, "paired.txt").unwrap();
+    let f = a.create(ROOT_INO, "shared.txt").unwrap();
     a.write(f.ino, 0, b"hello from A").unwrap();
     a.flush(f.ino).unwrap();
     SyncEngine::push(&a, &ca, &cloud).expect("A push");
 
-    // A issues a pairing code; a brand-new device B redeems it (never sees A's token).
-    let code = ca.create_pairing().expect("A issues code").code;
+    // A brand-new device B enrolls by logging in with the SAME account credentials (the
+    // Dropbox model — each device authenticates independently; no pairing code).
     let mut cb = ServerClient::new(&url);
-    cb.pair(&email, &code, "device-B").expect("B pairs in");
+    cb.device_login(&email, password, "device-B").expect("B logs in");
 
     // B is now a real device on the same library — it sees A's file.
     let b = dev();
     SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
-    assert!(b.lookup(ROOT_INO, "paired.txt").is_ok(), "paired device B sees A's library");
+    assert!(b.lookup(ROOT_INO, "shared.txt").is_ok(), "device B sees A's library");
 
-    // A reused code can't pair again (single-use).
-    assert!(ServerClient::new(&url).pair(&email, &code, "device-C").is_err(), "code is single-use");
+    // A wrong password cannot enroll a device.
+    assert!(
+        ServerClient::new(&url).device_login(&email, "wrong-password", "device-C").is_err(),
+        "wrong credentials are rejected"
+    );
 }
 
 // ---- file mode (executable bit) propagation ----------------------------------------
@@ -1004,7 +1008,7 @@ fn selective_sync_gates_proactive_hydration_but_not_on_demand() {
 fn one_block_edit_uploads_only_the_delta_chunks() {
     let url = server_url!();
     let mut ca = ServerClient::new(&url);
-    ca.register(&format!("it-{}@example.com", uniq()), "device-A").expect("register A");
+    ca.enroll(&format!("it-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     let cloud = CountingIO::new(
         SharedDirIO::new(std::env::temp_dir().join(format!("it-cloud-{}", uniq()))).unwrap(),
     );

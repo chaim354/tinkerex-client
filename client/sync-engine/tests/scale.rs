@@ -59,7 +59,7 @@ fn dev() -> SqliteProvider {
 
 fn two_devices(url: &str) -> (ServerClient, ServerClient, SharedDirIO) {
     let mut a = ServerClient::new(url);
-    a.register(&format!("scale-{}@example.com", uniq()), "device-A").expect("register A");
+    a.enroll(&format!("scale-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     let dev_b = a.create_device("device-B").expect("create device B");
     let b = ServerClient::with_token(url, dev_b.device_token);
     let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("scale-cloud-{}", uniq()))).unwrap();

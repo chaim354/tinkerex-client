@@ -48,7 +48,7 @@ fn read_all(p: &SqliteProvider, ino: u64) -> Vec<u8> {
 /// One library, three client tokens (A is the owner; B and C join via create_device).
 fn three_devices(url: &str) -> (ServerClient, ServerClient, ServerClient, SharedDirIO) {
     let mut a = ServerClient::new(url);
-    a.register(&format!("adv-{}@example.com", uniq()), "device-A").expect("register A");
+    a.enroll(&format!("adv-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     let b_tok = a.create_device("device-B").expect("device B").device_token;
     let c_tok = a.create_device("device-C").expect("device C").device_token;
     let b = ServerClient::with_token(url, b_tok);
@@ -207,7 +207,7 @@ fn three_way_concurrent_edit_records_conflicts_no_silent_lww() {
 fn four_way_concurrent_edit_surfaces_all_then_keep_resolves_all() {
     let url = server_url!();
     let mut ca = ServerClient::new(&url);
-    ca.register(&format!("adv4-{}@example.com", uniq()), "device-A").expect("register A");
+    ca.enroll(&format!("adv4-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     let clients: Vec<ServerClient> = ["B", "C", "D"]
         .iter()
         .map(|n| {

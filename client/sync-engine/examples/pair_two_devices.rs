@@ -32,30 +32,24 @@ fn main() {
         format!("twodev-{tag:x}@example.com")
     });
 
-    // Device A registers — creates the account/library (the app's `sync_start` first-run path).
+    // Device A creates the (confirmed) account + enrolls — the app's `sync_login` first-run path.
+    let password = "correct horse battery staple";
     let mut ca = ServerClient::new(&server);
-    let reg_a = match ca.register(&email, "device-A") {
+    let reg_a = match ca.enroll(&email, password, "device-A") {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("register A failed (is the server up at {server}? email free?): {e}");
+            eprintln!("enroll A failed (is the server up at {server}? ENABLE_TEST_SIGNUP set? email free?): {e}");
             std::process::exit(1);
         }
     };
 
-    // Device A mints a single-use pairing code; brand-new device B redeems it (never sees A's
-    // token) — the secure multi-device join (`DevicePairing`, the Syncthing/Plex model).
-    let code = match ca.create_pairing() {
-        Ok(p) => p.code,
-        Err(e) => {
-            eprintln!("A create_pairing failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    // Brand-new device B enrolls by logging in with the SAME account credentials (the Dropbox
+    // model — each device authenticates independently; no pairing codes).
     let mut cb = ServerClient::new(&server);
-    let reg_b = match cb.pair(&email, &code, "device-B") {
+    let reg_b = match cb.device_login(&email, password, "device-B") {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("B pair failed (code consumed/expired?): {e}");
+            eprintln!("B device_login failed (bad credentials/unconfirmed/locked?): {e}");
             std::process::exit(1);
         }
     };
