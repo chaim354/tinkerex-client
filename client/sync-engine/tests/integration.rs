@@ -374,6 +374,42 @@ fn executable_bit_propagates_across_devices() {
     assert_eq!(b.getattr(bf.ino).unwrap().mode, 0o755, "chmod +x on A is visible on B");
 }
 
+// ---- symlink sync (metadata-only node; target on the wire) --------------------------
+
+/// A symlink is a metadata-only node: no version/manifest, its target rides the control
+/// plane. Proves the full server round-trip — A creates a link through the Provider, the
+/// engine pushes it (real `POST /v1/nodes/symlink`, not the old SKIP), and B recreates it
+/// via BOTH paths: the changelog delta (`change_to_sync`) and a fresh-device snapshot
+/// (`tree_node_to_sync`). `readlink` on B must equal A's target byte-for-byte.
+#[test]
+fn symlink_roundtrips_across_devices() {
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+    let target = b"../shared/libfoo.so";
+
+    // B starts already in sync (empty) so it converges via the changelog DELTA.
+    let a = dev();
+    let b = dev();
+    let cursor = SyncEngine::pull_snapshot(&b, &cb).unwrap();
+
+    // A creates a symlink through the Provider and pushes it.
+    a.symlink(ROOT_INO, "libfoo.so", target).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // B converges via the delta (exercises `change_to_sync`).
+    SyncEngine::pull_changes(&b, &cb, cursor).unwrap();
+    let bl = b.lookup(ROOT_INO, "libfoo.so").expect("B has the symlink");
+    assert_eq!(bl.kind, fs_provider::Kind::Symlink, "B sees a symlink kind (delta)");
+    assert_eq!(b.readlink(bl.ino).unwrap(), target, "A → server → B link target byte-for-byte (delta)");
+
+    // A brand-new device converges via the full SNAPSHOT (exercises `tree_node_to_sync`).
+    let c = dev();
+    SyncEngine::pull_snapshot(&c, &cb).unwrap();
+    let cl = c.lookup(ROOT_INO, "libfoo.so").expect("C has the symlink");
+    assert_eq!(cl.kind, fs_provider::Kind::Symlink, "C sees a symlink kind (snapshot)");
+    assert_eq!(c.readlink(cl.ino).unwrap(), target, "snapshot also carries the link target");
+}
+
 // ---- offline availability after hydration (cross-platform) --------------------------
 
 /// A chunk transport that's "offline": every fetch fails. Used to prove a read after

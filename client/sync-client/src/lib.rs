@@ -62,6 +62,24 @@ pub struct RegisterResponse {
     pub head_seq: i64,
 }
 
+/// Decode an optional base64 string field into raw bytes — used for symlink targets,
+/// which are raw (possibly non-UTF8) path bytes the server carries base64'd over JSON.
+/// Absent/null → `None`; a malformed base64 string surfaces as a deserialize error.
+fn de_base64_opt<'de, D>(d: D) -> std::result::Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use base64::Engine as _;
+    let opt: Option<String> = Option::deserialize(d)?;
+    match opt {
+        None => Ok(None),
+        Some(s) => base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct CommitBegin {
     pub commit_id: String,
@@ -186,6 +204,10 @@ pub struct NodeView {
     /// sync (the engine falls back to `now` so freshness still works).
     #[serde(default)]
     pub mtime: Option<i64>,
+    /// For `kind == "symlink"`: the link target bytes, base64-decoded from the wire.
+    /// `None` for files/dirs (and from a server that predates symlink sync).
+    #[serde(default, deserialize_with = "de_base64_opt")]
+    pub symlink_target: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,6 +254,10 @@ pub struct TreeNode {
     /// Real modification time, unix nanoseconds. `None` from a pre-mtime server.
     #[serde(default)]
     pub mtime: Option<i64>,
+    /// For `kind == "symlink"`: the link target bytes, base64-decoded from the wire.
+    /// `None` for files/dirs (and from a server that predates symlink sync).
+    #[serde(default, deserialize_with = "de_base64_opt")]
+    pub symlink_target: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,6 +417,22 @@ impl ServerClient {
         let resp = self
             .authed(self.http.post(self.url("/v1/nodes")))?
             .json(&serde_json::json!({ "node_id": node_id, "parent_node_id": parent_node_id, "name": name, "mode": mode, "mtime": mtime }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Create/update a symlink node. The target is raw link bytes (a path, possibly
+    /// non-UTF8) and rides the control plane base64'd — a symlink has no manifest/chunks,
+    /// so this is a single metadata op (mkdir-shaped), not a two-phase content commit.
+    pub fn symlink(&self, node_id: &str, parent_node_id: Option<&str>, name: &str, target: &[u8], mode: u32, mtime: i64) -> Result<SeqResponse> {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(target);
+        let resp = self
+            .authed(self.http.post(self.url("/v1/nodes/symlink")))?
+            .json(&serde_json::json!({
+                "node_id": node_id, "parent_node_id": parent_node_id, "name": name,
+                "symlink_target": encoded, "mode": mode, "mtime": mtime
+            }))
             .send()?;
         Self::json(resp)
     }

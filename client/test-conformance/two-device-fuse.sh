@@ -131,6 +131,17 @@ wait_bytes() { # path want_sha [timeout_sec]
   return 1
 }
 wait_absent() { local p="$1" t="${2:-90}" end; end=$(( $(date +%s) + t )); while [ "$(date +%s)" -lt "$end" ]; do [ ! -e "$p" ] && return 0; sleep 0.5; done; return 1; }
+# Poll for a symlink to appear through a mount with the expected target (readlink). `-L` first
+# so a not-yet-synced path doesn't trip readlink; both must hold within the timeout.
+wait_symlink() { # path want_target [timeout_sec]
+  local p="$1" want="$2" t="${3:-90}" end
+  end=$(( $(date +%s) + t ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    if [ -L "$p" ] && [ "$(readlink "$p" 2>/dev/null)" = "$want" ]; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
 
 # --- 4. A writes through its mount -> B reads it through its mount, byte-for-byte ------------
 echo "==> [A->B] write through A's mount; read through B's mount"
@@ -173,9 +184,17 @@ mv "$MNT_B/draft.txt" "$MNT_B/final.txt"
 if wait_bytes "$MNT_A/final.txt" "$DR"; then pass "B->A: renamed final.txt appears through A's mount, content preserved"; else fail "B->A: rename appears through A"; fi
 if wait_absent "$MNT_A/draft.txt"; then pass "B->A: old name draft.txt gone from A's mount"; else fail "B->A: old name gone from A"; fi
 
+# --- 6e. Symlink (A -> B) -------------------------------------------------------------------
+# A symlink is metadata-only — the target rides the control plane (POST /v1/nodes/symlink),
+# no chunk bytes. Create it through A's real mount; assert readlink resolves it through B's.
+echo "==> [A->B] symlink through A's mount"
+LINK_TARGET="../shared/libfoo.so"
+ln -s "$LINK_TARGET" "$MNT_A/libfoo.so"
+if wait_symlink "$MNT_B/libfoo.so" "$LINK_TARGET"; then pass "A->B: symlink libfoo.so -> $LINK_TARGET resolves through B's mount (readlink)"; else fail "A->B: symlink target through B's mount"; fi
+
 # --- Verdict --------------------------------------------------------------------------------
 if [ "$FAILURES" -gt 0 ]; then
   echo ""; echo "TWO-DEVICE FUSE E2E FAILED: $FAILURES check(s)"; exit 1
 fi
-echo ""; echo "TWO-DEVICE FUSE E2E PASSED - file written through one real mount read byte-for-byte through the other (A<->B), incl. new/nested/delete/rename/multi-chunk"
+echo ""; echo "TWO-DEVICE FUSE E2E PASSED - file written through one real mount read byte-for-byte through the other (A<->B), incl. new/nested/delete/rename/multi-chunk/symlink"
 exit 0
