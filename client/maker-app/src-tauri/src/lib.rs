@@ -77,10 +77,16 @@ mod webview_cache {
 
         for dir in webkit_dirs(bundle_id) {
             match std::fs::remove_dir_all(&dir) {
-                Ok(()) => eprintln!("webview-cache: evicted {} on update -> {version}", dir.display()),
+                Ok(()) => eprintln!(
+                    "webview-cache: evicted {} on update -> {version}",
+                    dir.display()
+                ),
                 // Not-found is the normal case (clean install / dir never created) — not an error.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => eprintln!("webview-cache: could not evict {} ({e}); continuing", dir.display()),
+                Err(e) => eprintln!(
+                    "webview-cache: could not evict {} ({e}); continuing",
+                    dir.display()
+                ),
             }
         }
 
