@@ -54,9 +54,22 @@ pub struct FileAttachment {
     pub position: i64,
 }
 
+/// A tagging on an item's full view (`taggings: [{id, tag_id, name}]`). The `id` is the
+/// **tagging** id (the join row) — the key `DELETE /v1/maker/taggings/:id` (and the
+/// `untag` client method) needs to remove a tag from an item. `tag_id`/`name` identify
+/// the underlying tag. (The item view also still returns plain `tags: [names]` for display.)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaggingDetail {
+    pub id: i64,
+    pub tag_id: i64,
+    pub name: String,
+}
+
 /// The full item view (`GET /v1/maker/items/:id`, and the body returned by
 /// create/update): the short shape plus description/instructions/attachments/tags.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+///
+/// Also `Serialize` so a Tauri command can return it to the JS frontend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ItemDetail {
     pub id: i64,
     pub title: String,
@@ -83,13 +96,19 @@ pub struct ItemDetail {
     pub file_attachments: Vec<FileAttachment>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The item's taggings with their join-row ids — for in-app tag *removal*
+    /// (`untag(tagging.id)`). The plain `tags` above stays for display/back-compat.
+    #[serde(default)]
+    pub taggings: Vec<TaggingDetail>,
 }
 
 /// The mutable fields of an item — used to build the `{ item: { … } }` body for
 /// create/update. Every field is optional so `update_item` can send a partial patch;
 /// `None` fields are omitted from the JSON (Rails leaves unpermitted/absent keys
 /// untouched on update). `create_item` should at least set `title`.
-#[derive(Debug, Clone, Default, Serialize)]
+///
+/// Also `Deserialize` so it can arrive as a Tauri command arg from the JS frontend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ItemInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -126,7 +145,9 @@ pub struct ItemsResponse {
 }
 
 /// The body for attaching a file to an item (`POST /items/:id/file_attachments`).
-#[derive(Debug, Clone, Default, Serialize)]
+///
+/// Also `Deserialize` so it can arrive as a Tauri command arg from the JS frontend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileAttachmentInput {
     pub node_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,7 +162,7 @@ pub struct FileAttachmentInput {
 
 // ---- tags ----------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Tag {
     pub id: i64,
     pub name: String,
@@ -162,7 +183,7 @@ pub struct TaggingResponse {
 
 // ---- collections ----------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Collection {
     pub id: i64,
     pub name: String,
@@ -181,7 +202,7 @@ pub struct CollectionsResponse {
 
 /// An item as listed inside a collection (`GET /collections/:id/items`) — the controller
 /// renders just id/title/item_type there.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollectionItem {
     pub id: i64,
     pub title: String,
@@ -195,7 +216,7 @@ pub struct CollectionItemsResponse {
 
 // ---- tasks ----------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: i64,
     pub title: String,
@@ -225,7 +246,9 @@ pub struct TasksResponse {
 /// The mutable fields of a task — the `{ task: { … } }` body for create/update. All
 /// optional for partial patches; `create_task` should set at least `title`. Pair
 /// `taskable_type` + `taskable_id` to attach the task to an item (omit both for standalone).
-#[derive(Debug, Clone, Default, Serialize)]
+///
+/// Also `Deserialize` so it can arrive as a Tauri command arg from the JS frontend.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -476,7 +499,11 @@ mod tests {
             "file_attachments":[
               {"id":3,"node_id":"n-9","version_id":"v-2","role":"model","label":"body.step","position":0}
             ],
-            "tags":["printed","useful"]}"##;
+            "tags":["printed","useful"],
+            "taggings":[
+              {"id":11,"tag_id":1,"name":"printed"},
+              {"id":12,"tag_id":2,"name":"useful"}
+            ]}"##;
         let d: ItemDetail = serde_json::from_str(body).unwrap();
         assert_eq!(d.title, "Lamp");
         assert!(d.favorited);
@@ -485,6 +512,45 @@ mod tests {
         assert_eq!(d.file_attachments[0].node_id, "n-9");
         assert_eq!(d.file_attachments[0].role, "model");
         assert_eq!(d.tags, vec!["printed".to_string(), "useful".to_string()]);
+        // The taggings carry the join-row ids the in-app untag button needs.
+        assert_eq!(d.taggings.len(), 2);
+        assert_eq!(d.taggings[0].id, 11);
+        assert_eq!(d.taggings[0].tag_id, 1);
+        assert_eq!(d.taggings[0].name, "printed");
+        assert_eq!(d.taggings[1].id, 12);
+        assert_eq!(d.taggings[1].name, "useful");
+    }
+
+    #[test]
+    fn item_detail_taggings_default_when_absent() {
+        // An older/short item body without `taggings` must still parse (serde default = []).
+        let body = r#"{"id":3,"title":"Old","item_type":"other","origin":"downloaded",
+            "favorited":false,"tags":["a"]}"#;
+        let d: ItemDetail = serde_json::from_str(body).unwrap();
+        assert!(d.taggings.is_empty());
+        assert_eq!(d.tags, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn input_structs_deserialize_as_tauri_args() {
+        // These arrive FROM the JS frontend as Tauri command args, so they must
+        // `Deserialize` (the camelCase↔snake_case is handled by Tauri; serde sees snake_case).
+        let item: ItemInput = serde_json::from_str(
+            r#"{"title":"Vase","item_type":"model_3d","favorited":true}"#,
+        )
+        .unwrap();
+        assert_eq!(item.title.as_deref(), Some("Vase"));
+        assert_eq!(item.item_type.as_deref(), Some("model_3d"));
+        assert_eq!(item.favorited, Some(true));
+
+        let att: FileAttachmentInput =
+            serde_json::from_str(r#"{"node_id":"n-1","role":"model","label":"body.step"}"#).unwrap();
+        assert_eq!(att.node_id, "n-1");
+        assert_eq!(att.role.as_deref(), Some("model"));
+
+        let task: TaskInput = serde_json::from_str(r#"{"status":"doing"}"#).unwrap();
+        assert_eq!(task.status.as_deref(), Some("doing"));
+        assert_eq!(task.title, None);
     }
 
     #[test]

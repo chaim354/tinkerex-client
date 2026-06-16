@@ -357,6 +357,192 @@ fn resolve_conflict_split(server_url: String, email: String, node_id: String) ->
     Ok("split".into())
 }
 
+// ---- maker library (the catalog over the synced tree) ------------------------------
+
+/// Build an authed `ServerClient` from the saved creds for this (server, email), or a
+/// human error if this device isn't signed in. Mirrors the inline pattern in `browse`.
+fn maker_client(server_url: &str, email: &str) -> Result<sync_client::ServerClient, String> {
+    let token = load_token(server_url, email).ok_or("this device isn't signed in yet")?;
+    Ok(sync_client::ServerClient::with_token(server_url, token))
+}
+
+// -- items --
+
+#[tauri::command]
+fn maker_list_items(
+    server_url: String,
+    email: String,
+    item_type: Option<String>,
+    tag: Option<String>,
+    q: Option<String>,
+) -> Result<Vec<sync_client::Item>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_items(item_type.as_deref(), tag.as_deref(), q.as_deref())
+        .map_err(|e| format!("list items failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_get_item(server_url: String, email: String, id: i64) -> Result<sync_client::ItemDetail, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.get_item(id).map_err(|e| format!("open item failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_item(
+    server_url: String,
+    email: String,
+    input: sync_client::ItemInput,
+) -> Result<sync_client::ItemDetail, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_item(&input).map_err(|e| format!("create item failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_update_item(
+    server_url: String,
+    email: String,
+    id: i64,
+    input: sync_client::ItemInput,
+) -> Result<sync_client::ItemDetail, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.update_item(id, &input).map_err(|e| format!("update item failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_item(server_url: String, email: String, id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_item(id).map_err(|e| format!("delete item failed: {e}"))
+}
+
+// -- file attachments --
+
+#[tauri::command]
+fn maker_attach_file(
+    server_url: String,
+    email: String,
+    item_id: i64,
+    input: sync_client::FileAttachmentInput,
+) -> Result<sync_client::FileAttachment, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.attach_file(item_id, &input).map_err(|e| format!("attach failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_detach_file(server_url: String, email: String, attachment_id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.detach_file(attachment_id).map_err(|e| format!("detach failed: {e}"))
+}
+
+// -- tags & taggings --
+
+#[tauri::command]
+fn maker_tag_item(server_url: String, email: String, item_id: i64, name: String) -> Result<String, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.tag_item(item_id, &name).map_err(|e| format!("tag failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_untag(server_url: String, email: String, tagging_id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.untag(tagging_id).map_err(|e| format!("untag failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_list_tags(server_url: String, email: String) -> Result<Vec<sync_client::Tag>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_tags().map_err(|e| format!("list tags failed: {e}"))
+}
+
+// -- collections --
+
+#[tauri::command]
+fn maker_list_collections(server_url: String, email: String) -> Result<Vec<sync_client::Collection>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_collections().map_err(|e| format!("list collections failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_collection(
+    server_url: String,
+    email: String,
+    name: String,
+    description: Option<String>,
+) -> Result<sync_client::Collection, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_collection(&name, description.as_deref())
+        .map_err(|e| format!("create collection failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_collection_items(
+    server_url: String,
+    email: String,
+    collection_id: i64,
+) -> Result<Vec<sync_client::CollectionItem>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.collection_items(collection_id)
+        .map_err(|e| format!("collection items failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_add_to_collection(
+    server_url: String,
+    email: String,
+    collection_id: i64,
+    item_id: i64,
+) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.add_to_collection(collection_id, item_id)
+        .map_err(|e| format!("add to collection failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_remove_from_collection(
+    server_url: String,
+    email: String,
+    collection_id: i64,
+    item_id: i64,
+) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.remove_from_collection(collection_id, item_id)
+        .map_err(|e| format!("remove from collection failed: {e}"))
+}
+
+// -- tasks --
+
+#[tauri::command]
+fn maker_list_tasks(server_url: String, email: String, open_only: bool) -> Result<Vec<sync_client::Task>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_tasks(open_only).map_err(|e| format!("list tasks failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_task(
+    server_url: String,
+    email: String,
+    input: sync_client::TaskInput,
+) -> Result<sync_client::Task, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_task(&input).map_err(|e| format!("create task failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_update_task(
+    server_url: String,
+    email: String,
+    id: i64,
+    input: sync_client::TaskInput,
+) -> Result<sync_client::Task, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.update_task(id, &input).map_err(|e| format!("update task failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_task(server_url: String, email: String, id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_task(id).map_err(|e| format!("delete task failed: {e}"))
+}
+
 #[tauri::command]
 fn sync_stop(state: State<AppState>) -> Result<String, String> {
     let mut guard = state.0.lock().unwrap();
@@ -401,7 +587,26 @@ pub fn run() {
             restore_version,
             conflicts,
             resolve_conflict_keep,
-            resolve_conflict_split
+            resolve_conflict_split,
+            maker_list_items,
+            maker_get_item,
+            maker_create_item,
+            maker_update_item,
+            maker_delete_item,
+            maker_attach_file,
+            maker_detach_file,
+            maker_tag_item,
+            maker_untag,
+            maker_list_tags,
+            maker_list_collections,
+            maker_create_collection,
+            maker_collection_items,
+            maker_add_to_collection,
+            maker_remove_from_collection,
+            maker_list_tasks,
+            maker_create_task,
+            maker_update_task,
+            maker_delete_task
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
