@@ -131,6 +131,21 @@ const selectTab = (m) => {
 $("tabNew").onclick = () => selectTab("new");
 $("tabPair").onclick = () => selectTab("pair");
 
+// ---- top-level view nav (Sync | Library) -------------------------------------
+
+const showView = (which) => {
+  const lib = which === "library";
+  $("viewSync").classList.toggle("hidden", lib);
+  $("viewLibrary").classList.toggle("hidden", !lib);
+  $("navSync").classList.toggle("active", !lib);
+  $("navLibrary").classList.toggle("active", lib);
+  $("navSync").setAttribute("aria-selected", String(!lib));
+  $("navLibrary").setAttribute("aria-selected", String(lib));
+  if (lib) window.dispatchEvent(new CustomEvent("library:show"));
+};
+$("navSync").onclick = () => showView("sync");
+$("navLibrary").onclick = () => showView("library");
+
 // ---- validation --------------------------------------------------------------
 
 const validateConnForm = () => {
@@ -519,6 +534,10 @@ const pollConflicts = async () => {
 };
 
 // ---- boot --------------------------------------------------------------------
+
+// Shared with library.js (kept on window to avoid a bundler/import graph; main.js
+// is loaded first, so MakerUI exists before library.js's event handlers fire).
+window.MakerUI = { invoke, $, val, toast, withBusy, fmtSize, fmtWhen, relWhen, args };
 
 refreshStatus();
 setInterval(refreshStatus, 3000);
