@@ -335,16 +335,6 @@ fn assert_acyclic_reachable(p: &SqliteProvider, ctx: &str) {
 }
 
 #[test]
-#[ignore = "RED (documented gap): apply_remote does not guard against re-parenting a dir \
-            under its own descendant, so a cyclic changelog interleaving leaves a detached \
-            cycle in the LOCAL tree (subtree unreachable from ROOT). See comment for repro. \
-            Lower severity than the local-rename cycle: the authoritative server tree is \
-            acyclic, so this only manifests on a transient/buggy delta ordering and the \
-            reconcile floor (pull_snapshot) would eventually re-apply a consistent snapshot. \
-            Left documented rather than fixed tonight: the right fix (cycle-detect + defer in \
-            pull_changes_paged, mirroring BUG #2's defer-and-retry) belongs in sync-engine, \
-            not a blunt reject in apply_remote (which must stay able to apply any single \
-            authoritative snapshot row)."]
 fn apply_remote_cyclic_reparent_must_not_orphan_subtree() {
     // Build X and Y as two sibling dirs under ROOT on a source, export their nodes.
     let src = provider();

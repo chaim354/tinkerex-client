@@ -1271,11 +1271,18 @@ fn apply_upsert(
             }
             Ok(outcome.displaced_pending)
         }
-        // Parent not present locally yet → buffer for retry within this pull rather than
-        // aborting the whole pull. `apply_remote` only returns `NotFound` for a missing
-        // parent (the upsert itself is keyed by stable node_id, so the node's own absence is
-        // an INSERT, not a NotFound).
-        Err(fs_provider::FsError::NotFound) => {
+        // Parent not present locally yet (`NotFound`) OR applying this re-parent now would
+        // create a cycle (`InvalidArgument` — the new parent is the node itself or one of its
+        // descendants) → buffer for retry within this pull rather than aborting it. Both are
+        // transient *delta-interleaving* states: a later entry in the same delta usually moves
+        // the parent into place / out of the would-be loop, after which the deferred upsert
+        // applies cleanly (`retry_deferred`). If neither resolves by end-of-pull the node is
+        // dropped and the caller falls back to the full-tree reconcile floor (`pull_snapshot`),
+        // which re-applies the authoritative (acyclic) server snapshot — never leaving a detached
+        // cycle or an orphaned subtree locally. `apply_remote` returns `NotFound` only for a
+        // missing parent and `InvalidArgument` only for a would-be cycle (the node's own absence
+        // is an INSERT, not an error).
+        Err(fs_provider::FsError::NotFound | fs_provider::FsError::InvalidArgument) => {
             deferred.push(sn);
             Ok(false)
         }
@@ -1320,7 +1327,11 @@ fn retry_deferred(
                         }
                     }
                 }
-                Err(fs_provider::FsError::NotFound) => deferred.push(sn),
+                // Still parent-not-present, or still would-cycle (a later page / a yet-to-retry
+                // sibling may resolve either) → keep buffered.
+                Err(fs_provider::FsError::NotFound | fs_provider::FsError::InvalidArgument) => {
+                    deferred.push(sn)
+                }
                 // A non-parent error on a deferred node: log + drop (don't poison the pull).
                 Err(e) => eprintln!("retry_deferred: dropping node after error: {e}"),
             }
@@ -1492,6 +1503,128 @@ mod apply_tests {
         assert!(inval.invalidated.lock().unwrap().is_empty(), "a move is not a content invalidate");
         // created fired only for the two INSERTs (N's first appearance + the dir D), never for a move.
         assert_eq!(inval.created.lock().unwrap().len(), 2, "created only for the two inserts");
+    }
+
+    fn dir_upsert(node_id: &str, parent: Option<&str>, name: &str) -> Change {
+        let mut c = upsert_change(node_id, parent, name);
+        if let Some(n) = c.node.as_mut() {
+            n.kind = "dir".into();
+        }
+        c
+    }
+
+    /// Walk every node's parent chain; return false if any node can't reach ROOT within a bound
+    /// (it's in a cycle / orphaned). The post-pull invariant: the local tree is fully reachable.
+    fn tree_is_acyclic_reachable(p: &SqliteProvider) -> bool {
+        let nodes = p.export_tree().unwrap();
+        let parent_of: std::collections::HashMap<String, Option<String>> =
+            nodes.iter().map(|n| (n.node_id.clone(), n.parent_node_id.clone())).collect();
+        for n in &nodes {
+            let mut cur = n.parent_node_id.clone();
+            let mut hops = 0;
+            while let Some(pid) = cur {
+                hops += 1;
+                if hops > 10_000 {
+                    return false;
+                }
+                cur = parent_of.get(&pid).cloned().flatten();
+            }
+        }
+        true
+    }
+
+    /// A cyclic re-parent upsert (X under Y, then Y under X) must NOT propagate as an error that
+    /// aborts the whole pull, and must NOT mutate the tree into a detached cycle. Instead it is
+    /// DEFERRED (buffered for retry, mirroring the parent-not-present discipline). When the delta
+    /// drains and the cycle is still unresolvable, `retry_deferred(final_pass=true)` DROPS it and
+    /// returns `true` so the caller falls back to the reconcile floor (`pull_snapshot`). The tree
+    /// stays fully reachable throughout.
+    #[test]
+    fn cyclic_reparent_upsert_is_deferred_then_dropped_for_reconcile_floor() {
+        let p = provider();
+        let mut deferred = Vec::new();
+
+        // Seed X and Y as siblings under ROOT.
+        apply_change(&p, &dir_upsert("X", None, "X"), None, &mut deferred).unwrap();
+        apply_change(&p, &dir_upsert("Y", None, "Y"), None, &mut deferred).unwrap();
+        assert!(deferred.is_empty(), "clean sibling inserts don't defer");
+
+        // X.parent := Y — clean (Y is not below X). Tree: ROOT → Y → X.
+        let r1 = apply_change(&p, &dir_upsert("X", Some("Y"), "X"), None, &mut deferred).unwrap();
+        assert!(!r1, "a clean reparent doesn't signal reconcile");
+        assert!(deferred.is_empty(), "a clean reparent isn't deferred");
+
+        // Y.parent := X — now a CYCLE (X is below Y). Must be DEFERRED, not Err, not applied.
+        let r2 = apply_change(&p, &dir_upsert("Y", Some("X"), "Y"), None, &mut deferred)
+            .expect("a cyclic reparent must be deferred, not propagated as an error");
+        assert!(!r2, "deferring doesn't itself signal reconcile (the drop does)");
+        assert_eq!(deferred.len(), 1, "the cyclic upsert is buffered for retry");
+        assert!(tree_is_acyclic_reachable(&p), "tree stays reachable while the cycle is deferred");
+
+        // End-of-pull drain: the cycle can't resolve from the delta alone → dropped, reconcile.
+        let dropped = retry_deferred(&p, &mut deferred, None, true);
+        assert!(dropped, "an unresolvable cyclic upsert is dropped → caller hits the reconcile floor");
+        assert!(deferred.is_empty(), "deferred is cleared after the final pass");
+        assert!(tree_is_acyclic_reachable(&p), "tree stays reachable (no detached cycle)");
+    }
+
+    /// A cyclic interleaving that RESOLVES mid-delta: X under Y is deferred while it would cycle,
+    /// then a later entry moves X back out from under Y, so on retry the deferred upsert applies
+    /// cleanly — NO reconcile floor needed. This is the common transient-interleaving case.
+    #[test]
+    fn cyclic_reparent_resolved_by_a_later_delta_entry_needs_no_floor() {
+        let p = provider();
+        let mut deferred = Vec::new();
+
+        // ROOT → Y → X  (X already under Y).
+        apply_change(&p, &dir_upsert("Y", None, "Y"), None, &mut deferred).unwrap();
+        apply_change(&p, &dir_upsert("X", Some("Y"), "X"), None, &mut deferred).unwrap();
+        assert!(deferred.is_empty());
+
+        // Y.parent := X would cycle → deferred.
+        apply_change(&p, &dir_upsert("Y", Some("X"), "Y"), None, &mut deferred).unwrap();
+        assert_eq!(deferred.len(), 1, "cyclic upsert buffered");
+
+        // A LATER entry resolves it: move X back under ROOT (out from under Y). Now Y-under-X is
+        // no longer a cycle (X is no longer Y's ancestor).
+        apply_change(&p, &dir_upsert("X", None, "X"), None, &mut deferred).unwrap();
+
+        // Retry the buffered cyclic upsert: it now applies cleanly. final_pass=true, but nothing
+        // remains → no drop, no reconcile floor.
+        let dropped = retry_deferred(&p, &mut deferred, None, true);
+        assert!(!dropped, "the interleaving resolved → no reconcile floor");
+        assert!(deferred.is_empty());
+        assert!(tree_is_acyclic_reachable(&p), "converged to a reachable tree");
+
+        // Y is now under X, X under ROOT — exactly the resolved authoritative shape.
+        let nodes = p.export_tree().unwrap();
+        let y = nodes.iter().find(|n| n.node_id == "Y").unwrap();
+        let x = nodes.iter().find(|n| n.node_id == "X").unwrap();
+        assert_eq!(y.parent_node_id.as_deref(), Some("X"), "Y settled under X");
+        assert!(x.parent_node_id.is_none(), "X settled under ROOT");
+    }
+
+    /// A DEEPER cycle (A → B → C, then C re-parented under A) is rejected + deferred just the
+    /// same — the ancestor walk is not limited to the immediate parent.
+    #[test]
+    fn deep_cyclic_reparent_is_deferred() {
+        let p = provider();
+        let mut deferred = Vec::new();
+
+        // ROOT → A → B → C.
+        apply_change(&p, &dir_upsert("A", None, "A"), None, &mut deferred).unwrap();
+        apply_change(&p, &dir_upsert("B", Some("A"), "B"), None, &mut deferred).unwrap();
+        apply_change(&p, &dir_upsert("C", Some("B"), "C"), None, &mut deferred).unwrap();
+        assert!(deferred.is_empty());
+
+        // A.parent := C — A is C's grand-ancestor, so this closes a 3-node loop. Deferred.
+        apply_change(&p, &dir_upsert("A", Some("C"), "A"), None, &mut deferred).unwrap();
+        assert_eq!(deferred.len(), 1, "the deep cyclic upsert is buffered, not applied");
+        assert!(tree_is_acyclic_reachable(&p), "tree stays reachable");
+
+        let dropped = retry_deferred(&p, &mut deferred, None, true);
+        assert!(dropped, "still unresolvable → reconcile floor");
+        assert!(tree_is_acyclic_reachable(&p));
     }
 }
 

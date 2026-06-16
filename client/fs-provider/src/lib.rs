@@ -844,6 +844,24 @@ impl SqliteProvider {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
+        // Cycle guard (pull path): refuse to re-parent an *existing* node under itself or one
+        // of its own descendants — that would detach the node + its subtree into a cycle that's
+        // unreachable from ROOT (orphaned data + an infinite parent-walk). The authoritative
+        // server tree is always acyclic, so a cyclic upsert only arises from a transient
+        // *delta-interleaving* on the receiving side (e.g. "X.parent:=Y" and "Y.parent:=X" in the
+        // same delta, applied before the other's re-parent lands). We reject WITHOUT mutating the
+        // row (it stays where it was → still reachable) and surface `InvalidArgument`; the pull
+        // loop mirrors its parent-not-present discipline — DEFER + retry (a later entry in the
+        // same delta usually resolves the interleaving), and if it still can't resolve, fall back
+        // to the full-tree reconcile floor (`pull_snapshot`), which re-applies the acyclic server
+        // snapshot. Mirrors the local-`rename` EINVAL guard ("a dir can't become its own
+        // ancestor"). New INSERTs can't form a cycle (a fresh node has no descendants yet), so we
+        // only check on a re-parent of an existing node.
+        if let Some((self_ino, _, old_parent, _, _)) = &prior {
+            if *old_parent != parent_ino && self.ino_is_ancestor_or_self(&conn, *self_ino, parent_ino)? {
+                return Err(FsError::InvalidArgument);
+            }
+        }
         // Displace any *different* node already occupying this (parent, name): the remote
         // snapshot/changelog is authoritative, so the incoming node wins. Without this, applying
         // a snapshot in which a name was reused (e.g. a delete+create, or two devices racing a
@@ -918,6 +936,37 @@ impl SqliteProvider {
         };
         let inserted = prior.is_none();
         Ok(ApplyOutcome { ino, content_changed, inserted, moved, displaced_pending })
+    }
+
+    /// Would re-parenting a node under `cand` (the proposed new parent ino) create a cycle —
+    /// i.e. is `node_ino` equal to `cand` or an ancestor of `cand`? Walk `cand`'s parent chain
+    /// up to ROOT (NULL parent); if it passes through `node_ino`, placing `node_ino` *above*
+    /// `cand` would close a loop. Bounded by the tree depth (the chain is acyclic *before* this
+    /// would-be mutation, which is exactly the invariant the caller preserves by rejecting).
+    /// Mirrors the ancestor walk in local `rename`'s "dir into its own subtree" EINVAL guard.
+    fn ino_is_ancestor_or_self(
+        &self,
+        conn: &rusqlite::Connection,
+        node_ino: i64,
+        cand: i64,
+    ) -> Result<bool> {
+        let mut cur = cand;
+        loop {
+            if cur == node_ino {
+                return Ok(true);
+            }
+            if cur == ROOT_INO as i64 {
+                return Ok(false);
+            }
+            let parent: Option<i64> = conn
+                .query_row("SELECT parent_ino FROM nodes WHERE ino = ?1", params![cur], |r| r.get(0))
+                .optional()?
+                .flatten();
+            match parent {
+                Some(p) => cur = p,
+                None => return Ok(false), // reached a top-level node (NULL parent → ROOT)
+            }
+        }
     }
 
     /// Apply a delete pulled from the server: remove the node identified by its stable
