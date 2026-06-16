@@ -401,7 +401,11 @@ impl ServerClient {
         password: &str,
         device_name: &str,
     ) -> Result<RegisterResponse> {
-        self.create_test_user(email, password)?;
+        // Best-effort: in dev/test the gated `/v1/test/users` seam creates a confirmed
+        // account; on a production server that seam is off (404) and the account is
+        // expected to already exist (e.g. pre-created via `kamal app exec`). Either way
+        // the device-login below is the real auth — only its failure is fatal.
+        let _ = self.create_test_user(email, password);
         self.device_login(email, password, device_name)
     }
 
