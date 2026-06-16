@@ -23,6 +23,20 @@ use fuser::{
 
 const TTL: Duration = Duration::from_secs(1);
 
+/// G8 guardrail: decide whether a `mknod(mode)` request targets a node kind we model.
+/// We support only regular files (and dirs, which never come through `mknod`). A `mode`
+/// with no type bits (`S_IFMT == 0`) is treated as a regular file per POSIX. Everything
+/// else — FIFO (`S_IFIFO`), socket (`S_IFSOCK`), block (`S_IFBLK`) / char (`S_IFCHR`)
+/// device, or symlink (`S_IFLNK`, though that arrives via `symlink`) — is a deliberate
+/// non-goal and is rejected. Pure + platform-independent so it is unit-testable on any OS.
+fn mknod_is_regular_file(mode: u32) -> bool {
+    // `S_IFMT`/`S_IFREG` are `mode_t`, which is `u32` on Linux but `u16` on macOS/BSD —
+    // cast both to `u32` so this compiles + unit-tests on any host (the FUSE `mode` param
+    // is always `u32`). The bit values are identical across platforms.
+    let fmt = mode & (libc::S_IFMT as u32);
+    fmt == 0 || fmt == (libc::S_IFREG as u32)
+}
+
 fn errno(e: &FsError) -> fuser::Errno {
     // fuser 0.17: ReplyXxx::error() takes fuser::Errno (named consts), not a bare i32.
     match e {
@@ -31,6 +45,10 @@ fn errno(e: &FsError) -> fuser::Errno {
         FsError::IsADirectory => fuser::Errno::EISDIR,
         FsError::AlreadyExists => fuser::Errno::EEXIST,
         FsError::NotEmpty => fuser::Errno::ENOTEMPTY,
+        // Special files (symlink/FIFO/socket/device) are a deliberate non-goal — reject
+        // the attempt cleanly with EPERM rather than ENOSYS/EIO so callers (cp -a, tar,
+        // git) get a deterministic "operation not permitted" instead of a confusing crash.
+        FsError::NotSupported => fuser::Errno::EPERM,
         _ => fuser::Errno::EIO,
     }
 }
@@ -348,6 +366,58 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         }
     }
 
+    /// `mknod` — the kernel routes both *regular-file* creation (some tools, e.g. older
+    /// `cp`/`tar`, create the inode via `mknod(S_IFREG)` then `open` it) **and** special
+    /// files (FIFOs, sockets, block/char device nodes) here. We model only regular files +
+    /// directories, so:
+    ///   - `S_IFREG` (regular file) → create it (same as `create`, minus the open handle).
+    ///   - FIFO / socket / block / char device → reject with **EPERM** (special files are a
+    ///     deliberate non-goal — CLAUDE.md / parity-roadmap POSIX caveats). This is the
+    ///     guardrail (G8): without an explicit `mknod` the default returns `ENOSYS`, which
+    ///     surfaces as a confusing "Function not implemented" and lets some callers retry in
+    ///     odd ways; `EPERM` is the deterministic "operation not permitted" macFUSE/Linux
+    ///     callers expect for an unsupported node type. The tree is never touched for the
+    ///     rejected types, so it cannot be corrupted.
+    fn mknod(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        if !mknod_is_regular_file(mode) {
+            reply.error(errno(&FsError::NotSupported));
+            return;
+        }
+        match self.provider.create(parent.0, &name.to_string_lossy()) {
+            Ok(a) => {
+                if (mode & 0o7777) != a.mode {
+                    let _ = self.provider.set_mode(a.ino, mode & 0o7777);
+                }
+                let a = self.provider.getattr(a.ino).unwrap_or(a);
+                reply.entry(&TTL, &file_attr(&a), Generation(0))
+            }
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// `symlink` — symlinks are a deliberate non-goal (the tree models only `File`/`Dir`).
+    /// Reject cleanly with **EPERM** so `ln -s`, `cp -a`, `git checkout` of a symlink, etc.
+    /// fail deterministically instead of hitting the default `ENOSYS`. No tree mutation.
+    fn symlink(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _link_name: &OsStr,
+        _target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        reply.error(errno(&FsError::NotSupported));
+    }
+
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         match self.provider.unlink(parent.0, &name.to_string_lossy()) {
             Ok(()) => reply.ok(),
@@ -514,3 +584,42 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
 
 // Re-export so callers don't need ROOT_INO from two crates.
 pub use fs_provider::ROOT_INO as ROOT;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- G8: special-file guardrail (pure routing + errno mapping) ----
+
+    #[test]
+    fn mknod_accepts_regular_and_untyped() {
+        // A bare permission `mode` with no type bits → regular file.
+        assert!(mknod_is_regular_file(0o644));
+        // Explicit S_IFREG | perms → regular file.
+        assert!(mknod_is_regular_file(libc::S_IFREG as u32 | 0o644));
+        assert!(mknod_is_regular_file(libc::S_IFREG as u32));
+    }
+
+    #[test]
+    fn mknod_rejects_every_special_kind() {
+        // FIFO, socket, char device, block device, symlink — all special, all rejected.
+        for special in [
+            libc::S_IFIFO as u32,
+            libc::S_IFSOCK as u32,
+            libc::S_IFCHR as u32,
+            libc::S_IFBLK as u32,
+            libc::S_IFLNK as u32,
+        ] {
+            assert!(
+                !mknod_is_regular_file(special | 0o644),
+                "special kind {special:#o} must NOT be treated as a regular file",
+            );
+        }
+    }
+
+    #[test]
+    fn special_file_error_maps_to_eperm() {
+        // The guardrail surfaces as a deterministic EPERM, never ENOSYS/EIO.
+        assert_eq!(errno(&FsError::NotSupported), fuser::Errno::EPERM);
+    }
+}

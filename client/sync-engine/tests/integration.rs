@@ -188,22 +188,33 @@ fn hydrate_fetches_only_missing_and_is_idempotent() {
 
 // ---- progressive / range hydration: fetch only the chunks a read touches -----------
 
-/// A `ChunkIO` wrapping `SharedDirIO` that records every hash it was asked to `get` — the
-/// proof that range hydration fetched ONLY the overlapping chunks, not the whole file.
+/// A `ChunkIO` wrapping `SharedDirIO` that records every hash it was asked to `get` (the
+/// proof range hydration fetched ONLY the overlapping chunks) AND every hash it was asked
+/// to `put` (the G10 delta-on-wire audit — proof a small edit uploads only its delta).
 struct CountingIO {
     inner: SharedDirIO,
     fetched: std::sync::Mutex<Vec<String>>,
+    put: std::sync::Mutex<Vec<String>>,
 }
 impl CountingIO {
     fn new(inner: SharedDirIO) -> Self {
-        Self { inner, fetched: std::sync::Mutex::new(Vec::new()) }
+        Self {
+            inner,
+            fetched: std::sync::Mutex::new(Vec::new()),
+            put: std::sync::Mutex::new(Vec::new()),
+        }
     }
     fn fetched(&self) -> Vec<String> {
         self.fetched.lock().unwrap().clone()
     }
+    /// Drain + return the hashes uploaded since the last call (the G10 PUT counter).
+    fn take_puts(&self) -> Vec<String> {
+        std::mem::take(&mut *self.put.lock().unwrap())
+    }
 }
 impl ChunkIO for CountingIO {
     fn put(&self, hash: &str, urls: &HashMap<String, String>, bytes: Vec<u8>) -> sync_engine::Result<()> {
+        self.put.lock().unwrap().push(hash.to_string());
         self.inner.put(hash, urls, bytes)
     }
     fn get(&self, hash: &str, url: Option<&str>) -> sync_engine::Result<Vec<u8>> {
@@ -942,4 +953,86 @@ fn selective_sync_gates_proactive_hydration_but_not_on_demand() {
     // And it still re-hydrates on demand after the reclaim.
     SyncEngine::hydrate(&b, &cb, &cloud, &b_arf_id).expect("re-hydrate after dehydrate");
     assert_eq!(read_all(&b, b_arf.ino), archive_body, "re-hydrates on demand after reclaim");
+}
+
+// ---- G10: delta-on-wire audit ------------------------------------------------------
+// The whole point of FastCDC + content-addressing: a small edit to a large file uploads
+// only the PERTURBED chunks, not the whole file. `push_node` uploads exactly the hashes
+// the server reports missing (`commit_begin.missing`), and CDC keeps an edit's blast
+// radius to a few chunks, so the end-to-end wire delta is minimal. This test instruments
+// the ChunkIO to COUNT puts and asserts a one-block edit re-uploads only a handful of
+// chunks — a regression guard so the delta can't silently degrade to whole-file uploads.
+// Reuses the `CountingIO` defined above (it records both gets and puts).
+
+#[test]
+fn one_block_edit_uploads_only_the_delta_chunks() {
+    let url = server_url!();
+    let mut ca = ServerClient::new(&url);
+    ca.register(&format!("it-{}@example.com", uniq()), "device-A").expect("register A");
+    let cloud = CountingIO::new(
+        SharedDirIO::new(std::env::temp_dir().join(format!("it-cloud-{}", uniq()))).unwrap(),
+    );
+
+    // A large file: with TINY chunk params (~256B avg) a 60 KB file is ~hundreds of chunks.
+    let a = dev();
+    let f = a.create(ROOT_INO, "big.bin").unwrap();
+    let body = pseudo_random(60_000, 7);
+    a.write(f.ino, 0, &body).unwrap();
+    a.flush(f.ino).unwrap();
+
+    // Initial push uploads the whole file (every chunk is new to the server).
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("initial push");
+    let initial = cloud.take_puts();
+    let total_chunks = a.node_manifest_hashes(&a.node_id_for(f.ino).unwrap().unwrap()).unwrap().len();
+    assert!(total_chunks > 20, "test needs a multi-chunk file (got {total_chunks})");
+    assert_eq!(
+        initial.len(),
+        total_chunks,
+        "initial push uploads every chunk (all new to the server)"
+    );
+
+    // Flip one byte deep in the middle, re-flush, re-push. CDC localizes the change; the
+    // server already has every other chunk, so `commit_begin.missing` — and thus the PUTs —
+    // is only the perturbed neighborhood.
+    let mut edited = body.clone();
+    edited[30_000] ^= 0x5a;
+    a.truncate(f.ino, 0).unwrap();
+    a.write(f.ino, 0, &edited).unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("delta push");
+    let delta = cloud.take_puts();
+
+    // The audit: a one-byte edit must re-upload only a tiny fraction of the file — never
+    // the whole thing. (CDC's single_byte_middle_edit property bounds it to a small
+    // neighborhood; we assert a generous cap that still catches a whole-file regression.)
+    assert!(
+        !delta.is_empty(),
+        "the edit changed content, so SOME chunk must upload"
+    );
+    assert!(
+        delta.len() <= total_chunks / 4 + 2,
+        "G10: one-block edit re-uploaded {} of {} chunks — delta-on-wire is NOT minimal \
+         (expected only the perturbed neighborhood)",
+        delta.len(),
+        total_chunks,
+    );
+    eprintln!(
+        "G10 delta-on-wire audit: initial push = {} chunks, one-block-edit push = {} chunks \
+         ({}% of the file) — minimal ✔",
+        total_chunks,
+        delta.len(),
+        delta.len() * 100 / total_chunks.max(1),
+    );
+}
+
+/// Deterministic pseudo-random bytes (no `rand` dep) — same LCG the fs-provider chunking
+/// suite uses, so the delta-locality property is exercised on identical-shaped data.
+fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed.wrapping_add(0x9e3779b97f4a7c15);
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u8
+        })
+        .collect()
 }

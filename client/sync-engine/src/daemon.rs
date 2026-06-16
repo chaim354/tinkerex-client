@@ -61,6 +61,32 @@ pub struct DaemonConfig {
     /// Optional client-side **download** bandwidth cap in bytes/sec (`None`/`0` = unlimited).
     /// Applied to chunk GETs via [`ThrottledChunkIO`](crate::ThrottledChunkIO).
     pub down_bps: Option<u64>,
+    /// G5 outbox debounce/coalesce window (default disabled). See [`Debounce`].
+    pub debounce: Debounce,
+}
+
+/// **G5 outbox debounce** parameters (millis). A push of an `upsert` is held while the node
+/// is still being saved actively (`window_ms` quiescence) but never longer than `max_age_ms`
+/// (the cap, so a continuously re-saved file still syncs). `window_ms == 0` disables it.
+/// Default = disabled (eager push, the pre-G5 behavior); opt in via
+/// [`DaemonConfig::with_debounce`].
+#[derive(Clone, Copy, Debug)]
+pub struct Debounce {
+    pub window_ms: i64,
+    pub max_age_ms: i64,
+}
+
+impl Default for Debounce {
+    fn default() -> Self {
+        // Disabled by default — push promptly. Opt-in to the 2-3s coalesce window.
+        Self { window_ms: 0, max_age_ms: 0 }
+    }
+}
+
+impl Debounce {
+    /// The recommended maker-workload preset: a 2.5 s coalesce window with a 30 s cap
+    /// (`docs/torn-writes-and-batching.md` §4 — D = 2-3 s, M = 30 s).
+    pub const MAKER_DEFAULT: Debounce = Debounce { window_ms: 2_500, max_age_ms: 30_000 };
 }
 
 /// A shared pair of token-bucket limiters (upload + download), built once per `Daemon` and
@@ -103,7 +129,15 @@ impl DaemonConfig {
             webdav_port: 9988,
             up_bps: None,
             down_bps: None,
+            debounce: Debounce::default(),
         }
+    }
+
+    /// Enable the G5 outbox debounce (coalesce rapid saves into one push). Returns `self`
+    /// for chaining: `DaemonConfig::new(..).with_debounce(Debounce::MAKER_DEFAULT)`.
+    pub fn with_debounce(mut self, debounce: Debounce) -> Self {
+        self.debounce = debounce;
+        self
     }
 
     /// Set client-side bandwidth caps in bytes/sec (`None`/`0` = unlimited). Returns `self`
@@ -163,7 +197,8 @@ impl Daemon {
             let poll = cfg.poll;
             let inval = inval_dyn.clone();
             let limits = limits.clone();
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), None, limits))
+            let debounce = cfg.debounce;
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), None, limits, debounce))
         };
         {
             let client = client.clone();
@@ -318,7 +353,8 @@ impl WebdavMount {
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits))
+            let debounce = cfg.debounce;
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits, debounce))
         };
         {
             let client = client.clone();
@@ -434,7 +470,8 @@ impl WinfspMount {
             let client = client.clone();
             let stop = stop.clone();
             let poll = cfg.poll;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits))
+            let debounce = cfg.debounce;
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits, debounce))
         };
         {
             let client = client.clone();
@@ -644,7 +681,8 @@ impl CfApiMount {
             let inval = inval.clone();
             let push_gate = push_gate.clone();
             let limits = limits.clone();
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), Some(push_gate), limits))
+            let debounce = cfg.debounce;
+            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), Some(push_gate), limits, debounce))
         };
         {
             let client = client.clone();
@@ -856,6 +894,7 @@ fn library_id_for(server: &str, token: &str) -> i64 {
 /// Push the outbox + pull the changelog delta on each nudge or poll-timeout. `inval`, when
 /// present (the FUSE `Daemon`), drops the kernel cache for any inode a pull repoints at new
 /// content; the WebDAV/WinFsp mounts pass `None` (no strong push-invalidation yet).
+#[allow(clippy::too_many_arguments)]
 fn sync_loop(
     provider: Arc<SqliteProvider>,
     client: ServerClient,
@@ -865,6 +904,7 @@ fn sync_loop(
     inval: Option<Arc<dyn crate::Invalidate>>,
     push_gate: Option<Arc<std::sync::Mutex<()>>>,
     limits: TransferLimits,
+    debounce: Debounce,
 ) {
     let mut cursor = provider.cursor().unwrap_or(0);
     println!("sync loop started (cursor {cursor}, poll {poll:?})");
@@ -877,7 +917,15 @@ fn sync_loop(
         // SAME outbox node concurrently — a concurrent double-push sends the same base_version_id
         // twice and the server records a spurious self-conflict on the second.
         let guard = push_gate.as_ref().map(|g| g.lock().unwrap_or_else(|e| e.into_inner()));
-        let r = SyncEngine::sync_tick_inval(&provider, &client, &io, cursor, inval.as_deref());
+        let r = SyncEngine::sync_tick_debounced(
+            &provider,
+            &client,
+            &io,
+            cursor,
+            inval.as_deref(),
+            debounce.window_ms,
+            debounce.max_age_ms,
+        );
         drop(guard);
         match r {
             Ok(new_cursor) => {

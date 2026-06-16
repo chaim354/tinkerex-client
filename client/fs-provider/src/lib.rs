@@ -53,6 +53,14 @@ fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// Wall-clock now in unix milliseconds — the unit the G5 outbox debounce records.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     File,
@@ -179,6 +187,13 @@ pub enum FsError {
     ChunkMissing(String),
     #[error("locked (would block)")]
     WouldBlock,
+    /// The operation targets a node kind the sync engine deliberately does not model —
+    /// symlinks, FIFOs, sockets, and device (block/char) nodes (see CLAUDE.md / the
+    /// parity-roadmap POSIX non-goals). The adapters reject these cleanly (mapped to
+    /// `EPERM`) so an attempt fails with a deterministic errno rather than corrupting the
+    /// tree (which only stores `File`/`Dir`) or panicking.
+    #[error("operation not supported (special files are not synced)")]
+    NotSupported,
     #[error("db: {0}")]
     Db(#[from] rusqlite::Error),
     #[error("io: {0}")]
@@ -313,7 +328,14 @@ impl SqliteProvider {
             CREATE TABLE IF NOT EXISTS outbox (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 node_id TEXT NOT NULL UNIQUE,
-                op      TEXT NOT NULL        -- 'upsert' | 'delete'
+                op      TEXT NOT NULL,       -- 'upsert' | 'delete'
+                -- G5 debounce bookkeeping (unix millis): enqueued_at is refreshed on
+                -- every re-enqueue (the last touch, used to detect quiescence), while
+                -- first_enqueued_at is set once and preserved (the max-age cap, so a
+                -- file saved continuously still eventually syncs). 0 on rows from older
+                -- DBs; the debounce treats a 0 as ready-now (no debounce info, so push).
+                enqueued_at       INTEGER NOT NULL DEFAULT 0,
+                first_enqueued_at INTEGER NOT NULL DEFAULT 0
             );
             -- Misc sync state (the changelog cursor lives here under key 'cursor').
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -324,6 +346,9 @@ impl SqliteProvider {
         // Migrate older DBs that predate these columns (ignore "duplicate column").
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN version_id TEXT", []);
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN mode INTEGER", []);
+        // G5 debounce columns on an existing outbox (no-op on a fresh DB).
+        let _ = conn.execute("ALTER TABLE outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE outbox ADD COLUMN first_enqueued_at INTEGER NOT NULL DEFAULT 0", []);
         // Selective-sync subscription state (per-device hydration policy; never synced).
         Self::init_subscriptions(&conn)?;
         // Ensure the root directory (ino 1) exists.
@@ -853,10 +878,15 @@ impl SqliteProvider {
     /// outbox entry is atomic with the tree change that dirtied it. Re-enqueueing a
     /// node coalesces to its latest `op` (keeps the original insertion order).
     fn enqueue(conn: &Connection, node_id: &str, op: &str) -> rusqlite::Result<()> {
+        let now = now_millis();
+        // On insert: stamp both timestamps to `now`. On a re-enqueue of the same node
+        // (a rapid re-save): refresh `enqueued_at` (the last-touch the debounce watches
+        // for quiescence) but PRESERVE `first_enqueued_at` (the max-age cap floor, so a
+        // continuously re-saved file still flushes once it has waited long enough).
         conn.execute(
-            "INSERT INTO outbox(node_id, op) VALUES (?1, ?2)
-             ON CONFLICT(node_id) DO UPDATE SET op = excluded.op",
-            params![node_id, op],
+            "INSERT INTO outbox(node_id, op, enqueued_at, first_enqueued_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET op = excluded.op, enqueued_at = excluded.enqueued_at",
+            params![node_id, op, now],
         )?;
         Ok(())
     }
@@ -931,6 +961,104 @@ impl SqliteProvider {
             }
         }
         Ok(ordered)
+    }
+
+    /// The raw outbox entries with their debounce timestamps `(node_id, op, enqueued_at,
+    /// first_enqueued_at)` (unix millis). Exposed for the engine's debounce gate + tests.
+    pub fn outbox_list_timed(&self) -> Result<Vec<(String, String, i64, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, op, enqueued_at, first_enqueued_at FROM outbox ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// **G5 debounce drain order.** Like [`outbox_list_topo`](Self::outbox_list_topo) but
+    /// filters out `upsert`s that are still inside their debounce window, so a flurry of
+    /// rapid saves to one file coalesces into a single push of the *final* content instead
+    /// of N pushes of intermediate states.
+    ///
+    /// An `upsert` is **held** (skipped this tick, left queued — coalescing with any further
+    /// save) while BOTH:
+    ///   - it was last touched (`enqueued_at`) less than `window_ms` ago (still being saved
+    ///     actively — wait for quiescence), AND
+    ///   - its `first_enqueued_at` is less than `max_age_ms` ago (the hard cap: never hold a
+    ///     node longer than this, so a file saved every second still eventually syncs).
+    ///
+    /// `delete`s are **never** held (low-volume, user-visible — push promptly, per the design
+    /// in `docs/torn-writes-and-batching.md` §4). A held parent also holds its queued
+    /// descendants so the parents-first invariant of the topo order is preserved (a child is
+    /// never drained ahead of a parent that's still debouncing). `window_ms == 0` disables
+    /// the debounce entirely (identical to `outbox_list_topo`). A `0` timestamp (older-DB
+    /// row) counts as "ready now".
+    pub fn outbox_ready_topo(&self, window_ms: i64, max_age_ms: i64) -> Result<Vec<(String, String)>> {
+        if window_ms <= 0 {
+            return self.outbox_list_topo();
+        }
+        let now = now_millis();
+        let timed = self.outbox_list_timed()?;
+
+        // Eligibility per node: a delete or a quiesced/aged-out upsert is eligible; a still-hot
+        // upsert is held.
+        let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (nid, op, enq, first) in &timed {
+            if op == "delete" {
+                continue;
+            }
+            // enq == 0 (legacy row) → ready. Otherwise hold while hot AND under the cap.
+            let still_hot = *enq != 0 && now.saturating_sub(*enq) < window_ms;
+            let under_cap = *first == 0 || now.saturating_sub(*first) < max_age_ms;
+            if still_hot && under_cap {
+                held.insert(nid.clone());
+            }
+        }
+        if held.is_empty() {
+            return self.outbox_list_topo();
+        }
+
+        // Propagate the hold down the tree: any queued node whose ancestor chain passes
+        // through a held node is also held (don't drain a child before its still-debouncing
+        // parent). Build child->parent over the queued upserts, then mark transitively.
+        let mut parent_of: HashMap<String, Option<String>> = HashMap::new();
+        for (nid, op, _, _) in &timed {
+            if op != "delete" {
+                if let Ok(Some(n)) = self.sync_node(nid) {
+                    parent_of.insert(nid.clone(), n.parent_node_id.clone());
+                }
+            }
+        }
+        // Iterate to a fixpoint (cheap — the queue is small): a node becomes held if its
+        // parent is held.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (nid, op, _, _) in &timed {
+                if op == "delete" || held.contains(nid) {
+                    continue;
+                }
+                if let Some(Some(pid)) = parent_of.get(nid) {
+                    if held.contains(pid) {
+                        held.insert(nid.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        let ready: Vec<(String, String)> = self
+            .outbox_list_topo()?
+            .into_iter()
+            .filter(|(nid, _)| !held.contains(nid))
+            .collect();
+        Ok(ready)
     }
 
     /// Remove one outbox entry once it has been pushed to the server.

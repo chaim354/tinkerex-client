@@ -17,7 +17,7 @@ use fs_provider::{ChunkLoc, Kind, SqliteProvider, SyncNode};
 use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
 
 mod daemon;
-pub use daemon::{DaemonConfig, WebdavMount, DEFAULT_POLL};
+pub use daemon::{DaemonConfig, Debounce, WebdavMount, DEFAULT_POLL};
 
 /// Client-side bandwidth throttling: a [`ThrottledChunkIO`](throttle::ThrottledChunkIO)
 /// decorator that token-bucket rate-limits the bytes any [`ChunkIO`] transfers (separate
@@ -172,7 +172,26 @@ impl SyncEngine {
     /// tick's retry. The drain returns `Ok` even with failures (they're transient + retried);
     /// only an outbox read/clear DB error — a local-state problem — propagates.
     pub fn push_outbox(provider: &SqliteProvider, client: &ServerClient, io: &dyn ChunkIO) -> Result<()> {
-        let entries = provider.outbox_list_topo()?;
+        // No debounce by default — drain everything ready (window 0 == disabled). The daemon
+        // loop calls `push_outbox_debounced` with its configured window.
+        Self::push_outbox_debounced(provider, client, io, 0, 0)
+    }
+
+    /// [`push_outbox`](Self::push_outbox) with a **G5 debounce/coalesce window**. An `upsert`
+    /// that is still inside its debounce window (last touched < `window_ms` ago AND first
+    /// queued < `max_age_ms` ago) is **left queued** this tick so a flurry of rapid saves to
+    /// one big CAD file collapses into a single push of the final content (see
+    /// `docs/torn-writes-and-batching.md` §4). Deletes/renames are never debounced. With
+    /// `window_ms == 0` this is exactly the eager drain. On unmount/quiesce the caller passes
+    /// `window_ms == 0` (or [`flush_outbox`](Self::flush_outbox)) to force the final push.
+    pub fn push_outbox_debounced(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        window_ms: i64,
+        max_age_ms: i64,
+    ) -> Result<()> {
+        let entries = provider.outbox_ready_topo(window_ms, max_age_ms)?;
         if !entries.is_empty() {
             eprintln!("push_outbox: {} queued entr{}", entries.len(), if entries.len() == 1 { "y" } else { "ies" });
         }
@@ -207,6 +226,13 @@ impl SyncEngine {
             }
         }
         Ok(())
+    }
+
+    /// Force-drain the **entire** outbox ignoring any debounce window — the
+    /// flush-on-close/unmount path so a debounced final edit can't be left un-pushed when
+    /// the daemon stops. Equivalent to `push_outbox` (window 0).
+    pub fn flush_outbox(provider: &SqliteProvider, client: &ServerClient, io: &dyn ChunkIO) -> Result<()> {
+        Self::push_outbox_debounced(provider, client, io, 0, 0)
     }
 
     /// Initial sync: apply the full-tree snapshot (paginated) to the local provider.
@@ -467,7 +493,23 @@ impl SyncEngine {
         cursor: i64,
         inval: Option<&dyn Invalidate>,
     ) -> Result<i64> {
-        Self::push_outbox(provider, client, io)?;
+        Self::sync_tick_debounced(provider, client, io, cursor, inval, 0, 0)
+    }
+
+    /// [`sync_tick_inval`](Self::sync_tick_inval) with the **G5 debounce window** applied to
+    /// the push leg. The daemon loop passes its configured `(window_ms, max_age_ms)` so rapid
+    /// successive saves to one file coalesce into a single push. The pull leg is unchanged
+    /// (pulls are always applied promptly). `window_ms == 0` disables the debounce.
+    pub fn sync_tick_debounced(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        cursor: i64,
+        inval: Option<&dyn Invalidate>,
+        window_ms: i64,
+        max_age_ms: i64,
+    ) -> Result<i64> {
+        Self::push_outbox_debounced(provider, client, io, window_ms, max_age_ms)?;
         let new_cursor = Self::pull_changes_paged_inval(provider, client, cursor, 500, inval)?;
         // Selective sync: after applying the metadata delta, eagerly hydrate the *in-scope*
         // files (the gate lives in `proactive_hydration_targets`). Out-of-scope subtrees are
