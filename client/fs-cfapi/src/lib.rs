@@ -122,8 +122,10 @@ pub fn decide_action(ev: RemoteNodeEvent) -> PlaceholderAction {
         return PlaceholderAction::Create;
     }
     match ev.kind {
-        Kind::File if ev.content_changed => PlaceholderAction::UpdateAndDehydrate,
-        Kind::File => PlaceholderAction::UpdateMetadata,
+        // A symlink carries content (its target); treat it like a file — a changed target
+        // (content_changed) drops the cached placeholder, else refresh metadata.
+        Kind::File | Kind::Symlink if ev.content_changed => PlaceholderAction::UpdateAndDehydrate,
+        Kind::File | Kind::Symlink => PlaceholderAction::UpdateMetadata,
         // Dirs carry no content; an existing dir reappearing is a no-op (metadata like
         // mtime can be refreshed, but it's not worth a placeholder write).
         Kind::Dir => PlaceholderAction::None,

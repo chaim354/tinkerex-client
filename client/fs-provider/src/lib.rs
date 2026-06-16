@@ -48,6 +48,10 @@ fn default_mode(kind: Kind) -> u32 {
     match kind {
         Kind::Dir => 0o755,
         Kind::File => 0o644,
+        // Symlinks are conventionally 0o777 (the mode is ignored on most systems — the
+        // link's permissions come from the target — but git records 120000 and tools
+        // expect lrwxrwxrwx, so report 0o777 here).
+        Kind::Symlink => 0o777,
     }
 }
 
@@ -92,6 +96,12 @@ fn now_millis() -> i64 {
 pub enum Kind {
     File,
     Dir,
+    /// A symbolic link. The link target (an arbitrary byte path) is stored out-of-band in
+    /// the node's `symlink_target` column, read back via [`SqliteProvider::readlink`]. Git
+    /// stores symlinks (mode 120000) and `git checkout` materializes them, so this is the
+    /// one "special" POSIX kind the sync engine models (FIFOs/sockets/devices stay non-goals
+    /// — they have no portable cross-device meaning; a symlink target is just bytes).
+    Symlink,
 }
 
 impl Kind {
@@ -99,13 +109,14 @@ impl Kind {
         match self {
             Kind::File => "file",
             Kind::Dir => "dir",
+            Kind::Symlink => "symlink",
         }
     }
     fn from_str(s: &str) -> Kind {
-        if s == "dir" {
-            Kind::Dir
-        } else {
-            Kind::File
+        match s {
+            "dir" => Kind::Dir,
+            "symlink" => Kind::Symlink,
+            _ => Kind::File,
         }
     }
 }
@@ -166,6 +177,10 @@ pub struct SyncNode {
     /// time — is what every device sees. On **push** it's the local node's mtime; on
     /// **pull** it's the source device's mtime, applied verbatim by [`SqliteProvider::apply_remote`].
     pub mtime: i64,
+    /// For `kind == Symlink`: the link target bytes (a path), synced verbatim so the link
+    /// resolves identically on every device. `None` for files and dirs. This is a symlink's
+    /// entire content — there's no manifest/chunks for a link (the target is tiny inline data).
+    pub symlink_target: Option<Vec<u8>>,
 }
 
 /// Options for [`SqliteProvider::search`]. `limit`/`offset` paginate the (path-ordered)
@@ -333,6 +348,19 @@ pub trait Provider: Send + Sync {
     fn rmdir(&self, parent: u64, name: &str) -> Result<()>;
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()>;
 
+    /// Create a symbolic link `name` under `parent`, pointing at `target` (raw bytes — a
+    /// path, stored verbatim). The git-checkout path (mode-120000 entries). Default returns
+    /// `NotSupported` (an adapter/provider without link support behaves as before — EPERM);
+    /// `SqliteProvider` stores + syncs the target.
+    fn symlink(&self, _parent: u64, _name: &str, _target: &[u8]) -> Result<Attr> {
+        Err(FsError::NotSupported)
+    }
+    /// Read a symlink's target bytes (`readlink(2)`). Default `NotSupported`; `SqliteProvider`
+    /// returns the stored target (and `NotSupported` if `ino` is not a symlink).
+    fn readlink(&self, _ino: u64) -> Result<Vec<u8>> {
+        Err(FsError::NotSupported)
+    }
+
     // ---- advisory locking (POSIX byte-range; local to this device) -------------------
     // Defaults are a no-op "always succeeds" — a provider without lock support behaves as
     // if nothing is ever locked. `SqliteProvider` overrides with real tracking.
@@ -392,7 +420,8 @@ impl SqliteProvider {
                 manifest_id TEXT,
                 node_id     TEXT,
                 version_id  TEXT,         -- server version this node reflects (commit base)
-                mode        INTEGER       -- POSIX permission bits (preserved + synced)
+                mode        INTEGER,      -- POSIX permission bits (preserved + synced)
+                symlink_target BLOB       -- for kind='symlink': the link target bytes (NULL otherwise)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_ino, name);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_node_id ON nodes(node_id);
@@ -430,6 +459,8 @@ impl SqliteProvider {
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN mode INTEGER", []);
         // atime column on an existing DB (device-local access time; 0 → falls back to mtime).
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN atime INTEGER NOT NULL DEFAULT 0", []);
+        // Symlink support (git checkout of a symlinked path); NULL on older rows + non-links.
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN symlink_target BLOB", []);
         // G5 debounce columns on an existing outbox (no-op on a fresh DB).
         let _ = conn.execute("ALTER TABLE outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE outbox ADD COLUMN first_enqueued_at INTEGER NOT NULL DEFAULT 0", []);
@@ -643,7 +674,8 @@ impl SqliteProvider {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT n.node_id, n.name, n.kind, n.manifest_id,
-                    CASE WHEN n.parent_ino = ?1 THEN NULL ELSE p.node_id END, n.version_id, n.mode, n.mtime
+                    CASE WHEN n.parent_ino = ?1 THEN NULL ELSE p.node_id END, n.version_id, n.mode, n.mtime,
+                    n.symlink_target
              FROM nodes n LEFT JOIN nodes p ON p.ino = n.parent_ino
              WHERE n.ino != ?1
              ORDER BY n.ino",
@@ -658,11 +690,12 @@ impl SqliteProvider {
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, i64>(7)?,
+                r.get::<_, Option<Vec<u8>>>(8)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (node_id, name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime) = row?;
+            let (node_id, name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime, symlink_target) = row?;
             let kind = Kind::from_str(&kind_s);
             let chunks = match &manifest_id {
                 Some(m) => Self::manifest_rows(&conn, m)?,
@@ -678,6 +711,7 @@ impl SqliteProvider {
                 version_id,
                 mode: mode.map(|m| m as u32).unwrap_or_else(|| default_mode(kind)),
                 mtime,
+                symlink_target,
             });
         }
         Ok(out)
@@ -781,14 +815,19 @@ impl SqliteProvider {
                 }
             }
         }
-        let size: i64 = node.chunks.iter().map(|c| c.length as i64).sum();
-        // Look up the prior row (ino + manifest) so we can both reuse the inode on update
-        // and decide whether the content actually changed (→ cache invalidation).
-        let prior: Option<(i64, Option<String>, i64, String)> = conn
+        // A symlink's "size" is its target length (it has no chunks); a file's is the sum of
+        // its chunk lengths.
+        let size: i64 = match (node.kind, &node.symlink_target) {
+            (Kind::Symlink, Some(t)) => t.len() as i64,
+            _ => node.chunks.iter().map(|c| c.length as i64).sum(),
+        };
+        // Look up the prior row (ino + manifest + symlink target) so we can both reuse the
+        // inode on update and decide whether the content actually changed (→ cache invalidation).
+        let prior: Option<(i64, Option<String>, i64, String, Option<Vec<u8>>)> = conn
             .query_row(
-                "SELECT ino, manifest_id, parent_ino, name FROM nodes WHERE node_id = ?1",
+                "SELECT ino, manifest_id, parent_ino, name, symlink_target FROM nodes WHERE node_id = ?1",
                 params![node.node_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         // Displace any *different* node already occupying this (parent, name): the remote
@@ -833,31 +872,34 @@ impl SqliteProvider {
              )",
             params![parent_ino, node.name, node.node_id],
         )?;
-        let ino = if let Some((ino, _, _, _)) = &prior {
+        let ino = if let Some((ino, _, _, _, _)) = &prior {
             conn.execute(
-                "UPDATE nodes SET parent_ino=?1, name=?2, kind=?3, manifest_id=?4, size=?5, mtime=?6, version_id=?7, mode=?8 WHERE node_id=?9",
-                params![parent_ino, node.name, node.kind.as_str(), node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64, node.node_id],
+                "UPDATE nodes SET parent_ino=?1, name=?2, kind=?3, manifest_id=?4, size=?5, mtime=?6, version_id=?7, mode=?8, symlink_target=?10 WHERE node_id=?9",
+                params![parent_ino, node.name, node.kind.as_str(), node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64, node.node_id, node.symlink_target],
             )?;
             *ino as u64
         } else {
             conn.execute(
-                "INSERT INTO nodes(parent_ino, name, kind, node_id, manifest_id, size, mtime, version_id, mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![parent_ino, node.name, node.kind.as_str(), node.node_id, node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64],
+                "INSERT INTO nodes(parent_ino, name, kind, node_id, manifest_id, size, mtime, version_id, mode, symlink_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![parent_ino, node.name, node.kind.as_str(), node.node_id, node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64, node.symlink_target],
             )?;
             conn.last_insert_rowid() as u64
         };
         // Content changed iff the node already existed and its manifest moved (a same-size
-        // edit included — that's exactly the case the old mtime-bump heuristic could miss).
+        // edit included — that's exactly the case the old mtime-bump heuristic could miss) OR,
+        // for a symlink (which has no manifest), its target bytes changed.
         let content_changed = match &prior {
-            Some((_, old_manifest, _, _)) => *old_manifest != node.manifest_id,
+            Some((_, old_manifest, _, _, old_target)) => {
+                *old_manifest != node.manifest_id || *old_target != node.symlink_target
+            }
             None => false,
         };
         // Moved/renamed iff the node already existed and its (parent, name) changed. The
         // changelog models a move as an upsert on the same stable node_id, so this is the only
         // signal that an on-demand-population adapter's old-path placeholder is now stale.
         let moved = match &prior {
-            Some((_, _, old_parent, old_name)) => *old_parent != parent_ino || *old_name != node.name,
+            Some((_, _, old_parent, old_name, _)) => *old_parent != parent_ino || *old_name != node.name,
             None => false,
         };
         let inserted = prior.is_none();
@@ -1291,7 +1333,8 @@ impl SqliteProvider {
         let row = conn
             .query_row(
                 "SELECT n.name, n.kind, n.manifest_id,
-                        CASE WHEN n.parent_ino = ?2 THEN NULL ELSE p.node_id END, n.version_id, n.mode, n.mtime
+                        CASE WHEN n.parent_ino = ?2 THEN NULL ELSE p.node_id END, n.version_id, n.mode, n.mtime,
+                        n.symlink_target
                  FROM nodes n LEFT JOIN nodes p ON p.ino = n.parent_ino
                  WHERE n.node_id = ?1",
                 params![node_id, ROOT_INO as i64],
@@ -1304,11 +1347,12 @@ impl SqliteProvider {
                         r.get::<_, Option<String>>(4)?,
                         r.get::<_, Option<i64>>(5)?,
                         r.get::<_, i64>(6)?,
+                        r.get::<_, Option<Vec<u8>>>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let (name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime) = match row {
+        let (name, kind_s, manifest_id, parent_node_id, version_id, mode, mtime, symlink_target) = match row {
             Some(r) => r,
             None => return Ok(None),
         };
@@ -1327,6 +1371,7 @@ impl SqliteProvider {
             version_id,
             mode: mode.map(|m| m as u32).unwrap_or_else(|| default_mode(kind)),
             mtime,
+            symlink_target,
         }))
     }
 
@@ -1805,9 +1850,10 @@ impl Provider for SqliteProvider {
             //   - file  → existing directory : EISDIR
             //   - dir   → existing non-dir    : ENOTDIR
             //   - dir   → existing directory  : allowed only if the dest is empty (else ENOTEMPTY)
+            // A symlink is a non-directory (like a file) for rename purposes.
             match (src_kind, dst_kind) {
-                (Kind::File, Kind::Dir) => return Err(FsError::IsADirectory),
-                (Kind::Dir, Kind::File) => return Err(FsError::NotADirectory),
+                (Kind::File | Kind::Symlink, Kind::Dir) => return Err(FsError::IsADirectory),
+                (Kind::Dir, Kind::File | Kind::Symlink) => return Err(FsError::NotADirectory),
                 (Kind::Dir, Kind::Dir) => {
                     let kids: i64 = tx.query_row(
                         "SELECT COUNT(*) FROM nodes WHERE parent_ino = ?1",
@@ -1818,7 +1864,8 @@ impl Provider for SqliteProvider {
                         return Err(FsError::NotEmpty);
                     }
                 }
-                (Kind::File, Kind::File) => {} // plain replace (the atomic-save path)
+                // non-dir onto non-dir: plain atomic replace (the atomic-save path)
+                (Kind::File | Kind::Symlink, Kind::File | Kind::Symlink) => {}
             }
             // The displaced node is tombstoned so the deletion propagates on push
             // (otherwise other devices keep a duplicate).
@@ -1833,6 +1880,58 @@ impl Provider for SqliteProvider {
         Self::enqueue(&tx, &src_id, "upsert")?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Create a **symlink** named `name` under `parent`, pointing at `target` (arbitrary
+    /// bytes — a path). This is the git-checkout path: a repo storing a 120000 entry has its
+    /// working-tree link materialized via `symlink(2)`. Sync-ready on creation (no manifest
+    /// — the target *is* the content), so it's enqueued to the outbox immediately like a dir.
+    fn symlink(&self, parent: u64, name: &str, target: &[u8]) -> Result<Attr> {
+        let conn = self.conn.lock().unwrap();
+        let pkind: String = conn
+            .query_row("SELECT kind FROM nodes WHERE ino = ?1", params![parent as i64], |r| r.get(0))
+            .optional()?
+            .ok_or(FsError::NotFound)?;
+        if Kind::from_str(&pkind) != Kind::Dir {
+            return Err(FsError::NotADirectory);
+        }
+        let node_id = uuid::Uuid::new_v4().to_string();
+        let mode = default_mode(Kind::Symlink);
+        let mtime = now_nanos();
+        let size = target.len() as i64;
+        let res = conn.execute(
+            "INSERT INTO nodes(parent_ino, name, kind, node_id, mode, mtime, size, symlink_target)
+             VALUES (?1, ?2, 'symlink', ?3, ?4, ?5, ?6, ?7)",
+            params![parent as i64, name, node_id, mode as i64, mtime, size, target],
+        );
+        match res {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                return Err(FsError::AlreadyExists)
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let ino = conn.last_insert_rowid() as u64;
+        Self::enqueue(&conn, &node_id, "upsert")?;
+        Ok(Attr { ino, kind: Kind::Symlink, size: size as u64, mtime, atime: mtime, mode })
+    }
+
+    /// Read a symlink's target bytes (the `readlink(2)` path). `NotSupported` if the inode is
+    /// not a symlink (an EINVAL-shaped error — `readlink` on a regular file), `NotFound` if gone.
+    fn readlink(&self, ino: u64) -> Result<Vec<u8>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, Option<Vec<u8>>)> = conn
+            .query_row(
+                "SELECT kind, symlink_target FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => Err(FsError::NotFound),
+            Some((kind, _)) if Kind::from_str(&kind) != Kind::Symlink => Err(FsError::NotSupported),
+            Some((_, target)) => Ok(target.unwrap_or_default()),
+        }
     }
 
     fn set_mode(&self, ino: u64, mode: u32) -> Result<()> {
@@ -1941,6 +2040,12 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     }
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()> {
         (**self).rename(parent, name, newparent, newname)
+    }
+    fn symlink(&self, parent: u64, name: &str, target: &[u8]) -> Result<Attr> {
+        (**self).symlink(parent, name, target)
+    }
+    fn readlink(&self, ino: u64) -> Result<Vec<u8>> {
+        (**self).readlink(ino)
     }
     fn set_mode(&self, ino: u64, mode: u32) -> Result<()> {
         (**self).set_mode(ino, mode)
@@ -2293,6 +2398,7 @@ mod tests {
             version_id: Some("vR".into()),
             mode: 0o644,
             mtime: 0,
+            symlink_target: None,
         };
         let outcome = p.apply_remote(&remote).unwrap();
 
@@ -2316,6 +2422,7 @@ mod tests {
             version_id: Some("v1".into()),
             mode: 0o644,
             mtime: 0,
+            symlink_target: None,
         };
         p.apply_remote(&pulled).unwrap();
         p.outbox_clear("remote-S").unwrap(); // simulate it being a clean (non-local) row
@@ -2349,6 +2456,7 @@ mod tests {
             version_id: Some("v1".into()),
             mode: 0o644,
             mtime: 0,
+            symlink_target: None,
         };
         let o_insert = p.apply_remote(&mk("R", &d1_id, "a.txt")).unwrap();
         assert!(o_insert.inserted && !o_insert.moved, "INSERT is not a move");

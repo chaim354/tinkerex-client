@@ -72,6 +72,7 @@ fn file_attr(a: &Attr) -> FileAttr {
     let kind = match a.kind {
         Kind::Dir => FileType::Directory,
         Kind::File => FileType::RegularFile,
+        Kind::Symlink => FileType::Symlink,
     };
     // Convert a unix-nanos timestamp to a SystemTime, falling back to now for an unset (0) one.
     let to_time = |nanos: i64| {
@@ -270,6 +271,7 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
                     let ft = match c.kind {
                         Kind::Dir => FileType::Directory,
                         Kind::File => FileType::RegularFile,
+                        Kind::Symlink => FileType::Symlink,
                     };
                     entries.push((c.ino, ft, c.name));
                 }
@@ -425,18 +427,33 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         }
     }
 
-    /// `symlink` — symlinks are a deliberate non-goal (the tree models only `File`/`Dir`).
-    /// Reject cleanly with **EPERM** so `ln -s`, `cp -a`, `git checkout` of a symlink, etc.
-    /// fail deterministically instead of hitting the default `ENOSYS`. No tree mutation.
+    /// `symlink` — create a symbolic link. Git stores symlinks (mode 120000) and
+    /// `git checkout` materializes them via this call; `ln -s`, `cp -a` use it too. The
+    /// target is stored verbatim (its raw bytes, not interpreted) and synced, so the link
+    /// resolves identically on every device.
     fn symlink(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _link_name: &OsStr,
-        _target: &std::path::Path,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        reply.error(errno(&FsError::NotSupported));
+        use std::os::unix::ffi::OsStrExt;
+        let target_bytes = target.as_os_str().as_bytes();
+        match self.provider.symlink(parent.0, &link_name.to_string_lossy(), target_bytes) {
+            Ok(a) => reply.entry(&TTL, &file_attr(&a), Generation(0)),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// `readlink` — return a symlink's target bytes (what `git status`/`ls -l`/path
+    /// resolution read). Errors (`EPERM`) if the inode isn't a symlink.
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.provider.readlink(ino.0) {
+            Ok(target) => reply.data(&target),
+            Err(e) => reply.error(errno(&e)),
+        }
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -623,7 +640,10 @@ mod tests {
 
     #[test]
     fn mknod_rejects_every_special_kind() {
-        // FIFO, socket, char device, block device, symlink — all special, all rejected.
+        // FIFO, socket, char device, block device — special, all rejected via mknod.
+        // (Symlinks do NOT arrive via mknod — the kernel routes them to the dedicated
+        // `symlink` op, which IS supported; an S_IFLNK *through mknod* is still not a
+        // regular file, so the guardrail correctly declines it here.)
         for special in [
             libc::S_IFIFO as u32,
             libc::S_IFSOCK as u32,

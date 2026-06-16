@@ -697,6 +697,19 @@ fn push_node(
         Kind::Dir => {
             client.mkdir(&node.node_id, node.parent_node_id.as_deref(), &node.name, node.mode, node.mtime)?;
         }
+        Kind::Symlink => {
+            // Symlinks round-trip through the *Provider* (export_tree/apply_remote/sync_node)
+            // and the in-process replica path today, but the Rails server does not yet model a
+            // symlink-kind node (no schema/endpoint for the link target). Skip the push rather
+            // than fabricate server support or silently corrupt the tree — full end-to-end
+            // server sync of symlinks is the documented follow-up (the wire field exists in
+            // SyncNode; the server side is the remaining piece). Local checkout/readlink and
+            // device-to-device replication via apply_remote already work.
+            eprintln!(
+                "sync-engine: skipping symlink push for {} ({:?}) — server symlink support is a follow-up",
+                node.name, node.node_id
+            );
+        }
         Kind::File => {
             let manifest: Vec<ChunkRef> = node
                 .chunks
@@ -959,6 +972,9 @@ fn tree_node_to_sync(n: &TreeNode) -> SyncNode {
         // A server that predates mtime sync sends `None` — fall back to `now` so the kernel
         // still sees a fresh stamp (the old behavior); a real synced mtime is applied verbatim.
         mtime: n.mtime.unwrap_or_else(now_nanos),
+        // The server does not yet emit symlink-kind nodes or carry a link target (follow-up);
+        // server→client conversions therefore never produce a symlink target.
+        symlink_target: None,
     }
 }
 
@@ -1129,6 +1145,8 @@ fn change_to_sync(ch: &Change) -> Option<SyncNode> {
         version_id: ch.version.as_ref().map(|v| v.version_id.clone()),
         mode: view.mode.unwrap_or(if view.kind == "dir" { 0o755 } else { 0o644 }),
         mtime: view.mtime.unwrap_or_else(now_nanos),
+        // See `tree_node_to_sync`: server-emitted nodes never carry a symlink target yet.
+        symlink_target: None,
     })
 }
 
