@@ -131,6 +131,9 @@ pub struct ConflictSide {
     pub device_name: String,
 }
 
+/// One divergent side of a conflict. N-way: a node with 3+ concurrent edits yields MULTIPLE
+/// `ConflictInfo` entries sharing a `node_id` (same `current`, different `incoming`) — every
+/// divergent incoming edit is surfaced independently so none is silently lost.
 #[derive(Debug, Deserialize)]
 pub struct ConflictInfo {
     pub node_id: String,
@@ -146,7 +149,11 @@ pub struct ConflictsResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct SplitResponse {
+    /// First new sibling (kept for 2-way callers).
     pub split_node_id: String,
+    /// All new siblings — one per divergent incoming version (N-way split).
+    #[serde(default)]
+    pub split_node_ids: Vec<String>,
     pub seq: i64,
 }
 

@@ -120,37 +120,23 @@ fn delete_vs_offline_edit_does_not_silently_lose_the_edit() {
 }
 
 // =======================================================================================
-// RACE 2: three-way concurrent edit off the SAME base — REAL BUG FOUND (documented RED).
+// RACE 2: three-way concurrent edit off the SAME base — FIXED (was a documented RED).
 //
 // A, B, C all snapshot v1, then each edits + pushes. A holds the current base → its push is
 // the clean v2. B and C are both based on the stale v1, so EACH raises a conflict and BOTH
-// divergent edits should be presented to the user for adjudication (no edit silently lost).
+// divergent edits are presented to the user for adjudication (no edit silently lost).
 //
-// ACTUAL (the defect): `GET /v1/conflicts` returns only ONE conflict (current vs C's edit).
-// Root cause — `Sync::Commit#finalize` (app/services/sync/commit.rb:107) records the conflict
-// with `user.conflicts.unresolved.find_or_initialize_by(node_id:)` and then *overwrites*
-// `incoming_version_id`. So when C's stale push lands, it reuses B's open conflict row and
-// REPLACES B's incoming version with C's. B's divergent version still exists in history
-// (chunks refcounted, a "conflict" changelog entry was emitted) but is referenced by NO
-// conflict record — it is invisible to the resolution UI. Verified directly against the DB:
-//   4 versions (base, A=current, B, C); 1 unresolved conflict (current vs C); B unreferenced.
-// If the user resolves the surfaced (C) conflict, B's edit becomes a dangling orphan version
-// no UI ever shows → a silent loss of a user's edit from the user's point of view.
+// THE FIX (server conflict-model change): `Sync::Commit#finalize` used to record the conflict
+// with `find_or_initialize_by(node_id:)` and overwrite `incoming_version_id`, so C's stale push
+// reused B's open row and REPLACED B's incoming version — B's edit survived only in version
+// history, referenced by no conflict, invisible to the resolution UI. The row is now keyed by
+// (node_id, incoming_version_id) (unique index), so every divergent incoming version gets its
+// own conflict row and surfaces in `GET /v1/conflicts`. keep/split resolve ALL the node's rows.
 //
-// EXPECTED: every divergent incoming edit is independently surfaced for adjudication
-// (>= 2 unresolved conflicts here, or some other mechanism that keeps B reachable).
-//
-// Fixing this is a server conflict-MODEL change (track multiple incoming divergent versions
-// per node — schema/semantics, not a one-line patch), deferred out of this test pass. Left
-// as a documented RED rather than weakening the assertion.
+// EXPECTED: >= 2 unresolved conflicts here (one per divergent incoming edit).
 // =======================================================================================
 
 #[test]
-#[ignore = "RED (real bug, documented): 3+ way concurrent edits collapse to ONE conflict \
-            record — Sync::Commit#finalize's find_or_initialize_by(node_id:) overwrites the \
-            prior incoming version, dropping all but the last divergent edit from the \
-            resolution UI (bytes survive in history but are unreachable). Fix = server \
-            conflict-model change to track N incoming versions per node. See file comment."]
 fn three_way_concurrent_edit_records_conflicts_no_silent_lww() {
     let url = server_url!();
     let (ca, cb, cc, cloud) = three_devices(&url);
@@ -189,12 +175,110 @@ fn three_way_concurrent_edit_records_conflicts_no_silent_lww() {
 
     // The server must have recorded conflicts for the two stale edits (B and C), not LWW them.
     let conflicts = cb.conflicts().unwrap().conflicts;
+    let incoming: Vec<String> = conflicts
+        .iter()
+        .filter_map(|c| c.incoming.as_ref().map(|s| s.version_id.clone()))
+        .collect();
     assert!(
         conflicts.len() >= 2,
         "BUG: expected >=2 conflicts (B and C edited a stale base), got {} — \
          a silent last-writer-wins dropped at least one device's edit",
         conflicts.len()
     );
+    // Two DISTINCT incoming versions (B's and C's) must both be reachable — the N-way-collapse
+    // bug surfaced only one, dropping the other from the resolution UI.
+    let mut distinct = incoming.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert!(
+        distinct.len() >= 2,
+        "BUG (N-way collapse): expected 2 DISTINCT incoming versions reachable, got {:?}",
+        incoming
+    );
+}
+
+// =======================================================================================
+// RACE 2b: FOUR-way concurrent edit. A holds current (clean v2); B, C, D all push off the
+// stale v1 → THREE divergent incoming versions, all independently reachable. Then KEEPING
+// one side resolves every open conflict on the node and every device converges on it.
+// =======================================================================================
+
+#[test]
+fn four_way_concurrent_edit_surfaces_all_then_keep_resolves_all() {
+    let url = server_url!();
+    let mut ca = ServerClient::new(&url);
+    ca.register(&format!("adv4-{}@example.com", uniq()), "device-A").expect("register A");
+    let clients: Vec<ServerClient> = ["B", "C", "D"]
+        .iter()
+        .map(|n| {
+            let tok = ca.create_device(&format!("device-{n}")).expect("device").device_token;
+            ServerClient::with_token(&url, tok)
+        })
+        .collect();
+    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("adv4-cloud-{}", uniq()))).unwrap();
+
+    // A creates v1; B, C, D snapshot.
+    let a = dev();
+    let f = a.create(ROOT_INO, "model.step").unwrap();
+    a.write(f.ino, 0, b"shared base v1").unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    let mut others = Vec::new();
+    for cl in &clients {
+        let p = dev();
+        SyncEngine::pull_snapshot(&p, cl).unwrap();
+        let fino = p.lookup(ROOT_INO, "model.step").unwrap().ino;
+        others.push((p, fino));
+    }
+
+    // A advances current to a clean v2 (it never re-pulled).
+    let af = a.lookup(ROOT_INO, "model.step").unwrap();
+    a.truncate(af.ino, 0).unwrap();
+    a.write(af.ino, 0, b"A clean v2 current").unwrap();
+    a.flush(af.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).unwrap();
+
+    // B, C, D each push a distinct stale-based edit → three conflicts.
+    for (i, ((p, fino), cl)) in others.iter().zip(clients.iter()).enumerate() {
+        p.truncate(*fino, 0).unwrap();
+        p.write(*fino, 0, format!("diverged side {i}").as_bytes()).unwrap();
+        p.flush(*fino).unwrap();
+        SyncEngine::push_outbox(p, cl, &cloud).unwrap();
+    }
+
+    let conflicts = clients[0].conflicts().unwrap().conflicts;
+    let mut distinct: Vec<String> = conflicts
+        .iter()
+        .filter_map(|c| c.incoming.as_ref().map(|s| s.version_id.clone()))
+        .collect();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "BUG: expected 3 distinct divergent incoming versions (B,C,D), got {:?}",
+        distinct
+    );
+
+    // KEEP A's current v2 on the node — must clear ALL three conflict rows.
+    let node_id = conflicts[0].node_id.clone();
+    let keep_v = conflicts[0].current.as_ref().expect("current side").version_id.clone();
+    clients[0].resolve_conflict_keep(&node_id, &keep_v).expect("keep current");
+    assert!(
+        clients[0].conflicts().unwrap().conflicts.is_empty(),
+        "keeping one version clears every open conflict on the node (N-way)"
+    );
+
+    // A fresh device converges on the kept version, byte-for-byte.
+    let fresh = dev();
+    let fresh_tok = ca.create_device("fresh4").unwrap().device_token;
+    let cf = ServerClient::with_token(&url, fresh_tok);
+    SyncEngine::pull_snapshot(&fresh, &cf).unwrap();
+    let ff = fresh.lookup(ROOT_INO, "model.step").expect("present after keep");
+    let nid = fresh.node_id_for(ff.ino).unwrap().unwrap();
+    SyncEngine::hydrate(&fresh, &cf, &cloud, &nid).expect("hydrate kept");
+    assert_eq!(read_all(&fresh, ff.ino), b"A clean v2 current", "every device converges on the kept version");
 }
 
 // =======================================================================================
