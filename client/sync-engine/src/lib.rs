@@ -52,6 +52,52 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The outcome of [`SyncEngine::ensure_available_offline`] — a one-shot "download this
+/// folder/file for offline use" pass over a subtree.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OfflineSummary {
+    /// How many files had missing chunks fetched this call (a re-run over an already-resident
+    /// subtree reports 0 — idempotency is observable).
+    pub files_hydrated: usize,
+    /// Total bytes actually fetched this call (the previously-missing chunks).
+    pub bytes_hydrated: u64,
+    /// Per-file failures as `(path, error)` — a file that couldn't be hydrated (transient
+    /// network, a missing chunk). The rest of the subtree is still attempted; the caller
+    /// should re-run if this is non-empty. Empty ⇒ the whole subtree is now resident.
+    pub failures: Vec<(String, String)>,
+}
+
+impl OfflineSummary {
+    /// Whether the pass completed with no per-file failures (the subtree is now resident).
+    pub fn ok(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// The result of [`SyncEngine::offline_readiness`] — the pre-disconnect "is this safe to
+/// take offline?" report, computed with **no network** from the local tree + chunk cache.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OfflineReadiness {
+    /// Total files in the node/subtree.
+    pub total_files: usize,
+    /// Files whose every chunk is already local (fully downloaded).
+    pub ready_files: usize,
+    /// Distinct chunks across the subtree (deduped — a shared chunk counts once).
+    pub total_chunks: usize,
+    /// Distinct chunks already present in the local cache.
+    pub present_chunks: usize,
+    /// The files **not yet fully downloaded** (path + node_id) — what's still online-only.
+    pub missing_files: Vec<fs_provider::SubtreeFile>,
+}
+
+impl OfflineReadiness {
+    /// `true` iff every chunk of every file is local — i.e. the node/subtree can be opened
+    /// and read with no network. (An empty subtree — no files — is trivially ready.)
+    pub fn is_ready(&self) -> bool {
+        self.present_chunks == self.total_chunks && self.missing_files.is_empty()
+    }
+}
+
 /// Active OS-cache invalidation. When a **pull** repoints an *existing* inode at new
 /// content, the engine calls [`invalidate`](Invalidate::invalidate) so the adapter drops
 /// the kernel's cached attrs + data for that inode and the next read re-fetches the new
@@ -549,6 +595,133 @@ impl SyncEngine {
     pub fn unsubscribe(provider: &SqliteProvider, node_id: &str) -> Result<usize> {
         provider.unsubscribe(node_id)?;
         Ok(provider.dehydrate_subtree(node_id)?)
+    }
+
+    /// **Pin a subtree for offline + download it now.** Records the pin (forcing the subtree
+    /// in scope for proactive hydration across pulls — see [`SqliteProvider::pin`]) and then
+    /// immediately makes it available offline via [`ensure_available_offline`](Self::ensure_available_offline).
+    /// The combination is the "make this folder available offline" action: it both downloads
+    /// the current contents AND keeps the folder resident as new files arrive (the daemon's
+    /// proactive-hydration pass honors the pin every tick). Returns the download summary.
+    pub fn pin(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        node_id: &str,
+        concurrency: usize,
+    ) -> Result<OfflineSummary> {
+        provider.pin(node_id)?;
+        Self::ensure_available_offline(provider, client, io, node_id, concurrency)
+    }
+
+    /// **Unpin a subtree**, optionally reclaiming its cached bytes. Removes the pin so the
+    /// subtree stops being force-kept resident (it reverts to inheriting its ancestry / the
+    /// device default). When `reclaim` is true, the now out-of-scope subtree's cached chunks
+    /// are dropped (dedup-safe — a chunk a still-in-scope file shares is never dropped),
+    /// returning the number reclaimed; when false, returns 0 and leaves the bytes (they'll be
+    /// reclaimed by a later dehydrate / GC). The tree + manifests stay, so the subtree is still
+    /// navigable and re-hydrates on demand.
+    pub fn unpin(provider: &SqliteProvider, node_id: &str, reclaim: bool) -> Result<usize> {
+        provider.unpin(node_id)?;
+        if reclaim {
+            Ok(provider.dehydrate_subtree(node_id)?)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// **Make a node available offline.** Fully hydrate `node_id` and — if it's a directory —
+    /// every descendant file's chunks, so the whole subtree is resident on local disk before
+    /// the device goes offline (the workshop / makerspace / client-site scenario). Each file
+    /// is hydrated over the bounded worker pool (`concurrency` threads per file). Idempotent:
+    /// already-local chunks are skipped, so a re-run over a resident subtree fetches nothing.
+    ///
+    /// Returns an [`OfflineSummary`]: how many files were (partly or wholly) hydrated, the
+    /// bytes brought down, and any per-file [`failures`](OfflineSummary::failures). **Per-file
+    /// error isolation:** one file that fails (transient network, a missing chunk) is recorded
+    /// in `failures` and does NOT abort the rest — so a single bad file can't leave the rest of
+    /// the offline set un-downloaded. The caller should re-run (or check
+    /// [`offline_readiness`](Self::offline_readiness)) if `failures` is non-empty.
+    ///
+    /// This is the engine primitive behind a future "make available offline" app button / the
+    /// `pin` CLI command. It does NOT itself set a subscription rule — pair it with
+    /// [`subscribe`](Self::subscribe) (or the pin flag) to keep the subtree resident across
+    /// pulls; on its own it's a one-shot "download these now".
+    pub fn ensure_available_offline(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+        node_id: &str,
+        concurrency: usize,
+    ) -> Result<OfflineSummary> {
+        let mut summary = OfflineSummary::default();
+        for file in provider.subtree_files(node_id)? {
+            // Count only the bytes actually fetched this call (the still-missing chunks), so a
+            // re-run over a resident subtree reports 0 bytes (idempotency is observable).
+            let hashes = provider.node_manifest_hashes(&file.node_id)?;
+            let missing: Vec<String> = hashes.iter().filter(|h| !provider.has_chunk(h)).cloned().collect();
+            if missing.is_empty() {
+                continue; // already fully resident — nothing to do
+            }
+            match Self::hydrate_concurrent(provider, client, io, &file.node_id, concurrency) {
+                Ok(()) => {
+                    summary.files_hydrated += 1;
+                    // Sum the bytes of the chunks that were missing (now fetched). Read each
+                    // from the now-populated cache; a chunk that somehow still isn't present
+                    // (shouldn't happen on Ok) contributes 0 rather than erroring the summary.
+                    for h in &missing {
+                        if let Ok(bytes) = provider.chunk_get(h) {
+                            summary.bytes_hydrated += bytes.len() as u64;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("ensure_available_offline: {} failed: {e}", file.path);
+                    summary.failures.push((file.path.clone(), e.to_string()));
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// **Offline-readiness check — the pre-disconnect "are these files safe to take offline?"**
+    /// Without any network, report whether `node_id` (a file or a whole subtree) is fully
+    /// resident on local disk: total vs locally-present chunks, how many files are completely
+    /// local, and the list of files **not yet fully downloaded**. A file/subtree is ready iff
+    /// every chunk of every descendant file is in the local cache
+    /// ([`is_ready`](OfflineReadiness::is_ready)).
+    ///
+    /// Takes only the provider — **no client, no `ChunkIO`** — so it is structurally incapable
+    /// of touching the network (it consults the local SQLite tree + chunk store only,
+    /// `node_manifest_hashes` + `has_chunk`). That's the point: you run it right before you
+    /// pull the plug, possibly already on a flaky connection.
+    pub fn offline_readiness(provider: &SqliteProvider, node_id: &str) -> Result<OfflineReadiness> {
+        let mut r = OfflineReadiness::default();
+        // Distinct chunks across the subtree (content-addressed + deduped) so a chunk shared by
+        // two files counts once — present_chunks/total_chunks then read as a true coverage %.
+        let mut total: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for file in provider.subtree_files(node_id)? {
+            r.total_files += 1;
+            let hashes = provider.node_manifest_hashes(&file.node_id)?;
+            let mut all_local = true;
+            for h in &hashes {
+                total.insert(h.clone());
+                if provider.has_chunk(h) {
+                    present.insert(h.clone());
+                } else {
+                    all_local = false;
+                }
+            }
+            if all_local {
+                r.ready_files += 1;
+            } else {
+                r.missing_files.push(file);
+            }
+        }
+        r.total_chunks = total.len();
+        r.present_chunks = present.len();
+        Ok(r)
     }
 
     /// One whole-tree loop iteration: push the full tree, then pull remote changes.

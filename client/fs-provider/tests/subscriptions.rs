@@ -233,6 +233,107 @@ fn clear_subscription_reverts_to_default() {
     assert!(p.proactively_hydrate(&f_id).unwrap(), "back to the default (include)");
 }
 
+// ---- pin-for-offline (the workshop "always keep this resident") --------------------
+
+/// Pinning a subtree forces it in-scope for proactive hydration **regardless of the device
+/// default** — even when the default is Exclude (the "subscribe to a few folders" device)
+/// and nothing else included it. This is the "make available offline" guarantee: a pinned
+/// folder is always kept resident.
+#[test]
+fn pin_forces_in_scope_even_under_default_exclude() {
+    let p = provider();
+    let jobs = p.mkdir(ROOT, "jobs").unwrap();
+    let f = write_file(&p, jobs.ino, "client.step", b"cad");
+    let jobs_id = p.node_id_for(jobs.ino).unwrap().unwrap();
+    let f_id = p.node_id_for(f).unwrap().unwrap();
+
+    // Device is in "online-only by default" mode.
+    p.set_subscription_default(SubRule::Exclude).unwrap();
+    assert!(!p.proactively_hydrate(&f_id).unwrap(), "default exclude → out of scope");
+    assert!(!p.is_pinned(&jobs_id).unwrap(), "not pinned yet");
+
+    // Pin the jobs folder → its whole subtree is now in scope.
+    p.pin(&jobs_id).unwrap();
+    assert!(p.is_pinned(&jobs_id).unwrap(), "jobs is pinned");
+    assert!(p.proactively_hydrate(&f_id).unwrap(), "a pinned subtree is forced in scope");
+    assert!(p.pinned_nodes().unwrap().contains(&jobs_id), "pin shows up in the pin list");
+}
+
+/// A pin overrides an EXCLUDED ancestor (closest-rule-wins), so you can keep one job folder
+/// resident while its parent archive is online-only.
+#[test]
+fn pin_overrides_an_excluded_ancestor() {
+    let p = provider();
+    let archive = p.mkdir(ROOT, "archive").unwrap();
+    let job = p.mkdir(archive.ino, "active_job").unwrap();
+    let f = write_file(&p, job.ino, "part.stl", b"part");
+    let archive_id = p.node_id_for(archive.ino).unwrap().unwrap();
+    let job_id = p.node_id_for(job.ino).unwrap().unwrap();
+    let f_id = p.node_id_for(f).unwrap().unwrap();
+
+    p.unsubscribe(&archive_id).unwrap(); // exclude the whole archive
+    assert!(!p.proactively_hydrate(&f_id).unwrap(), "inherits archive's exclude");
+
+    p.pin(&job_id).unwrap(); // pin the nested job
+    assert!(p.proactively_hydrate(&f_id).unwrap(), "the closer pin overrides the excluded ancestor");
+    assert!(!p.proactively_hydrate(&archive_id).unwrap(), "archive itself still excluded");
+}
+
+/// `unpin` removes the pin → the subtree reverts to inheriting from its ancestry / default.
+#[test]
+fn unpin_reverts_to_inherited_scope() {
+    let p = provider();
+    let f = write_file(&p, ROOT, "f.bin", b"x");
+    let f_id = p.node_id_for(f).unwrap().unwrap();
+
+    p.set_subscription_default(SubRule::Exclude).unwrap();
+    p.pin(&f_id).unwrap();
+    assert!(p.proactively_hydrate(&f_id).unwrap(), "pinned → in scope");
+    assert!(p.is_pinned(&f_id).unwrap());
+
+    p.unpin(&f_id).unwrap();
+    assert!(!p.is_pinned(&f_id).unwrap(), "no longer pinned");
+    assert!(!p.proactively_hydrate(&f_id).unwrap(), "reverts to default exclude");
+    assert!(p.pinned_nodes().unwrap().is_empty(), "pin list cleared");
+}
+
+/// A pin is keyed by stable node_id, so it survives a rename/move of the pinned subtree
+/// root — exactly like a subscription.
+#[test]
+fn pin_survives_rename() {
+    let p = provider();
+    let dir = p.mkdir(ROOT, "old").unwrap();
+    let dir_id = p.node_id_for(dir.ino).unwrap().unwrap();
+    let f = write_file(&p, dir.ino, "f.bin", b"data");
+    let f_id = p.node_id_for(f).unwrap().unwrap();
+
+    p.set_subscription_default(SubRule::Exclude).unwrap();
+    p.pin(&dir_id).unwrap();
+    assert!(p.proactively_hydrate(&f_id).unwrap());
+
+    p.rename(ROOT, "old", ROOT, "renamed").unwrap();
+    assert!(p.is_pinned(&dir_id).unwrap(), "pin survives the rename (node_id stable)");
+    assert!(p.proactively_hydrate(&f_id).unwrap(), "still forced in scope after rename");
+}
+
+/// A pin is **per-device local state** — it must NEVER leak into the synced tree (it lives
+/// in the local-only `subscriptions` table, never pushed). Pinning enqueues nothing to the
+/// outbox and changes nothing in the exported tree.
+#[test]
+fn pin_is_local_only_never_synced() {
+    let p = provider();
+    let dir = p.mkdir(ROOT, "d").unwrap();
+    let dir_id = p.node_id_for(dir.ino).unwrap().unwrap();
+    // Drain whatever the mkdir queued so we measure only the pin's effect.
+    p.outbox_clear(&dir_id).unwrap();
+    let tree_before = p.export_tree().unwrap();
+
+    p.pin(&dir_id).unwrap();
+
+    assert!(p.outbox_list_topo().unwrap().is_empty(), "pinning enqueues nothing to the outbox");
+    assert_eq!(p.export_tree().unwrap(), tree_before, "pinning does not change the synced tree");
+}
+
 // ---- small local helpers (the suite's common mod has no node-id manifest helper) ----
 
 /// The chunk hashes of a file by inode, via the provider's public node-id API.

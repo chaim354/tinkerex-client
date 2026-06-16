@@ -1025,6 +1025,106 @@ fn one_block_edit_uploads_only_the_delta_chunks() {
     );
 }
 
+// ---- make-available-offline: pin a subtree, then keep it resident across a pull --------
+
+/// The headline offline-workshop workflow, server-backed: device B PINS a folder and makes
+/// it available offline; when device A later adds a new file to that folder, B's next
+/// `sync_tick` (the daemon loop) must AUTOMATICALLY hydrate the new file too — because the
+/// pin forces the whole subtree in scope for proactive hydration. So B stays "100% ready
+/// for offline" across the pull without re-pinning. This is what makes the pin durable.
+#[test]
+fn pinned_subtree_stays_fully_hydrated_across_a_pull_that_adds_a_file() {
+    use fs_provider::SubRule;
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    // A: Jobs/{first.step}, plus an Archive sibling B will leave online-only.
+    let a = dev();
+    let jobs = a.mkdir(ROOT_INO, "Jobs").unwrap();
+    let first = a.create(jobs.ino, "first.step").unwrap();
+    a.write(first.ino, 0, &pseudo_random(20_000, 1)).unwrap();
+    a.flush(first.ino).unwrap();
+    let archive = a.mkdir(ROOT_INO, "Archive").unwrap();
+    let old = a.create(archive.ino, "old.stl").unwrap();
+    a.write(old.ino, 0, &pseudo_random(8_000, 2)).unwrap();
+    a.flush(old.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A initial push");
+
+    // B: snapshot the tree, go "online-only by default", PIN Jobs + download it now.
+    let b = dev();
+    let cursor0 = SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    b.set_cursor(cursor0).unwrap();
+    b.set_subscription_default(SubRule::Exclude).unwrap();
+    let b_jobs_id = b.node_id_for(b.lookup(ROOT_INO, "Jobs").unwrap().ino).unwrap().unwrap();
+    let b_archive_id = b.node_id_for(b.lookup(ROOT_INO, "Archive").unwrap().ino).unwrap().unwrap();
+
+    // The engine pin: record the pin AND make it available offline right now.
+    let summary = SyncEngine::pin(&b, &cb, &cloud, &b_jobs_id, 4).expect("pin + download Jobs");
+    assert_eq!(summary.files_hydrated, 1, "the existing Jobs file downloaded");
+    assert!(b.is_pinned(&b_jobs_id).unwrap(), "Jobs is pinned");
+    assert!(SyncEngine::offline_readiness(&b, &b_jobs_id).unwrap().is_ready(), "Jobs ready for offline");
+    // Archive stays online-only (default exclude, not pinned).
+    assert!(!SyncEngine::offline_readiness(&b, &b_archive_id).unwrap().is_ready());
+
+    // A adds a SECOND file to Jobs and pushes.
+    let second = a.create(jobs.ino, "second.lbrn2").unwrap();
+    a.write(second.ino, 0, &pseudo_random(15_000, 3)).unwrap();
+    a.flush(second.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push the new file");
+
+    // B's daemon tick: pull the delta AND run proactive hydration (gated by the pin). The
+    // new file must be both applied to the tree AND hydrated — no manual re-pin.
+    let cursor1 = SyncEngine::sync_tick(&b, &cb, &cloud, b.cursor().unwrap()).expect("B sync tick");
+    b.set_cursor(cursor1).unwrap();
+
+    // The pin held: Jobs is STILL 100% ready, now including the new file.
+    let readiness = SyncEngine::offline_readiness(&b, &b_jobs_id).unwrap();
+    assert_eq!(readiness.total_files, 2, "B sees both Jobs files");
+    assert!(readiness.is_ready(), "pinned Jobs stayed fully hydrated across the pull (new file too)");
+    let b_second = b.lookup(b.lookup(ROOT_INO, "Jobs").unwrap().ino, "second.lbrn2").unwrap();
+    assert_eq!(read_all(&b, b_second.ino), pseudo_random(15_000, 3), "new file reads byte-for-byte offline");
+
+    // And the un-pinned Archive was NOT dragged resident by the tick.
+    assert!(!SyncEngine::offline_readiness(&b, &b_archive_id).unwrap().is_ready(), "Archive stays online-only");
+}
+
+/// `SyncEngine::unpin` stops the subtree being force-kept and (optionally) reclaims its
+/// bytes; after it, a pull no longer keeps the folder resident.
+#[test]
+fn unpin_stops_forced_hydration_and_can_reclaim() {
+    use fs_provider::SubRule;
+    let url = server_url!();
+    let (ca, cb, cloud) = two_devices(&url);
+
+    let a = dev();
+    let jobs = a.mkdir(ROOT_INO, "Jobs").unwrap();
+    let f = a.create(jobs.ino, "part.step").unwrap();
+    a.write(f.ino, 0, &pseudo_random(20_000, 5)).unwrap();
+    a.flush(f.ino).unwrap();
+    SyncEngine::push_outbox(&a, &ca, &cloud).expect("A push");
+
+    let b = dev();
+    SyncEngine::pull_snapshot(&b, &cb).expect("B snapshot");
+    b.set_subscription_default(SubRule::Exclude).unwrap();
+    let b_jobs_id = b.node_id_for(b.lookup(ROOT_INO, "Jobs").unwrap().ino).unwrap().unwrap();
+    let b_f_id = b.node_id_for(b.lookup(jobs_child(&b), "part.step").unwrap().ino).unwrap().unwrap();
+
+    SyncEngine::pin(&b, &cb, &cloud, &b_jobs_id, 4).expect("pin");
+    assert!(b.node_manifest_hashes(&b_f_id).unwrap().iter().all(|h| b.has_chunk(h)), "resident after pin");
+
+    // Unpin + reclaim: bytes dropped, pin gone, no longer in scope.
+    let reclaimed = SyncEngine::unpin(&b, &b_jobs_id, true).expect("unpin + reclaim");
+    assert!(reclaimed > 0, "reclaimed the pinned subtree's chunks");
+    assert!(!b.is_pinned(&b_jobs_id).unwrap(), "no longer pinned");
+    assert!(b.node_manifest_hashes(&b_f_id).unwrap().iter().any(|h| !b.has_chunk(h)), "dehydrated after unpin");
+    assert!(!SyncEngine::offline_readiness(&b, &b_jobs_id).unwrap().is_ready(), "no longer offline-ready");
+}
+
+/// Tiny helper: the ino of B's `Jobs` dir (re-looked-up because the dir ino differs per device).
+fn jobs_child(b: &SqliteProvider) -> u64 {
+    b.lookup(ROOT_INO, "Jobs").unwrap().ino
+}
+
 /// Deterministic pseudo-random bytes (no `rand` dep) — same LCG the fs-provider chunking
 /// suite uses, so the delta-locality property is exercised on identical-shaped data.
 fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {

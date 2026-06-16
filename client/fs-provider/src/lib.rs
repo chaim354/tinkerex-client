@@ -217,6 +217,20 @@ pub struct SearchHit {
     pub mtime: i64,
 }
 
+/// A file within a subtree, as enumerated by [`SqliteProvider::subtree_files`] — the
+/// work-list unit for "make this folder available offline" + the pre-disconnect readiness
+/// report. Directories are not represented (only files carry chunks to hydrate/verify).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtreeFile {
+    /// The file's stable `node_id` (survives renames/moves) — the key the hydrate +
+    /// verification primitives take.
+    pub node_id: String,
+    /// The file's path relative to (and *including*) the subtree root's own name, e.g.
+    /// querying `Jobs` yields `Jobs/ClientX/part.step`. A file root yields just its name.
+    /// Human-readable for the "still-online-only" list in a readiness report.
+    pub path: String,
+}
+
 /// What [`SqliteProvider::apply_remote`] did, so the caller can refresh the OS cache. A
 /// pull that **repointed an existing node at new content** must explicitly invalidate the
 /// kernel's data cache for that inode (we no longer bump mtime to force a re-read). A brand
@@ -1046,6 +1060,46 @@ impl SqliteProvider {
                 Ok(rows.collect::<std::result::Result<_, _>>()?)
             }
         }
+    }
+
+    /// Enumerate every **file** under a subtree (by `node_id`), returning each file's stable
+    /// `node_id` + its path relative to (and including) the subtree root's own name. This is
+    /// the work-list for "make this folder available offline" (which files' chunks to
+    /// hydrate) and the pre-disconnect readiness report (which files to verify are local).
+    ///
+    /// A **file** root resolves to just that one file. A **directory** root resolves to every
+    /// file at any depth beneath it (directories themselves are omitted — only files carry
+    /// chunks). An empty directory, or an unknown `node_id`, yields an empty list (not an
+    /// error — the caller is asking "what's under here", and "nothing" is a valid answer).
+    /// Results are ordered by path.
+    pub fn subtree_files(&self, node_id: &str) -> Result<Vec<SubtreeFile>> {
+        let conn = self.conn.lock().unwrap();
+        let root_ino: Option<i64> = conn
+            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| r.get(0))
+            .optional()?;
+        let root_ino = match root_ino {
+            None => return Ok(Vec::new()),
+            Some(i) => i,
+        };
+        // Recursive CTE: seed with the subtree root (path = its own name), descend by
+        // parent_ino building each node's path. Emit only files; the root itself is emitted
+        // iff it is a file (a directory root has depth-0 kind 'dir', filtered out).
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE sub(ino, node_id, name, kind, path) AS (
+                 SELECT ino, node_id, name, kind, name FROM nodes WHERE ino = ?1
+                 UNION ALL
+                 SELECT n.ino, n.node_id, n.name, n.kind, sub.path || '/' || n.name
+                   FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                  WHERE n.ino != ?1
+             )
+             SELECT node_id, path FROM sub
+             WHERE kind = 'file' AND node_id IS NOT NULL
+             ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![root_ino], |r| {
+            Ok(SubtreeFile { node_id: r.get::<_, String>(0)?, path: r.get::<_, String>(1)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     // ---- chunk cache access (for the sync daemon to move bytes) -----------
@@ -2362,6 +2416,72 @@ mod tests {
         assert!(b.ino_for_node_id(&sub_id).unwrap().is_none(), "nested dir swept");
         assert!(b.ino_for_node_id(&y_id).unwrap().is_none(), "nested file swept");
         assert!(b.export_tree().unwrap().is_empty(), "tree fully emptied");
+    }
+
+    /// `subtree_files` enumerates every FILE node under a subtree root (by node_id),
+    /// returning each file's stable `node_id` + its path relative to the subtree root. This
+    /// is the work-list backbone for "make this folder available offline" (which files to
+    /// hydrate) and for the pre-disconnect readiness report (which files to check). A file
+    /// root returns just itself; directories are not listed (only files carry chunks).
+    #[test]
+    fn subtree_files_enumerates_every_file_under_a_dir() {
+        let p = provider();
+        // Jobs/{a.stl, ClientX/{part.step, sub/deep.bin}}, plus an Archive sibling NOT under Jobs.
+        let jobs = p.mkdir(ROOT_INO, "Jobs").unwrap();
+        let a = p.create(jobs.ino, "a.stl").unwrap();
+        p.write(a.ino, 0, &vec![1u8; 300]).unwrap();
+        p.flush(a.ino).unwrap();
+        let clientx = p.mkdir(jobs.ino, "ClientX").unwrap();
+        let part = p.create(clientx.ino, "part.step").unwrap();
+        p.write(part.ino, 0, &vec![2u8; 300]).unwrap();
+        p.flush(part.ino).unwrap();
+        let sub = p.mkdir(clientx.ino, "sub").unwrap();
+        let deep = p.create(sub.ino, "deep.bin").unwrap();
+        p.write(deep.ino, 0, &vec![3u8; 300]).unwrap();
+        p.flush(deep.ino).unwrap();
+
+        let archive = p.mkdir(ROOT_INO, "Archive").unwrap();
+        let old = p.create(archive.ino, "old.stl").unwrap();
+        p.write(old.ino, 0, &vec![4u8; 300]).unwrap();
+        p.flush(old.ino).unwrap();
+
+        let jobs_id = p.node_id_for(jobs.ino).unwrap().unwrap();
+        let files = p.subtree_files(&jobs_id).unwrap();
+
+        // Exactly the three files under Jobs (no dirs, nothing from Archive).
+        let mut paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["Jobs/ClientX/part.step", "Jobs/ClientX/sub/deep.bin", "Jobs/a.stl"]);
+        // Each carries the real file node_id (resolvable back to an inode).
+        for f in &files {
+            assert!(p.ino_for_node_id(&f.node_id).unwrap().is_some(), "file node_id resolves");
+            assert!(!p.node_manifest_hashes(&f.node_id).unwrap().is_empty(), "file has a manifest");
+        }
+    }
+
+    /// A FILE root resolves to just that one file (so "available offline" works on a single
+    /// file, not only a folder).
+    #[test]
+    fn subtree_files_on_a_file_returns_just_that_file() {
+        let p = provider();
+        let f = p.create(ROOT_INO, "solo.stl").unwrap();
+        p.write(f.ino, 0, &vec![9u8; 300]).unwrap();
+        p.flush(f.ino).unwrap();
+        let id = p.node_id_for(f.ino).unwrap().unwrap();
+        let files = p.subtree_files(&id).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].node_id, id);
+        assert_eq!(files[0].path, "solo.stl");
+    }
+
+    /// An empty directory (or an unknown node_id) yields no files — not an error.
+    #[test]
+    fn subtree_files_empty_dir_and_unknown_id_are_empty() {
+        let p = provider();
+        let empty = p.mkdir(ROOT_INO, "Empty").unwrap();
+        let empty_id = p.node_id_for(empty.ino).unwrap().unwrap();
+        assert!(p.subtree_files(&empty_id).unwrap().is_empty(), "no files under an empty dir");
+        assert!(p.subtree_files("never-existed").unwrap().is_empty(), "unknown id → empty");
     }
 
     /// A pull whose collision sweep would clobber a locally-renamed-but-not-yet-pushed node

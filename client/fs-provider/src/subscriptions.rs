@@ -65,13 +65,28 @@ const DEFAULT_POLICY_KEY: &str = "subscription_default";
 
 impl SqliteProvider {
     /// Ensure the subscriptions table exists. Called from `init`.
+    ///
+    /// The `pinned` column distinguishes a **pin** ("always keep this resident for offline" —
+    /// an Include rule the user explicitly asked for, surfaced as a pin in the UI/CLI) from a
+    /// plain subscription Include. Both gate proactive hydration identically; `pinned` is what
+    /// `is_pinned`/`pinned_nodes` report. Added via `ALTER TABLE` for DBs created before the
+    /// column existed (idempotent — a duplicate-column error is swallowed).
     pub(crate) fn init_subscriptions(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS subscriptions (
                  node_id TEXT PRIMARY KEY,
-                 rule    TEXT NOT NULL    -- 'include' | 'exclude'
+                 rule    TEXT NOT NULL,   -- 'include' | 'exclude'
+                 pinned  INTEGER NOT NULL DEFAULT 0
              );",
         )?;
+        // Migrate a pre-existing table that lacks `pinned`. SQLite has no "ADD COLUMN IF NOT
+        // EXISTS"; a duplicate-column error just means the migration already ran.
+        if let Err(e) = conn.execute("ALTER TABLE subscriptions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -114,7 +129,8 @@ impl SqliteProvider {
         self.set_subscription(node_id, SubRule::Exclude)
     }
 
-    /// Record (or replace) an explicit rule for a node's subtree.
+    /// Record (or replace) an explicit rule for a node's subtree. Preserves the existing
+    /// `pinned` flag (changing the include/exclude rule doesn't pin or unpin).
     pub fn set_subscription(&self, node_id: &str, rule: SubRule) -> Result<u64> {
         let conn = self.conn_lock();
         let ino: Option<i64> = conn
@@ -122,11 +138,71 @@ impl SqliteProvider {
             .optional()?;
         let ino = ino.ok_or(FsError::NotFound)?;
         conn.execute(
-            "INSERT INTO subscriptions(node_id, rule) VALUES (?1, ?2)
+            "INSERT INTO subscriptions(node_id, rule, pinned) VALUES (?1, ?2, 0)
              ON CONFLICT(node_id) DO UPDATE SET rule = excluded.rule",
             params![node_id, rule.as_str()],
         )?;
         Ok(ino as u64)
+    }
+
+    /// **Pin a subtree for offline** — force it (and its whole subtree) in scope for proactive
+    /// hydration **regardless of the device default or any excluded ancestor**, and mark it as
+    /// a pin so the UI/CLI can show/list it. A pin is an [`Include`](SubRule::Include) rule
+    /// keyed by stable `node_id` (so it survives renames/moves), tagged `pinned = 1`. Pair it
+    /// with the engine's `ensure_available_offline` (download now) to make the subtree resident
+    /// immediately; the daemon's proactive-hydration pass then keeps it resident across pulls.
+    /// Returns the node's inode. Errors `NotFound` if the `node_id` isn't in the local tree.
+    ///
+    /// **Local-only, never synced** — like all subscription state, it lives in the local
+    /// `subscriptions` table and is never pushed to the server.
+    pub fn pin(&self, node_id: &str) -> Result<u64> {
+        let conn = self.conn_lock();
+        let ino: Option<i64> = conn
+            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| r.get(0))
+            .optional()?;
+        let ino = ino.ok_or(FsError::NotFound)?;
+        conn.execute(
+            "INSERT INTO subscriptions(node_id, rule, pinned) VALUES (?1, 'include', 1)
+             ON CONFLICT(node_id) DO UPDATE SET rule = 'include', pinned = 1",
+            params![node_id],
+        )?;
+        Ok(ino as u64)
+    }
+
+    /// **Unpin a subtree** — remove the pin so it reverts to inheriting from its ancestry /
+    /// the device default. Idempotent (a no-op if the node wasn't pinned). Does NOT itself
+    /// reclaim cached bytes — call [`dehydrate_subtree`](Self::dehydrate_subtree) if the now
+    /// out-of-scope subtree's space should be freed. (We remove the whole rule rather than just
+    /// flip `pinned`, so unpinning a folder under a default-include device leaves it in scope,
+    /// matching "stop forcing it" rather than "exclude it".)
+    pub fn unpin(&self, node_id: &str) -> Result<()> {
+        let conn = self.conn_lock();
+        conn.execute("DELETE FROM subscriptions WHERE node_id = ?1 AND pinned = 1", params![node_id])?;
+        Ok(())
+    }
+
+    /// Whether `node_id` carries an explicit pin (the user asked to keep it resident for
+    /// offline). Note this checks the node *itself*, not inheritance — a child of a pinned dir
+    /// is *in scope* (see [`proactively_hydrate`](Self::proactively_hydrate)) but is not itself
+    /// "pinned". An unknown `node_id` is not pinned.
+    pub fn is_pinned(&self, node_id: &str) -> Result<bool> {
+        let conn = self.conn_lock();
+        let pinned: Option<i64> = conn
+            .query_row(
+                "SELECT pinned FROM subscriptions WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(pinned == Some(1))
+    }
+
+    /// Every pinned `node_id` on this device (for the app/CLI to render the offline set).
+    pub fn pinned_nodes(&self) -> Result<Vec<String>> {
+        let conn = self.conn_lock();
+        let mut stmt = conn.prepare("SELECT node_id FROM subscriptions WHERE pinned = 1 ORDER BY node_id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Remove an explicit rule for a node, so it falls back to whatever its ancestry /
