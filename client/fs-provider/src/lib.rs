@@ -28,6 +28,20 @@ pub use subscriptions::SubRule;
 
 pub const ROOT_INO: u64 = 1;
 
+/// POSIX `NAME_MAX`: the maximum length, **in bytes**, of a single path component. A
+/// longer name fails with `ENAMETOOLONG` (pjdfstest `<op>/02.t`). The kernel enforces this
+/// per component (bytes, not chars), so we mirror it on every node-creating/-renaming path.
+pub const NAME_MAX: usize = 255;
+
+/// Reject a component longer than [`NAME_MAX`] bytes with [`FsError::NameTooLong`]
+/// (ENAMETOOLONG). Shared by `create`/`mkdir` (via `insert_node`) and `rename`.
+fn check_name_len(name: &str) -> Result<()> {
+    if name.len() > NAME_MAX {
+        return Err(FsError::NameTooLong);
+    }
+    Ok(())
+}
+
 /// The default permission bits for a freshly created node (no umask modeling — the
 /// mount runs as the user, who owns everything).
 fn default_mode(kind: Kind) -> u32 {
@@ -105,6 +119,11 @@ pub struct Attr {
     /// Real modification time, **unix nanoseconds** (see [`now_nanos`]). Preserved + synced
     /// so a file's true mtime is stable across devices (not the sync time).
     pub mtime: i64,
+    /// Access time, **unix nanoseconds**. **Device-local** — set by `utimensat`/`set_atime`
+    /// and reported by `getattr`, but deliberately NOT carried in the sync export (every
+    /// device has its own access pattern; syncing atime would be both wrong and chatty).
+    /// Defaults to the node's mtime when never explicitly set.
+    pub atime: i64,
     /// POSIX permission bits (e.g. `0o644`, `0o755`). Preserved + synced so the
     /// executable bit (and other mode bits) survive a chmod and propagate across devices.
     pub mode: u32,
@@ -230,6 +249,15 @@ pub enum FsError {
     AlreadyExists,
     #[error("directory not empty")]
     NotEmpty,
+    /// The arguments are structurally invalid for the operation — currently raised when a
+    /// `rename` would move a directory into its own subtree (a directory cannot become its
+    /// own ancestor; POSIX maps this to **EINVAL**). Mapped to `EINVAL` by the adapters.
+    #[error("invalid argument")]
+    InvalidArgument,
+    /// A single path component exceeds `NAME_MAX` (255 bytes) — POSIX **ENAMETOOLONG**.
+    /// Mapped to `ENAMETOOLONG` by the adapters.
+    #[error("file name too long")]
+    NameTooLong,
     #[error("chunk missing: {0}")]
     ChunkMissing(String),
     #[error("locked (would block)")]
@@ -288,6 +316,12 @@ pub trait Provider: Send + Sync {
     /// `utimensat`/`cp -p`). Default no-op; `SqliteProvider` persists + syncs it so the real
     /// mtime survives and propagates instead of being overwritten with the sync time.
     fn set_mtime(&self, _ino: u64, _mtime: i64) -> Result<()> {
+        Ok(())
+    }
+    /// Set the access time (unix nanoseconds — the kernel's `setattr(atime)`, e.g. a
+    /// `utimensat`). Default no-op; `SqliteProvider` persists it **device-locally** (atime
+    /// is access state, never synced — see [`Attr::atime`]).
+    fn set_atime(&self, _ino: u64, _atime: i64) -> Result<()> {
         Ok(())
     }
     /// Resize the file to exactly `size` bytes (the kernel's `setattr`/`O_TRUNC`).
@@ -354,6 +388,7 @@ impl SqliteProvider {
                 kind        TEXT NOT NULL,
                 size        INTEGER NOT NULL DEFAULT 0,
                 mtime       INTEGER NOT NULL DEFAULT 0,  -- real mtime, unix NANOSECONDS (preserved + synced)
+                atime       INTEGER NOT NULL DEFAULT 0,  -- access time, unix NANOSECONDS (DEVICE-LOCAL, never synced)
                 manifest_id TEXT,
                 node_id     TEXT,
                 version_id  TEXT,         -- server version this node reflects (commit base)
@@ -393,6 +428,8 @@ impl SqliteProvider {
         // Migrate older DBs that predate these columns (ignore "duplicate column").
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN version_id TEXT", []);
         let _ = conn.execute("ALTER TABLE nodes ADD COLUMN mode INTEGER", []);
+        // atime column on an existing DB (device-local access time; 0 → falls back to mtime).
+        let _ = conn.execute("ALTER TABLE nodes ADD COLUMN atime INTEGER NOT NULL DEFAULT 0", []);
         // G5 debounce columns on an existing outbox (no-op on a fresh DB).
         let _ = conn.execute("ALTER TABLE outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE outbox ADD COLUMN first_enqueued_at INTEGER NOT NULL DEFAULT 0", []);
@@ -414,15 +451,24 @@ impl SqliteProvider {
 
     fn attr_row(conn: &Connection, ino: u64) -> Result<Attr> {
         conn.query_row(
-            "SELECT ino, kind, size, mtime, mode FROM nodes WHERE ino = ?1",
+            "SELECT ino, kind, size, mtime, mode, atime FROM nodes WHERE ino = ?1",
             params![ino as i64],
             |r| {
                 let kind = Kind::from_str(&r.get::<_, String>(1)?);
+                let mtime = r.get::<_, i64>(3)?;
+                // atime defaults to mtime when never explicitly set (a fresh node, or an
+                // older DB predating the column) — a sane "last touched" value, and what a
+                // noatime-style mount would report.
+                let atime = match r.get::<_, Option<i64>>(5)? {
+                    Some(a) if a > 0 => a,
+                    _ => mtime,
+                };
                 Ok(Attr {
                     ino: r.get::<_, i64>(0)? as u64,
                     kind,
                     size: r.get::<_, i64>(2)? as u64,
-                    mtime: r.get::<_, i64>(3)?,
+                    mtime,
+                    atime,
                     mode: r.get::<_, Option<i64>>(4)?.map(|m| m as u32).unwrap_or_else(|| default_mode(kind)),
                 })
             },
@@ -526,6 +572,7 @@ impl SqliteProvider {
     }
 
     fn insert_node(&self, parent: u64, name: &str, kind: Kind) -> Result<Attr> {
+        check_name_len(name)?;
         let conn = self.conn.lock().unwrap();
         // parent must exist and be a directory
         let pkind: String = conn
@@ -542,8 +589,10 @@ impl SqliteProvider {
         let node_id = uuid::Uuid::new_v4().to_string();
         let mode = default_mode(kind);
         let mtime = now_nanos();
+        // Seed atime = mtime at creation so it has a concrete value; thereafter set_mtime
+        // never disturbs atime and set_atime never disturbs mtime (the UTIME_OMIT contract).
         let res = conn.execute(
-            "INSERT INTO nodes(parent_ino, name, kind, node_id, mode, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO nodes(parent_ino, name, kind, node_id, mode, mtime, atime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![parent as i64, name, kind.as_str(), node_id, mode as i64, mtime],
         );
         match res {
@@ -563,6 +612,7 @@ impl SqliteProvider {
             kind,
             size: 0,
             mtime,
+            atime: mtime, // a fresh node's atime starts at its creation/mtime
             mode,
         })
     }
@@ -1578,6 +1628,20 @@ impl Provider for SqliteProvider {
     }
 
     fn truncate(&self, ino: u64, size: u64) -> Result<()> {
+        // POSIX: truncate() on a directory is EISDIR. Reject before touching staging/chunks
+        // (a dir has no manifest; without this the size=0 path would commit an empty file
+        // manifest onto the directory row). A missing inode is ENOENT.
+        {
+            let conn = self.conn.lock().unwrap();
+            let kind: Option<String> = conn
+                .query_row("SELECT kind FROM nodes WHERE ino = ?1", params![ino as i64], |r| r.get(0))
+                .optional()?;
+            match kind {
+                None => return Err(FsError::NotFound),
+                Some(k) if Kind::from_str(&k) == Kind::Dir => return Err(FsError::IsADirectory),
+                Some(_) => {}
+            }
+        }
         // If the file is already open for write, resize the live staging buffer in
         // place; the eventual `flush`/`release` commits the new length. Shrinking here
         // is what clears the stale tail an overwrite-with-shorter would otherwise leave
@@ -1610,36 +1674,45 @@ impl Provider for SqliteProvider {
 
     fn unlink(&self, parent: u64, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let node_id: Option<String> = conn
+        // Look the target up by (parent, name) WITHOUT a kind filter, so we can return the
+        // POSIX-correct errno: a missing entry is ENOENT, but a *directory* is EISDIR
+        // (`unlink` of a dir must not masquerade as "not found"). Linux maps this to EISDIR;
+        // the mount adapters surface it as such.
+        let target: Option<(String, String)> = conn
             .query_row(
-                "SELECT node_id FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND kind = 'file'",
+                "SELECT node_id, kind FROM nodes WHERE parent_ino = ?1 AND name = ?2",
                 params![parent as i64, name],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let n = conn.execute(
+        let (node_id, kind) = target.ok_or(FsError::NotFound)?;
+        if Kind::from_str(&kind) == Kind::Dir {
+            return Err(FsError::IsADirectory);
+        }
+        conn.execute(
             "DELETE FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND kind = 'file'",
             params![parent as i64, name],
         )?;
-        if n == 0 {
-            return Err(FsError::NotFound);
-        }
-        if let Some(id) = node_id {
-            Self::enqueue(&conn, &id, "delete")?;
-        }
+        Self::enqueue(&conn, &node_id, "delete")?;
         Ok(())
     }
 
     fn rmdir(&self, parent: u64, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let ino: i64 = conn
+        // Resolve without a kind filter for the POSIX-correct errno: a missing entry is
+        // ENOENT, but `rmdir` of a *file* (non-directory) is ENOTDIR — it must not look
+        // like "not found".
+        let (ino, kind): (i64, String) = conn
             .query_row(
-                "SELECT ino FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND kind = 'dir'",
+                "SELECT ino, kind FROM nodes WHERE parent_ino = ?1 AND name = ?2",
                 params![parent as i64, name],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
             .ok_or(FsError::NotFound)?;
+        if Kind::from_str(&kind) != Kind::Dir {
+            return Err(FsError::NotADirectory);
+        }
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM nodes WHERE parent_ino = ?1", params![ino], |r| {
                 r.get(0)
@@ -1658,6 +1731,9 @@ impl Provider for SqliteProvider {
     }
 
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()> {
+        // The *new* name is the one being written; the old name already passed this check
+        // when its node was created, so only the destination component needs validating.
+        check_name_len(newname)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -1670,6 +1746,45 @@ impl Provider for SqliteProvider {
             )
             .optional()?;
         let (src_ino, src_id) = src.ok_or(FsError::NotFound)?;
+        let src_kind = Kind::from_str(
+            &tx.query_row("SELECT kind FROM nodes WHERE ino = ?1", params![src_ino], |r| {
+                r.get::<_, String>(0)
+            })?,
+        );
+
+        // The destination *parent* must exist and be a directory — otherwise the bare
+        // UPDATE below would reparent the node under a non-existent or non-directory ino,
+        // silently orphaning it (it would vanish from every readdir while still holding a
+        // row). POSIX: a missing prefix component is ENOENT; a file used as a directory is
+        // ENOTDIR.
+        let pkind: Option<String> = tx
+            .query_row("SELECT kind FROM nodes WHERE ino = ?1", params![newparent as i64], |r| r.get(0))
+            .optional()?;
+        match pkind {
+            None => return Err(FsError::NotFound),
+            Some(k) if Kind::from_str(&k) != Kind::Dir => return Err(FsError::NotADirectory),
+            Some(_) => {}
+        }
+
+        // A directory cannot be moved into its own subtree (it would become its own
+        // ancestor — a cycle). POSIX: EINVAL. Walk the destination parent's ancestor chain
+        // up to the root; if the source is on it (or IS the destination parent), reject.
+        if src_kind == Kind::Dir {
+            let mut cur = newparent as i64;
+            loop {
+                if cur == src_ino {
+                    return Err(FsError::InvalidArgument);
+                }
+                let parent: Option<i64> = tx
+                    .query_row("SELECT parent_ino FROM nodes WHERE ino = ?1", params![cur], |r| r.get(0))
+                    .optional()?
+                    .flatten();
+                match parent {
+                    Some(p) => cur = p,
+                    None => break, // reached the root (NULL parent)
+                }
+            }
+        }
 
         // POSIX rename atomically *replaces* an occupied destination (the atomic-save
         // pattern: write `f.tmp`, rename `f.tmp` → `f`). Without this the unique
@@ -1681,20 +1796,32 @@ impl Provider for SqliteProvider {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some((dst_ino, dst_id, dst_kind)) = dst {
+        if let Some((dst_ino, dst_id, dst_kind_s)) = dst {
             if dst_ino == src_ino {
                 return Ok(()); // rename onto itself — no-op
             }
-            // A directory destination must be empty (ENOTEMPTY otherwise); a file is
-            // simply displaced. The displaced node is tombstoned so the deletion
-            // propagates on push (otherwise other devices keep a duplicate).
-            if Kind::from_str(&dst_kind) == Kind::Dir {
-                let kids: i64 = tx
-                    .query_row("SELECT COUNT(*) FROM nodes WHERE parent_ino = ?1", params![dst_ino], |r| r.get(0))?;
-                if kids > 0 {
-                    return Err(FsError::NotEmpty);
+            let dst_kind = Kind::from_str(&dst_kind_s);
+            // POSIX cross-type rules: the source and destination must agree on directory-ness.
+            //   - file  → existing directory : EISDIR
+            //   - dir   → existing non-dir    : ENOTDIR
+            //   - dir   → existing directory  : allowed only if the dest is empty (else ENOTEMPTY)
+            match (src_kind, dst_kind) {
+                (Kind::File, Kind::Dir) => return Err(FsError::IsADirectory),
+                (Kind::Dir, Kind::File) => return Err(FsError::NotADirectory),
+                (Kind::Dir, Kind::Dir) => {
+                    let kids: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM nodes WHERE parent_ino = ?1",
+                        params![dst_ino],
+                        |r| r.get(0),
+                    )?;
+                    if kids > 0 {
+                        return Err(FsError::NotEmpty);
+                    }
                 }
+                (Kind::File, Kind::File) => {} // plain replace (the atomic-save path)
             }
+            // The displaced node is tombstoned so the deletion propagates on push
+            // (otherwise other devices keep a duplicate).
             tx.execute("DELETE FROM nodes WHERE ino = ?1", params![dst_ino])?;
             Self::enqueue(&tx, &dst_id, "delete")?;
         }
@@ -1744,6 +1871,18 @@ impl Provider for SqliteProvider {
         if let Some(id) = node_id {
             Self::enqueue(&conn, &id, "upsert")?;
         }
+        Ok(())
+    }
+
+    fn set_atime(&self, ino: u64, atime: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("UPDATE nodes SET atime = ?1 WHERE ino = ?2", params![atime, ino as i64])?;
+        if n == 0 {
+            return Err(FsError::NotFound);
+        }
+        // Deliberately NOT enqueued to the outbox: atime is device-local access state, not
+        // synced (unlike set_mtime, which propagates the real modification time). This is
+        // the whole reason atime lives in a separate column the export ignores.
         Ok(())
     }
 
@@ -1808,6 +1947,9 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     }
     fn set_mtime(&self, ino: u64, mtime: i64) -> Result<()> {
         (**self).set_mtime(ino, mtime)
+    }
+    fn set_atime(&self, ino: u64, atime: i64) -> Result<()> {
+        (**self).set_atime(ino, atime)
     }
     fn set_lock(&self, ino: u64, lock: LockRange) -> Result<()> {
         (**self).set_lock(ino, lock)

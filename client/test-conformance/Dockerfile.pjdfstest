@@ -1,0 +1,17 @@
+# Linux image for the real-mount pjdfstest conformance run (driven from macOS via Docker).
+# rust toolchain + fuse3 (for fs-fuse/fuser) + autotools/perl (to build & run pjdfstest).
+FROM rust:1-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fuse3 libfuse3-dev pkg-config \
+        autoconf automake libtool \
+        perl \
+        git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# pjdfstest's runner uses `prove` (Test::Harness, ships with perl). Allow non-root FUSE
+# mounts to expose themselves (the harness runs as root in the container anyway).
+RUN echo "user_allow_other" >> /etc/fuse.conf
+
+WORKDIR /build

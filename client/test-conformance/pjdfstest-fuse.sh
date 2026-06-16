@@ -2,10 +2,11 @@
 #
 # External conformance: **pjdfstest** against our FUSE mount — the POSIX filesystem
 # semantics suite that JuiceFS/CephFS gate on. We run only the subset of operations our
-# sync mount actually implements (rename / unlink / mkdir / rmdir / truncate / open);
-# the suite's chmod/chown/symlink/hardlink/xattr tests are intentionally out of scope
-# (we don't expose POSIX permissions or links), so this job is **informational** — it
-# prints a conformance map of what we pass, not a hard gate.
+# sync mount actually implements (rename / unlink / mkdir / rmdir / truncate / open /
+# chmod — permission *bits* round-trip + sync, so the chmod mode-bit subtests pass; only
+# chown/owner subtests are out of scope). The suite's chown/symlink/hardlink/xattr tests
+# are intentionally out of scope (we don't model ownership or links), so this job is
+# **informational** — it prints a conformance map of what we pass, not a hard gate.
 #
 # Linux only. Requires: libfuse + fusermount, autotools + a C compiler, git, prove
 # (perl), a Rust toolchain. pjdfstest's setuid/owner tests want root; run under sudo for
@@ -19,7 +20,7 @@ cd "$(dirname "$0")/../.."   # repo root
 MNT="$(mktemp -d)"
 WORK="$(mktemp -d)"
 MOUNT_PID=""
-SUBSET=(rename unlink mkdir rmdir truncate open)
+SUBSET=(rename unlink mkdir rmdir truncate open chmod)
 
 unmount() { fusermount3 -u "$MNT" 2>/dev/null || fusermount -u "$MNT" 2>/dev/null || true; }
 cleanup() {

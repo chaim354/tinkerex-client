@@ -45,6 +45,11 @@ fn errno(e: &FsError) -> fuser::Errno {
         FsError::IsADirectory => fuser::Errno::EISDIR,
         FsError::AlreadyExists => fuser::Errno::EEXIST,
         FsError::NotEmpty => fuser::Errno::ENOTEMPTY,
+        // A directory moved into its own subtree (rename cycle) and other structurally
+        // invalid arguments → EINVAL, the POSIX errno pjdfstest's rename/17 expects.
+        FsError::InvalidArgument => fuser::Errno::EINVAL,
+        // A path component longer than NAME_MAX (255 bytes) → ENAMETOOLONG (pjdfstest <op>/02).
+        FsError::NameTooLong => fuser::Errno::ENAMETOOLONG,
         // Special files (symlink/FIFO/socket/device) are a deliberate non-goal — reject
         // the attempt cleanly with EPERM rather than ENOSYS/EIO so callers (cp -a, tar,
         // git) get a deterministic "operation not permitted" instead of a confusing crash.
@@ -68,22 +73,29 @@ fn file_attr(a: &Attr) -> FileAttr {
         Kind::Dir => FileType::Directory,
         Kind::File => FileType::RegularFile,
     };
-    // `a.mtime` is the real modification time in unix **nanoseconds** (preserved + synced).
-    let t = if a.mtime > 0 {
-        UNIX_EPOCH + Duration::from_nanos(a.mtime as u64)
-    } else {
-        SystemTime::now()
+    // Convert a unix-nanos timestamp to a SystemTime, falling back to now for an unset (0) one.
+    let to_time = |nanos: i64| {
+        if nanos > 0 {
+            UNIX_EPOCH + Duration::from_nanos(nanos as u64)
+        } else {
+            SystemTime::now()
+        }
     };
+    // `a.mtime` is the real modification time in unix **nanoseconds** (preserved + synced);
+    // `a.atime` is the access time (device-local, set via `utimensat`). ctime/crtime have no
+    // separate store, so they track mtime.
+    let mtime = to_time(a.mtime);
+    let atime = to_time(a.atime);
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     FileAttr {
         // fuser 0.17: FileAttr.ino is now the `INodeNo` newtype (was a bare u64).
         ino: INodeNo(a.ino),
         size: a.size,
         blocks: (a.size + 511) / 512,
-        atime: t,
-        mtime: t,
-        ctime: t,
-        crtime: t,
+        atime,
+        mtime,
+        ctime: mtime,
+        crtime: mtime,
         kind,
         perm: a.mode as u16,
         nlink: 1,
@@ -196,7 +208,7 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<fuser::FileHandle>,
@@ -208,9 +220,12 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
     ) {
         let ino = ino.0;
         // We persist size (truncate — the kernel issues `setattr(size=0)` on an `O_TRUNC`
-        // open), mode (chmod — so the executable bit sticks + syncs), and mtime (the real
+        // open), mode (chmod — so the executable bit sticks + syncs), mtime (the real
         // modification time from `utimensat`/`cp -p` — preserved + synced instead of being
-        // overwritten with the sync time). Owner + atime/ctime are no-ops; we echo current state.
+        // overwritten with the sync time), and atime (device-local, not synced). The kernel
+        // resolves `utimensat`'s special values before they reach us: UTIME_OMIT arrives as
+        // `None` (so we leave that timestamp alone) and UTIME_NOW as `TimeOrNow::Now`. Owner
+        // + ctime are no-ops; we echo current state.
         if let Some(sz) = size {
             if let Err(e) = self.provider.truncate(ino, sz) {
                 reply.error(errno(&e));
@@ -225,6 +240,12 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
         }
         if let Some(mt) = mtime {
             if let Err(e) = self.provider.set_mtime(ino, time_or_now_nanos(mt)) {
+                reply.error(errno(&e));
+                return;
+            }
+        }
+        if let Some(at) = atime {
+            if let Err(e) = self.provider.set_atime(ino, time_or_now_nanos(at)) {
                 reply.error(errno(&e));
                 return;
             }
