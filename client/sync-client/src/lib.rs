@@ -236,6 +236,22 @@ pub struct DownloadResponse {
     pub urls: HashMap<String, String>,
 }
 
+/// A single server-side search hit (G9). `size` is present for files, absent for dirs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResult {
+    pub node_id: String,
+    pub name: String,
+    pub kind: String,
+    /// Full slash-rooted path, e.g. `/Project/Bracket.STL`.
+    pub path: String,
+    pub size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResult>,
+}
+
 // ---- the API client -------------------------------------------------------
 
 /// Cheap to clone — `reqwest::blocking::Client` shares its connection pool via an
@@ -451,6 +467,21 @@ impl ServerClient {
         Self::json(resp)
     }
 
+    /// Server-side name/path search (G9), scoped to this device's user. For the web UI and a
+    /// fresh device with no local mirror; the desktop app prefers `fs-provider`'s local
+    /// `search` (instant + offline). Paginated by `limit`/`offset`.
+    pub fn search(&self, query: &str, limit: i64, offset: i64) -> Result<SearchResponse> {
+        let resp = self
+            .authed(self.http.get(self.url("/v1/search")))?
+            .query(&[
+                ("q", query.to_string()),
+                ("limit", limit.to_string()),
+                ("offset", offset.to_string()),
+            ])
+            .send()?;
+        Self::json(resp)
+    }
+
     pub fn download_urls(&self, hashes: &[String]) -> Result<DownloadResponse> {
         let resp = self
             .authed(self.http.post(self.url("/v1/chunks/download")))?
@@ -550,5 +581,21 @@ mod tests {
     fn url_join_trims_trailing_slash() {
         let c = ServerClient::new("http://localhost:3001/");
         assert_eq!(c.url("/v1/tree"), "http://localhost:3001/v1/tree");
+    }
+
+    #[test]
+    fn search_response_deserializes_server_shape() {
+        // Locks the wire contract with Sync::Search's JSON: a file carries a size, a dir
+        // has size = null (deserialized to None).
+        let body = r#"{"results":[
+            {"node_id":"n1","name":"Bracket.STL","kind":"file","path":"/Project/Bracket.STL","size":12},
+            {"node_id":"n2","name":"Project","kind":"dir","path":"/Project","size":null}
+        ]}"#;
+        let resp: SearchResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.results[0].path, "/Project/Bracket.STL");
+        assert_eq!(resp.results[0].size, Some(12));
+        assert_eq!(resp.results[1].kind, "dir");
+        assert_eq!(resp.results[1].size, None);
     }
 }

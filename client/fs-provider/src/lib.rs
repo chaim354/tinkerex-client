@@ -37,6 +37,19 @@ fn default_mode(kind: Kind) -> u32 {
     }
 }
 
+/// Escape the LIKE wildcards `%` and `_` (and the escape char `\` itself) so a user's
+/// search query is matched literally, not as a glob. Pair with `ESCAPE '\'` in the SQL.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Wall-clock **nanoseconds** since the epoch — the real `mtime` stamp for a *local*
 /// modification (a new write with no caller-supplied time). A pulled remote change carries
 /// the source device's real mtime instead (see [`SqliteProvider::apply_remote`]); we no
@@ -133,6 +146,40 @@ pub struct SyncNode {
     /// Real modification time (unix nanoseconds). Synced so the true mtime — not the sync
     /// time — is what every device sees. On **push** it's the local node's mtime; on
     /// **pull** it's the source device's mtime, applied verbatim by [`SqliteProvider::apply_remote`].
+    pub mtime: i64,
+}
+
+/// Options for [`SqliteProvider::search`]. `limit`/`offset` paginate the (path-ordered)
+/// result set so a huge tree never returns an unbounded list. Defaults: a generous cap,
+/// from the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOpts {
+    /// Max results to return (cap; the local tree could be large).
+    pub limit: usize,
+    /// Skip the first `offset` results (paginate alongside `limit`).
+    pub offset: usize,
+}
+
+impl Default for SearchOpts {
+    fn default() -> Self {
+        Self { limit: 200, offset: 0 }
+    }
+}
+
+/// A single search hit: enough to render a result row and navigate to the node without a
+/// second round-trip. `path` is the full slash-rooted path (e.g. `/Project/Bracket.STL`),
+/// reconstructed from the parent chain. `size`/`mtime` come straight from the local row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    pub node_id: String,
+    /// Full path from the library root, leading slash, e.g. `/a/b/file.stl`.
+    pub path: String,
+    /// The basename (leaf component), e.g. `file.stl`.
+    pub name: String,
+    pub kind: Kind,
+    /// File size in bytes (0 for directories).
+    pub size: u64,
+    /// Real modification time, unix nanoseconds (0 if never set).
     pub mtime: i64,
 }
 
@@ -597,6 +644,55 @@ impl SqliteProvider {
                 length: r.get::<_, i64>(2)? as u64,
             })
         })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- local search (G9) ------------------------------------------------
+
+    /// Instant, offline search of the **local** SQLite tree by name or full path.
+    ///
+    /// Local-first: this touches only the device's own metadata — never the WAN and never
+    /// the chunk store — so an online-only (never-hydrated) node is still found. The match
+    /// is a case-insensitive substring of either the basename *or* the full slash-rooted
+    /// path (so a query of a parent folder name finds its descendants). Results are ordered
+    /// by path (stable) and paginated by [`SearchOpts`]. The root is never a hit.
+    ///
+    /// `%`/`_` in the query are treated literally (escaped for the `LIKE`).
+    pub fn search(&self, query: &str, opts: &SearchOpts) -> Result<Vec<SearchHit>> {
+        let conn = self.conn.lock().unwrap();
+        // A recursive CTE reconstructs each node's full path (parent_ino chain) in one pass,
+        // then we filter on the lowercased path. The root (ino = ROOT_INO) seeds with an
+        // empty path and is excluded from the output by the `depth > 0` guard.
+        let pattern = format!("%{}%", escape_like(&query.to_lowercase()));
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE paths(ino, parent_ino, name, kind, size, mtime, node_id, path, depth) AS (
+                 SELECT ino, parent_ino, name, kind, size, mtime, node_id, '', 0
+                   FROM nodes WHERE ino = ?1
+                 UNION ALL
+                 SELECT n.ino, n.parent_ino, n.name, n.kind, n.size, n.mtime, n.node_id,
+                        paths.path || '/' || n.name, paths.depth + 1
+                   FROM nodes n JOIN paths ON n.parent_ino = paths.ino
+                  WHERE n.ino != ?1
+             )
+             SELECT node_id, path, name, kind, size, mtime FROM paths
+             WHERE depth > 0 AND LOWER(path) LIKE ?2 ESCAPE '\\'
+             ORDER BY path
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![ROOT_INO as i64, pattern, opts.limit as i64, opts.offset as i64],
+            |r| {
+                let kind = Kind::from_str(&r.get::<_, String>(3)?);
+                Ok(SearchHit {
+                    node_id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    path: r.get::<_, String>(1)?,
+                    name: r.get::<_, String>(2)?,
+                    kind,
+                    size: r.get::<_, i64>(4)? as u64,
+                    mtime: r.get::<_, i64>(5)?,
+                })
+            },
+        )?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
