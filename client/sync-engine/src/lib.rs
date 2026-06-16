@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fs_provider::{ChunkLoc, Kind, SqliteProvider, SyncNode};
+use sha2::{Digest, Sha256};
 use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
 
 mod daemon;
@@ -39,6 +40,14 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("no presigned url for {0}")]
     NoUrl(String),
+    /// A chunk fetched from remote object storage failed its content-address check: the
+    /// sha256 of the bytes that came back is not the hash they were fetched for. Means the
+    /// storage returned corrupt/truncated/wrong bytes (bit rot, a partial download, a stale
+    /// or wrong object). The hydrate is failed all-or-nothing and the bad bytes are NEVER
+    /// written into the local cache, so a read can never serve corrupt content. `expected` is
+    /// the manifest hash; `got` is the sha256 actually computed over the returned bytes.
+    #[error("chunk corrupt: expected {expected}, got {got} (storage returned bytes that don't match the content hash)")]
+    ChunkCorrupt { expected: String, got: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -478,10 +487,17 @@ impl SyncEngine {
         } else {
             HashMap::new()
         };
-        // Each item fetches → writes its chunk to the local cache → drops the bytes (so we hold
-        // at most `P` chunk buffers at once). Order is irrelevant; assembly is by hash.
+        // Each item fetches → VERIFIES the bytes hash to `h` → writes its chunk to the local
+        // cache → drops the bytes (so we hold at most `P` chunk buffers at once). Order is
+        // irrelevant; assembly is by hash. The verify is the integrity gate: object storage
+        // (R2/SeaweedFS) returning a corrupt/truncated/wrong object would otherwise be cached
+        // and served as file content undetected. We check here (where REMOTE bytes enter the
+        // cache), not on every local read (hot path) nor on the local-write/commit path (those
+        // bytes were just hashed to derive the key). A mismatch fails the whole hydrate
+        // (all-or-nothing) so a read never serves corrupt content.
         parallel_for_each(&missing, concurrency, |h| {
             let bytes = io.get(h, urls.get(h).map(String::as_str))?;
+            verify_chunk(h, &bytes)?;
             provider.chunk_put(h, &bytes)?;
             Ok(())
         })
@@ -596,6 +612,20 @@ impl SyncEngine {
         }
         Ok(new_cursor)
     }
+}
+
+/// Verify a fetched chunk is content-addressed-correct: `sha256(bytes)` (hex) must equal the
+/// `expected` hash it was fetched for. This is the SAME hash function the chunk addressing uses
+/// everywhere — `fs-provider`'s commit path (`hex(Sha256::digest(bytes))`) and `sync-client`'s
+/// `manifest_id` — so an honest chunk always matches and only genuine storage corruption (bit
+/// rot / a truncated download / a wrong object) is rejected. Returns [`Error::ChunkCorrupt`] on
+/// mismatch; the caller then never caches the bad bytes and fails the hydrate.
+fn verify_chunk(expected: &str, bytes: &[u8]) -> Result<()> {
+    let got = hex::encode(Sha256::digest(bytes));
+    if got != expected {
+        return Err(Error::ChunkCorrupt { expected: expected.to_string(), got });
+    }
+    Ok(())
 }
 
 /// Default concurrency for parallel chunk **uploads** during a push (mirrors
@@ -1276,5 +1306,146 @@ mod apply_tests {
         assert!(inval.invalidated.lock().unwrap().is_empty(), "a move is not a content invalidate");
         // created fired only for the two INSERTs (N's first appearance + the dir D), never for a move.
         assert_eq!(inval.created.lock().unwrap().len(), 2, "created only for the two inserts");
+    }
+}
+
+#[cfg(test)]
+mod hydrate_integrity_tests {
+    //! Chunk-integrity verification on the hydrate (fetch-from-cloud) path. Chunks are
+    //! content-addressed — the manifest hash IS the sha256 of the bytes — so a corrupt /
+    //! truncated / wrong byte returned by remote object storage must be **rejected** before
+    //! it is written into the local cache and served as file content (silent data corruption).
+    //! Verification lives only on the fetch path; the local-write/commit path already hashed
+    //! its own bytes to derive the key, and every-read verification would be a hot-path cost.
+    use super::*;
+    use fs_provider::{ChunkConfig, LocalChunkStore, Provider};
+    use std::sync::Mutex;
+
+    const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+
+    fn provider() -> SqliteProvider {
+        SqliteProvider::in_memory(Box::new(LocalChunkStore::temp().unwrap()), TINY).unwrap()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Seed a single-chunk file node in the local tree (a manifest pointing at `hash`) WITHOUT
+    /// the chunk bytes in the local store — exactly the post-pull state a hydrate fetches. Uses
+    /// `apply_remote`, the real pull-apply path. Returns the node_id.
+    fn seed_placeholder(p: &SqliteProvider, content: &[u8]) -> String {
+        let hash = sha256_hex(content);
+        let manifest_id = {
+            let mut mh = Sha256::new();
+            mh.update(hash.as_bytes());
+            hex::encode(mh.finalize())
+        };
+        let node = SyncNode {
+            node_id: "F".into(),
+            parent_node_id: None,
+            name: "f.bin".into(),
+            kind: Kind::File,
+            manifest_id: Some(manifest_id),
+            chunks: vec![ChunkLoc { hash, offset: 0, length: content.len() as u64 }],
+            version_id: Some("v1".into()),
+            mode: 0o644,
+            mtime: 0,
+            symlink_target: None,
+        };
+        p.apply_remote(&node).unwrap();
+        "F".into()
+    }
+
+    /// A transport that returns the requested chunk's bytes verbatim — the honest cloud.
+    /// `needs_urls() == false` so the engine never calls the (offline) server.
+    struct HonestIO {
+        chunks: HashMap<String, Vec<u8>>,
+    }
+    impl ChunkIO for HonestIO {
+        fn put(&self, _h: &str, _u: &HashMap<String, String>, _b: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        fn get(&self, hash: &str, _url: Option<&str>) -> Result<Vec<u8>> {
+            Ok(self.chunks.get(hash).cloned().unwrap_or_default())
+        }
+        fn needs_urls(&self) -> bool {
+            false
+        }
+    }
+
+    /// A transport that returns CORRUPTED bytes for a chunk — bytes whose sha256 does NOT match
+    /// the hash they were fetched for (simulates storage corruption / a truncated download / a
+    /// wrong object). Records which hashes it served so the test can assert nothing leaked.
+    struct CorruptingIO {
+        served: Mutex<Vec<String>>,
+    }
+    impl ChunkIO for CorruptingIO {
+        fn put(&self, _h: &str, _u: &HashMap<String, String>, _b: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        fn get(&self, hash: &str, _url: Option<&str>) -> Result<Vec<u8>> {
+            self.served.lock().unwrap().push(hash.to_string());
+            Ok(b"corrupted-bytes-do-not-match-the-hash".to_vec())
+        }
+        fn needs_urls(&self) -> bool {
+            false
+        }
+    }
+
+    /// RED: a fetched chunk whose bytes don't hash to the expected (manifest) hash must be
+    /// REJECTED — the hydrate fails with a corruption error, the bad bytes are NOT written into
+    /// the local cache, and a subsequent read therefore never serves wrong content.
+    #[test]
+    fn corrupt_fetched_chunk_is_rejected_and_not_cached() {
+        let p = provider();
+        let content = b"the real file content, repeated to span a chunk boundary maybe... \
+                        and a bit more so the manifest is non-trivial";
+        let node_id = seed_placeholder(&p, content);
+        let expected_hash = sha256_hex(content);
+        assert!(!p.has_chunk(&expected_hash), "precondition: chunk not yet local");
+
+        let client = ServerClient::new("http://127.0.0.1:0"); // never contacted (needs_urls=false)
+        let io = CorruptingIO { served: Mutex::new(Vec::new()) };
+
+        let err = SyncEngine::hydrate(&p, &client, &io, &node_id)
+            .expect_err("hydrate must FAIL when the cloud returns bytes that don't match the hash");
+
+        match err {
+            Error::ChunkCorrupt { expected, .. } => {
+                assert_eq!(expected, expected_hash, "the error names the expected manifest hash");
+            }
+            other => panic!("expected Error::ChunkCorrupt, got {other:?}"),
+        }
+
+        // The corrupt bytes must NOT have been written into the content-addressed cache.
+        assert!(
+            !p.has_chunk(&expected_hash),
+            "corrupt bytes must never enter the local cache under the chunk's hash"
+        );
+        // And the transport was actually exercised (we really fetched + rejected).
+        assert_eq!(io.served.lock().unwrap().len(), 1, "the corrupt chunk was fetched once");
+    }
+
+    /// GREEN companion: a correct chunk (bytes hash to the requested hash) hydrates fine and is
+    /// cached, so verification does not break the honest path.
+    #[test]
+    fn correct_fetched_chunk_hydrates_and_is_cached() {
+        let p = provider();
+        let content = b"honest bytes that hash to their own content address";
+        let node_id = seed_placeholder(&p, content);
+        let hash = sha256_hex(content);
+
+        let mut chunks = HashMap::new();
+        chunks.insert(hash.clone(), content.to_vec());
+        let io = HonestIO { chunks };
+        let client = ServerClient::new("http://127.0.0.1:0");
+
+        SyncEngine::hydrate(&p, &client, &io, &node_id).expect("a correct chunk hydrates");
+        assert!(p.has_chunk(&hash), "the verified chunk is now in the local cache");
+        // And the file reads back byte-for-byte.
+        let ino = p.ino_for_node_id(&node_id).unwrap().unwrap();
+        let got = p.read(ino, 0, content.len() as u32).unwrap();
+        assert_eq!(got, content, "the hydrated file reads back its real content");
     }
 }

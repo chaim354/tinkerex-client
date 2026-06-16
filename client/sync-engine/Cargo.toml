@@ -12,6 +12,12 @@ sync-client = { path = "../sync-client" }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# Chunk-integrity verification on the hydrate path: recompute sha256(bytes) and compare to the
+# content-addressed manifest hash so corrupt/truncated bytes from object storage are rejected,
+# never cached and served as file content. MUST be the SAME hash as the chunk addressing
+# (fs-provider's commit path / sync-client's manifest_id), i.e. hex(Sha256(bytes)).
+sha2 = "0.10"
+hex = "0.4"
 
 # Per-OS mount backend: Linux = FUSE (`Daemon`), Windows = WinFsp (`WinfspMount`),
 # macOS = WebDAV (`WebdavMount`, cross-platform deps above). `fuser` is Unix-only and
@@ -23,11 +29,6 @@ fs-fuse = { path = "../fs-fuse" }
 # content-changing pull, see EngineInvalidate) are now always available, no feature gate.
 fuser = "0.17"
 libc = "0.2"
-
-[dev-dependencies]
-# Used by the verify_tree example (content-hash oracle for the CfAPI conformance harness).
-sha2 = "0.10"
-hex = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 fs-winfsp = { path = "../fs-winfsp" }
