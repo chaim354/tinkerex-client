@@ -23,12 +23,10 @@
       <div id="viewSync">
       <!-- Connection -->
       <section class="card">
-        <h2>Connection</h2>
-
-        <div class="tabs" role="tablist" aria-label="How this device joins the library">
-          <button id="tabNew" role="tab" aria-selected="true">This is my device</button>
-          <button id="tabPair" role="tab" aria-selected="false">Pair with a code</button>
-        </div>
+        <h2>Sign in to sync</h2>
+        <p class="muted">Sign in with your account email and password to enroll this device.
+          Each of your devices signs in independently — your password is sent once over TLS
+          and never stored; only a per-device token is kept on this machine.</p>
 
         <label for="server">Sync server URL</label>
         <input id="server" value="http://localhost:3001" autocomplete="off" spellcheck="false" />
@@ -38,36 +36,19 @@
         <input id="email" value="maker@example.com" autocomplete="off" spellcheck="false" />
         <div class="field-err" id="emailErr"></div>
 
-        <div id="pairRow" class="hidden">
-          <label for="code">Pairing code (from a signed-in device)</label>
-          <input id="code" class="code" placeholder="ABCD2345" autocomplete="off" spellcheck="false" />
-          <div class="field-err" id="codeErr"></div>
-        </div>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" spellcheck="false" />
+        <div class="field-err" id="passwordErr"></div>
 
         <label id="mountLabel" for="mount">Mount point</label>
         <input id="mount" value="/tmp/MakerDrive" autocomplete="off" spellcheck="false" />
         <div class="field-err" id="mountErr"></div>
 
         <div class="row">
-          <button id="mountBtn" class="primary">Mount &amp; sync</button>
+          <button id="mountBtn" class="primary">Sign in &amp; sync</button>
           <button id="unmountBtn" disabled>Unmount</button>
         </div>
         <div id="connToast" class="toast hidden" role="alert"></div>
-      </section>
-
-      <!-- Devices -->
-      <section class="card">
-        <h2>Add another device</h2>
-        <p class="muted">Generate a one-time code, then enter it on the other device under
-          “Pair with a code”. The code expires in 10 minutes.</p>
-        <div class="row" style="margin-top:0.6rem">
-          <button id="pairCodeBtn">Generate pairing code</button>
-        </div>
-        <div id="codeboxWrap" class="codebox-wrap hidden">
-          <div id="codebox" class="codebox" aria-label="Pairing code"></div>
-          <button id="copyCodeBtn" title="Copy code">Copy</button>
-        </div>
-        <div id="pairToast" class="toast hidden" role="alert"></div>
       </section>
 
       <!-- Files -->

@@ -106,7 +106,7 @@ fn save_token(server: &str, email: &str, token: &str) {
 // ---- mounting ----------------------------------------------------------------------
 
 /// Mount + start the sync loop with an already-obtained device `token`. Shared by
-/// `sync_start` and `sync_pair`.
+/// the `sync_login` enrollment path.
 fn mount_with_token(
     state: &State<AppState>,
     server_url: &str,

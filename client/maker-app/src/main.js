@@ -2,16 +2,14 @@
 //
 // Vanilla ES module. All backend calls go through the Tauri `invoke` bridge.
 // The command names + argument casing here MUST match src-tauri/src/lib.rs:
-//   sync_start / sync_pair / create_pairing / sync_stop / sync_status / platform /
+//   sync_login / sync_stop / sync_status / platform /
 //   browse / file_versions / restore_version / conflicts /
 //   resolve_conflict_keep / resolve_conflict_split
-// args use camelCase: serverUrl, email, mountpoint, code, nodeId, versionId.
+// args use camelCase: serverUrl, email, password, mountpoint, nodeId, versionId.
 
 const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const val = (id) => $(id).value.trim();
-
-let mode = "new"; // "new" | "pair"
 
 // ---- small helpers -----------------------------------------------------------
 
@@ -101,9 +99,9 @@ const setStatus = (text) => {
   if (text.startsWith("mounted")) {
     pill.className = "pill on";
     label.textContent = text; // "mounted at <path>"
-  } else if (text === "mounting" || text === "pairing") {
+  } else if (text === "mounting") {
     pill.className = "pill busy";
-    label.textContent = text === "pairing" ? "pairing…" : "mounting…";
+    label.textContent = "signing in…";
   } else {
     pill.className = "pill";
     label.textContent = "unmounted";
@@ -112,26 +110,14 @@ const setStatus = (text) => {
 };
 
 const refreshStatus = async () => {
-  // don't clobber a transient "mounting"/"pairing" the click handler set
-  if (lastStatus === "mounting" || lastStatus === "pairing") return;
+  // don't clobber a transient "mounting" the click handler set
+  if (lastStatus === "mounting") return;
   try {
     setStatus(await invoke("sync_status"));
   } catch {
     setStatus("unmounted");
   }
 };
-
-// ---- connect tabs ------------------------------------------------------------
-
-const selectTab = (m) => {
-  mode = m;
-  $("tabNew").setAttribute("aria-selected", String(m === "new"));
-  $("tabPair").setAttribute("aria-selected", String(m === "pair"));
-  $("pairRow").classList.toggle("hidden", m !== "pair");
-  $("mountBtn").textContent = m === "pair" ? "Pair & sync" : "Mount & sync";
-};
-$("tabNew").onclick = () => selectTab("new");
-$("tabPair").onclick = () => selectTab("pair");
 
 // ---- top-level view nav (Sync | Library) -------------------------------------
 
@@ -154,8 +140,8 @@ const validateConnForm = () => {
   let ok = true;
   setFieldError($("server"), $("serverErr"), "");
   setFieldError($("email"), $("emailErr"), "");
+  setFieldError($("password"), $("passwordErr"), "");
   setFieldError($("mount"), $("mountErr"), "");
-  setFieldError($("code"), $("codeErr"), "");
 
   if (!val("server")) {
     setFieldError($("server"), $("serverErr"), "Enter the sync server URL.");
@@ -165,29 +151,35 @@ const validateConnForm = () => {
     setFieldError($("email"), $("emailErr"), "Enter your account email.");
     ok = false;
   }
-  if (!val("mount")) {
-    setFieldError($("mount"), $("mountErr"), "Choose where to mount the drive.");
+  // Don't trim the password — it may legitimately contain whitespace.
+  if (!$("password").value) {
+    setFieldError($("password"), $("passwordErr"), "Enter your account password.");
     ok = false;
   }
-  if (mode === "pair" && !val("code")) {
-    setFieldError($("code"), $("codeErr"), "Enter the pairing code from a signed-in device.");
+  if (!val("mount")) {
+    setFieldError($("mount"), $("mountErr"), "Choose where to mount the drive.");
     ok = false;
   }
   return ok;
 };
 
-// ---- mount / pair ------------------------------------------------------------
+// ---- sign in (device login) --------------------------------------------------
 
 $("mountBtn").onclick = async () => {
   hideToast($("connToast"));
   if (!validateConnForm()) return;
-  setStatus(mode === "pair" ? "pairing" : "mounting");
-  await withBusy($("mountBtn"), mode === "pair" ? "Pairing…" : "Mounting…", async () => {
+  setStatus("mounting");
+  await withBusy($("mountBtn"), "Signing in…", async () => {
     try {
-      const a = { ...args(), mountpoint: val("mount") };
-      const cmd = mode === "pair" ? "sync_pair" : "sync_start";
-      if (mode === "pair") a.code = val("code");
-      const result = await invoke(cmd, a);
+      // sync_login(server_url, email, password, mountpoint) — Tauri maps camelCase→snake_case.
+      // The device enrolls by logging in; the server returns a per-device token (saved
+      // locally), then we mount + start the sync loop. Reused on later launches.
+      const result = await invoke("sync_login", {
+        serverUrl: val("server"),
+        email: val("email"),
+        password: $("password").value,
+        mountpoint: val("mount"),
+      });
       toast($("connToast"), result, "ok");
       await refreshStatus();
       loadFiles();
@@ -210,37 +202,6 @@ $("unmountBtn").onclick = async () => {
     }
     await refreshStatus();
   });
-};
-
-// ---- pairing code ------------------------------------------------------------
-
-$("pairCodeBtn").onclick = async () => {
-  hideToast($("pairToast"));
-  $("codeboxWrap").classList.add("hidden");
-  if (!val("server") || !val("email")) {
-    toast($("pairToast"), "Enter a server URL and email first.", "err");
-    return;
-  }
-  await withBusy($("pairCodeBtn"), "Generating…", async () => {
-    try {
-      const code = await invoke("create_pairing", args());
-      $("codebox").textContent = code;
-      $("codeboxWrap").classList.remove("hidden");
-    } catch (e) {
-      toast($("pairToast"), errText(e), "err");
-    }
-  });
-};
-
-$("copyCodeBtn").onclick = async () => {
-  const code = $("codebox").textContent;
-  if (!code) return;
-  try {
-    await navigator.clipboard.writeText(code);
-    toast($("pairToast"), "Copied to clipboard.", "ok");
-  } catch {
-    toast($("pairToast"), "Couldn't copy — select the code and copy manually.", "err");
-  }
 };
 
 // ---- file browser + versions -------------------------------------------------
