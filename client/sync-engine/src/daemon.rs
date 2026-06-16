@@ -26,9 +26,9 @@ use crate::{ChunkIO, PresignedIO, SyncEngine, ThrottledChunkIO};
 
 // FUSE bits — Linux only (macOS → WebDAV, Windows → WinFsp).
 #[cfg(target_os = "linux")]
-use crate::{EngineInvalidate, Invalidate};
-#[cfg(target_os = "linux")]
 use crate::EngineHydrator;
+#[cfg(target_os = "linux")]
+use crate::{EngineInvalidate, Invalidate};
 #[cfg(target_os = "linux")]
 use fs_fuse::FuseAdapter;
 #[cfg(target_os = "linux")]
@@ -86,14 +86,20 @@ pub struct Debounce {
 impl Default for Debounce {
     fn default() -> Self {
         // Disabled by default — push promptly. Opt-in to the 2-3s coalesce window.
-        Self { window_ms: 0, max_age_ms: 0 }
+        Self {
+            window_ms: 0,
+            max_age_ms: 0,
+        }
     }
 }
 
 impl Debounce {
     /// The recommended maker-workload preset: a 2.5 s coalesce window with a 30 s cap
     /// (`docs/torn-writes-and-batching.md` §4 — D = 2-3 s, M = 30 s).
-    pub const MAKER_DEFAULT: Debounce = Debounce { window_ms: 2_500, max_age_ms: 30_000 };
+    pub const MAKER_DEFAULT: Debounce = Debounce {
+        window_ms: 2_500,
+        max_age_ms: 30_000,
+    };
 }
 
 /// Default chunk-fetch concurrency for hydration. 8 in-flight GETs balances throughput
@@ -113,8 +119,14 @@ pub(crate) struct TransferLimits {
 impl TransferLimits {
     /// Build from optional byte/sec caps. `None`/`Some(0)` on a side → unlimited there.
     fn from_caps(up_bps: Option<u64>, down_bps: Option<u64>) -> Self {
-        let mk = |b: Option<u64>| b.filter(|&b| b > 0).map(|b| Arc::new(crate::RateLimiter::new(b)));
-        Self { up: mk(up_bps), down: mk(down_bps) }
+        let mk = |b: Option<u64>| {
+            b.filter(|&b| b > 0)
+                .map(|b| Arc::new(crate::RateLimiter::new(b)))
+        };
+        Self {
+            up: mk(up_bps),
+            down: mk(down_bps),
+        }
     }
 
     /// Wrap a transport with these limiters (a no-op pass-through when both are unlimited).
@@ -194,7 +206,10 @@ impl Daemon {
         // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
         // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
         // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+        if provider
+            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
+            .unwrap_or(false)
+        {
             eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
         }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
@@ -217,7 +232,19 @@ impl Daemon {
             let inval = inval_dyn.clone();
             let limits = limits.clone();
             let debounce = cfg.debounce;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), None, limits, debounce))
+            thread::spawn(move || {
+                sync_loop(
+                    provider,
+                    client,
+                    stop,
+                    nudge_rx,
+                    poll,
+                    Some(inval),
+                    None,
+                    limits,
+                    debounce,
+                )
+            })
         };
         {
             let client = client.clone();
@@ -230,8 +257,15 @@ impl Daemon {
             client.clone(),
             cfg.hydrate_concurrency,
         ));
-        let freshness = Arc::new(crate::EngineFreshness::new(provider.clone(), client.clone(), Some(inval_dyn.clone())));
-        let remote_lock = Arc::new(crate::EngineRemoteLock::new(provider.clone(), client.clone()));
+        let freshness = Arc::new(crate::EngineFreshness::new(
+            provider.clone(),
+            client.clone(),
+            Some(inval_dyn.clone()),
+        ));
+        let remote_lock = Arc::new(crate::EngineRemoteLock::new(
+            provider.clone(),
+            client.clone(),
+        ));
         let fs = FuseAdapter::with_hydrator(provider.clone(), hydrator)
             .with_freshness(freshness)
             .with_remote_lock(remote_lock);
@@ -362,7 +396,10 @@ impl WebdavMount {
         // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
         // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
         // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+        if provider
+            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
+            .unwrap_or(false)
+        {
             eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
         }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
@@ -377,7 +414,11 @@ impl WebdavMount {
             let stop = stop.clone();
             let poll = cfg.poll;
             let debounce = cfg.debounce;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits, debounce))
+            thread::spawn(move || {
+                sync_loop(
+                    provider, client, stop, nudge_rx, poll, None, None, limits, debounce,
+                )
+            })
         };
         {
             let client = client.clone();
@@ -393,7 +434,9 @@ impl WebdavMount {
             Arc::new(move |ino: u64| {
                 if let Ok(Some(node_id)) = p.node_id_for(ino) {
                     let io = PresignedIO::new(&c);
-                    if let Err(e) = SyncEngine::hydrate_concurrent(&p, &c, &io, &node_id, concurrency) {
+                    if let Err(e) =
+                        SyncEngine::hydrate_concurrent(&p, &c, &io, &node_id, concurrency)
+                    {
                         eprintln!("webdav hydrate ino {ino}: {e}");
                     }
                 }
@@ -402,16 +445,26 @@ impl WebdavMount {
 
         // WebDAV server on its own multi-thread runtime (dropped on stop → shutdown).
         let addr: SocketAddr = ([127, 0, 0, 1], cfg.webdav_port).into();
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
         rt.spawn(fs_webdav::serve(provider, addr, Some(hydrate)));
 
         // Mount via the native client once the server is listening.
         std::fs::create_dir_all(&cfg.mountpoint)?;
         thread::sleep(Duration::from_millis(400));
         mount_native(&addr, &cfg.mountpoint)?;
-        println!("WebDAV mounted at {} (http://{addr}/)", cfg.mountpoint.display());
+        println!(
+            "WebDAV mounted at {} (http://{addr}/)",
+            cfg.mountpoint.display()
+        );
 
-        Ok(Self { stop, rt: Some(rt), sync_handle: Some(sync_handle), mountpoint: cfg.mountpoint })
+        Ok(Self {
+            stop,
+            rt: Some(rt),
+            sync_handle: Some(sync_handle),
+            mountpoint: cfg.mountpoint,
+        })
     }
 
     pub fn mountpoint(&self) -> &Path {
@@ -445,7 +498,9 @@ fn mount_native(addr: &SocketAddr, mp: &Path) -> std::io::Result<()> {
         .arg(mp)
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::other(format!("mount_webdav exited {status}")));
+        return Err(std::io::Error::other(format!(
+            "mount_webdav exited {status}"
+        )));
     }
     Ok(())
 }
@@ -480,7 +535,10 @@ impl WinfspMount {
         // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
         // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
         // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+        if provider
+            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
+            .unwrap_or(false)
+        {
             eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
         }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
@@ -495,7 +553,11 @@ impl WinfspMount {
             let stop = stop.clone();
             let poll = cfg.poll;
             let debounce = cfg.debounce;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, None, None, limits, debounce))
+            thread::spawn(move || {
+                sync_loop(
+                    provider, client, stop, nudge_rx, poll, None, None, limits, debounce,
+                )
+            })
         };
         {
             let client = client.clone();
@@ -511,7 +573,9 @@ impl WinfspMount {
             Arc::new(move |ino: u64| {
                 if let Ok(Some(node_id)) = p.node_id_for(ino) {
                     let io = PresignedIO::new(&c);
-                    if let Err(e) = SyncEngine::hydrate_concurrent(&p, &c, &io, &node_id, concurrency) {
+                    if let Err(e) =
+                        SyncEngine::hydrate_concurrent(&p, &c, &io, &node_id, concurrency)
+                    {
                         eprintln!("winfsp hydrate ino {ino}: {e}");
                     }
                 }
@@ -525,19 +589,21 @@ impl WinfspMount {
         let fs_thread = {
             let provider = provider.clone();
             let stop = stop.clone();
-            thread::spawn(move || match fs_winfsp::start_mount(provider, &mountpoint, Some(hydrate)) {
-                Ok(mounted) => {
-                    let _ = ready_tx.send(Ok(()));
-                    while !stop.load(Ordering::Relaxed) {
-                        thread::sleep(Duration::from_millis(150));
+            thread::spawn(move || {
+                match fs_winfsp::start_mount(provider, &mountpoint, Some(hydrate)) {
+                    Ok(mounted) => {
+                        let _ = ready_tx.send(Ok(()));
+                        while !stop.load(Ordering::Relaxed) {
+                            thread::sleep(Duration::from_millis(150));
+                        }
+                        drop(mounted); // unmount on stop
                     }
-                    drop(mounted); // unmount on stop
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(std::io::Error::other(format!(
-                        "winfsp mount failed: {e:?}"
-                    ))
-                    .into()));
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(std::io::Error::other(format!(
+                            "winfsp mount failed: {e:?}"
+                        ))
+                        .into()));
+                    }
                 }
             })
         };
@@ -643,7 +709,10 @@ impl CfApiMount {
         // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
         // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
         // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider.bind_library(library_id_for(&cfg.server_url, &cfg.token)).unwrap_or(false) {
+        if provider
+            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
+            .unwrap_or(false)
+        {
             eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
         }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
@@ -661,7 +730,9 @@ impl CfApiMount {
                 let _ = provider.set_cursor(head);
                 println!("cfapi: initial pull complete (head_seq {head}, cursor reset)");
             }
-            Err(e) => eprintln!("cfapi: initial pull failed (will populate as the loop catches up): {e}"),
+            Err(e) => {
+                eprintln!("cfapi: initial pull failed (will populate as the loop catches up): {e}")
+            }
         }
 
         // ONE teardown flag shared by the mount's callbacks AND the invalidator. The sync loop's
@@ -684,15 +755,14 @@ impl CfApiMount {
         // resolves paths + opens handles itself, so it needs no post-mount notifier). Share the
         // path index + echo guard so it benefits from enumeration-time path knowledge and its
         // delete/move FS ops are recognized as self-echoes by the mount's NOTIFY callbacks.
-        let inval: Arc<dyn crate::Invalidate> = Arc::new(EngineCfInvalidate(
-            fs_cfapi::CfApiInvalidate::with_index(
+        let inval: Arc<dyn crate::Invalidate> =
+            Arc::new(EngineCfInvalidate(fs_cfapi::CfApiInvalidate::with_index(
                 provider.clone(),
                 cfg.mountpoint.clone(),
                 shutting_down.clone(),
                 path_index.clone(),
                 self_removes.clone(),
-            ),
-        ));
+            )));
 
         // Serialize the sync loop's push against the shutdown drain (see `push_gate` field).
         let push_gate = Arc::new(std::sync::Mutex::new(()));
@@ -707,7 +777,19 @@ impl CfApiMount {
             let push_gate = push_gate.clone();
             let limits = limits.clone();
             let debounce = cfg.debounce;
-            thread::spawn(move || sync_loop(provider, client, stop, nudge_rx, poll, Some(inval), Some(push_gate), limits, debounce))
+            thread::spawn(move || {
+                sync_loop(
+                    provider,
+                    client,
+                    stop,
+                    nudge_rx,
+                    poll,
+                    Some(inval),
+                    Some(push_gate),
+                    limits,
+                    debounce,
+                )
+            })
         };
         {
             let client = client.clone();
@@ -726,9 +808,15 @@ impl CfApiMount {
             let concurrency = cfg.hydrate_concurrency;
             Arc::new(move |node_id: &str, offset: u64, length: u64| {
                 let io = PresignedIO::new(&c);
-                if let Err(e) =
-                    SyncEngine::hydrate_range_concurrent(&p, &c, &io, node_id, offset, length, concurrency)
-                {
+                if let Err(e) = SyncEngine::hydrate_range_concurrent(
+                    &p,
+                    &c,
+                    &io,
+                    node_id,
+                    offset,
+                    length,
+                    concurrency,
+                ) {
                     eprintln!("cfapi hydrate_range {node_id} off={offset} len={length}: {e}");
                 }
             })
@@ -793,7 +881,14 @@ impl CfApiMount {
         if let Some(h) = handle {
             h.remove_library(delete_folder)?; // std::io::Error → crate::Error::Io via #[from]
         }
-        eprintln!("cfapi: library removed (sync root unregistered{})", if delete_folder { " + folder deleted" } else { "" });
+        eprintln!(
+            "cfapi: library removed (sync root unregistered{})",
+            if delete_folder {
+                " + folder deleted"
+            } else {
+                ""
+            }
+        );
         Ok(())
     }
 
@@ -865,7 +960,10 @@ impl CfApiMount {
                 let _gate = self.push_gate.lock().unwrap_or_else(|e| e.into_inner());
                 before = self.provider.outbox_list().unwrap_or_default();
                 if !before.is_empty() {
-                    let ops: Vec<String> = before.iter().map(|(id, op)| format!("{op}:{}", &id[..8.min(id.len())])).collect();
+                    let ops: Vec<String> = before
+                        .iter()
+                        .map(|(id, op)| format!("{op}:{}", &id[..8.min(id.len())]))
+                        .collect();
                     eprintln!("cfapi: drain round — outbox [{}]", ops.join(", "));
                     let _ = std::io::Write::flush(&mut std::io::stderr());
                 }
@@ -885,7 +983,9 @@ impl CfApiMount {
             // happened for MAX_IDLE — so a straggler that lands seconds after a slow push is caught.
             if remaining == 0 {
                 if let Some(since) = empty_since {
-                    if now.duration_since(since) >= STABLE && now.duration_since(last_work) >= MAX_IDLE {
+                    if now.duration_since(since) >= STABLE
+                        && now.duration_since(last_work) >= MAX_IDLE
+                    {
                         break;
                     }
                 }
@@ -944,7 +1044,9 @@ fn sync_loop(
         // Hold the push gate across the tick (CfAPI only) so the shutdown drain can't push the
         // SAME outbox node concurrently — a concurrent double-push sends the same base_version_id
         // twice and the server records a spurious self-conflict on the second.
-        let guard = push_gate.as_ref().map(|g| g.lock().unwrap_or_else(|e| e.into_inner()));
+        let guard = push_gate
+            .as_ref()
+            .map(|g| g.lock().unwrap_or_else(|e| e.into_inner()));
         let r = SyncEngine::sync_tick_debounced(
             &provider,
             &client,

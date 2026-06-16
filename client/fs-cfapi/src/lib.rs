@@ -116,7 +116,11 @@ pub struct RemoteNodeEvent {
 pub fn decide_action(ev: RemoteNodeEvent) -> PlaceholderAction {
     if ev.deleted {
         // A delete only needs an op if the placeholder is actually on disk.
-        return if ev.existed { PlaceholderAction::Delete } else { PlaceholderAction::None };
+        return if ev.existed {
+            PlaceholderAction::Delete
+        } else {
+            PlaceholderAction::None
+        };
     }
     if !ev.existed {
         return PlaceholderAction::Create;
@@ -213,7 +217,9 @@ pub fn plan_transfer_chunks(
     // Floor the start to a page boundary (the kernel asks page-aligned; be defensive).
     let start = (required_offset / TRANSFER_BLOCK) * TRANSFER_BLOCK;
     // The end of the required range, clamped to EOF — we never transfer past the file.
-    let req_end = required_offset.saturating_add(required_length).min(file_size);
+    let req_end = required_offset
+        .saturating_add(required_length)
+        .min(file_size);
     // Per-chunk step: floor max_chunk to whole pages, at least one page.
     let step = (max_chunk / TRANSFER_BLOCK).max(1) * TRANSFER_BLOCK;
     // Round req_end UP to a page so a non-final chunk stays page-aligned; the chunk that
@@ -227,7 +233,10 @@ pub fn plan_transfer_chunks(
         let aligned_end = (off + step).min(req_end_ceil);
         // Clamp to file_size: the chunk that reaches EOF is the only one allowed a short length.
         let end = aligned_end.min(file_size);
-        chunks.push(TransferChunk { offset: off, length: end - off });
+        chunks.push(TransferChunk {
+            offset: off,
+            length: end - off,
+        });
         off = aligned_end;
     }
     chunks
@@ -434,13 +443,18 @@ impl SelfOps {
     /// Normalize a path to the echo-guard key form (case-insensitive, `/`-separated, no trailing
     /// separator) so the daemon's and the callback's path spellings collide on the same entry.
     pub fn key(path: &str) -> String {
-        path.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase()
+        path.replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
     }
 
     /// Record that the daemon is about to mutate `path` itself — the next matching NOTIFY callback
     /// is our own echo and should be suppressed.
     pub fn mark(&self, path: &str) {
-        self.map.lock().unwrap().insert(Self::key(path), std::time::Instant::now());
+        self.map
+            .lock()
+            .unwrap()
+            .insert(Self::key(path), std::time::Instant::now());
     }
 
     /// Consume a mark for `path`. Returns `true` (suppress this callback — it's our echo) only on a
@@ -467,7 +481,10 @@ mod tests {
         // The daemon's own delete/rename echo is suppressed exactly once.
         assert!(g.take(path), "fresh mark → suppress the echo");
         // A second callback at the same path (e.g. a later genuine user op) is NOT suppressed.
-        assert!(!g.take(path), "mark is consumed — a subsequent op is captured");
+        assert!(
+            !g.take(path),
+            "mark is consumed — a subsequent op is captured"
+        );
     }
 
     #[test]
@@ -476,7 +493,10 @@ mod tests {
         // daemon used for the FS op; both must collide on the same guard entry.
         let g = SelfOps::new();
         g.mark(r"C:\Users\me\MakerCF\A\B.txt");
-        assert!(g.take("c:/users/ME/makercf/a/b.txt"), "case + separator insensitive match");
+        assert!(
+            g.take("c:/users/ME/makercf/a/b.txt"),
+            "case + separator insensitive match"
+        );
     }
 
     #[test]
@@ -493,10 +513,10 @@ mod tests {
         let g = SelfOps::new();
         let path = r"C:\Users\me\MakerCF\x.txt";
         // Insert a mark whose timestamp is already older than the TTL.
-        g.map
-            .lock()
-            .unwrap()
-            .insert(SelfOps::key(path), std::time::Instant::now() - SelfOps::ECHO_TTL - std::time::Duration::from_secs(1));
+        g.map.lock().unwrap().insert(
+            SelfOps::key(path),
+            std::time::Instant::now() - SelfOps::ECHO_TTL - std::time::Duration::from_secs(1),
+        );
         assert!(!g.take(path), "stale mark → capture normally");
         assert!(!g.take(path), "and it was removed");
     }
@@ -505,7 +525,10 @@ mod tests {
     fn library_relative_strips_root_and_normalizes_backslashes() {
         let root = r"C:\Users\me\MakerCF";
         let abs = r"C:\Users\me\MakerCF\proj\part.stl";
-        assert_eq!(library_relative(root, abs).as_deref(), Some("proj/part.stl"));
+        assert_eq!(
+            library_relative(root, abs).as_deref(),
+            Some("proj/part.stl")
+        );
     }
 
     #[test]
@@ -519,8 +542,14 @@ mod tests {
     fn library_relative_handles_trailing_slash_on_root() {
         // Root with a trailing separator and without should both yield the same relative path.
         let abs = r"C:\Users\me\MakerCF\a\b.txt";
-        assert_eq!(library_relative(r"C:\Users\me\MakerCF", abs).as_deref(), Some("a/b.txt"));
-        assert_eq!(library_relative(r"C:\Users\me\MakerCF\", abs).as_deref(), Some("a/b.txt"));
+        assert_eq!(
+            library_relative(r"C:\Users\me\MakerCF", abs).as_deref(),
+            Some("a/b.txt")
+        );
+        assert_eq!(
+            library_relative(r"C:\Users\me\MakerCF\", abs).as_deref(),
+            Some("a/b.txt")
+        );
     }
 
     #[test]
@@ -534,7 +563,10 @@ mod tests {
     fn library_relative_matches_case_insensitively() {
         // CfAPI may report a differently-cased drive/path than the user-supplied root.
         let abs = r"c:\users\ME\makercf\a.txt";
-        assert_eq!(library_relative(r"C:\Users\me\MakerCF", abs).as_deref(), Some("a.txt"));
+        assert_eq!(
+            library_relative(r"C:\Users\me\MakerCF", abs).as_deref(),
+            Some("a.txt")
+        );
     }
 
     #[test]
@@ -595,8 +627,15 @@ mod tests {
         // that's a whole number of 100 ns ticks round-trips exactly.
         let nanos = 1_780_000_000_000_000_000_i64; // multiple of 100
         let ft = unix_nanos_to_filetime(nanos);
-        assert!(ft > FILETIME_UNIX_EPOCH_TICKS as u64, "after the 1601 epoch by >1 unix-epoch");
-        assert_eq!(filetime_to_unix_nanos(ft), nanos, "round-trips at 100 ns resolution");
+        assert!(
+            ft > FILETIME_UNIX_EPOCH_TICKS as u64,
+            "after the 1601 epoch by >1 unix-epoch"
+        );
+        assert_eq!(
+            filetime_to_unix_nanos(ft),
+            nanos,
+            "round-trips at 100 ns resolution"
+        );
     }
 
     #[test]
@@ -620,17 +659,73 @@ mod tests {
         let f = Kind::File;
         let d = Kind::Dir;
         // Deletes
-        assert_eq!(decide_action(RemoteNodeEvent { existed: true, content_changed: false, deleted: true, kind: f }), PlaceholderAction::Delete);
-        assert_eq!(decide_action(RemoteNodeEvent { existed: false, content_changed: false, deleted: true, kind: f }), PlaceholderAction::None);
+        assert_eq!(
+            decide_action(RemoteNodeEvent {
+                existed: true,
+                content_changed: false,
+                deleted: true,
+                kind: f
+            }),
+            PlaceholderAction::Delete
+        );
+        assert_eq!(
+            decide_action(RemoteNodeEvent {
+                existed: false,
+                content_changed: false,
+                deleted: true,
+                kind: f
+            }),
+            PlaceholderAction::None
+        );
         // New nodes
-        assert_eq!(decide_action(RemoteNodeEvent { existed: false, content_changed: false, deleted: false, kind: f }), PlaceholderAction::Create);
-        assert_eq!(decide_action(RemoteNodeEvent { existed: false, content_changed: false, deleted: false, kind: d }), PlaceholderAction::Create);
+        assert_eq!(
+            decide_action(RemoteNodeEvent {
+                existed: false,
+                content_changed: false,
+                deleted: false,
+                kind: f
+            }),
+            PlaceholderAction::Create
+        );
+        assert_eq!(
+            decide_action(RemoteNodeEvent {
+                existed: false,
+                content_changed: false,
+                deleted: false,
+                kind: d
+            }),
+            PlaceholderAction::Create
+        );
         // Existing file, content change → dehydrate (the cache-drop)
-        assert_eq!(decide_action(RemoteNodeEvent { existed: true, content_changed: true, deleted: false, kind: f }), PlaceholderAction::UpdateAndDehydrate);
+        assert_eq!(
+            decide_action(RemoteNodeEvent {
+                existed: true,
+                content_changed: true,
+                deleted: false,
+                kind: f
+            }),
+            PlaceholderAction::UpdateAndDehydrate
+        );
         // Existing file, metadata-only
-        assert_eq!(decide_action(RemoteNodeEvent { existed: true, content_changed: false, deleted: false, kind: f }), PlaceholderAction::UpdateMetadata);
+        assert_eq!(
+            decide_action(RemoteNodeEvent {
+                existed: true,
+                content_changed: false,
+                deleted: false,
+                kind: f
+            }),
+            PlaceholderAction::UpdateMetadata
+        );
         // Existing dir → no-op
-        assert_eq!(decide_action(RemoteNodeEvent { existed: true, content_changed: false, deleted: false, kind: d }), PlaceholderAction::None);
+        assert_eq!(
+            decide_action(RemoteNodeEvent {
+                existed: true,
+                content_changed: false,
+                deleted: false,
+                kind: d
+            }),
+            PlaceholderAction::None
+        );
     }
 
     // --- B6.3: streamed FETCH_DATA chunk planning ---------------------------------------
@@ -639,7 +734,13 @@ mod tests {
     fn transfer_small_file_is_one_short_final_chunk() {
         // A 1000-byte file, whole range requested: one chunk, short (EOF) length — legal.
         let plan = plan_transfer_chunks(0, 1000, 1000, 1 << 20);
-        assert_eq!(plan, vec![TransferChunk { offset: 0, length: 1000 }]);
+        assert_eq!(
+            plan,
+            vec![TransferChunk {
+                offset: 0,
+                length: 1000
+            }]
+        );
     }
 
     #[test]
@@ -651,9 +752,18 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                TransferChunk { offset: 0, length: 4 * mb },
-                TransferChunk { offset: 4 * mb, length: 4 * mb },
-                TransferChunk { offset: 8 * mb, length: 2 * mb },
+                TransferChunk {
+                    offset: 0,
+                    length: 4 * mb
+                },
+                TransferChunk {
+                    offset: 4 * mb,
+                    length: 4 * mb
+                },
+                TransferChunk {
+                    offset: 8 * mb,
+                    length: 2 * mb
+                },
             ]
         );
     }
@@ -670,11 +780,19 @@ mod tests {
         assert!(step % TRANSFER_BLOCK == 0 && step > 0);
         let mut covered = 0u64;
         for (i, c) in plan.iter().enumerate() {
-            assert_eq!(c.offset % TRANSFER_BLOCK, 0, "chunk {i} offset must be page-aligned");
+            assert_eq!(
+                c.offset % TRANSFER_BLOCK,
+                0,
+                "chunk {i} offset must be page-aligned"
+            );
             assert_eq!(c.offset, covered, "chunks must be contiguous");
             let is_final = i == plan.len() - 1;
             if !is_final {
-                assert_eq!(c.length % TRANSFER_BLOCK, 0, "non-final chunk {i} length must be page-aligned");
+                assert_eq!(
+                    c.length % TRANSFER_BLOCK,
+                    0,
+                    "non-final chunk {i} length must be page-aligned"
+                );
             }
             covered += c.length;
         }
@@ -688,7 +806,10 @@ mod tests {
         // A (defensive) unaligned required offset is floored to its page so the transfer offset
         // is always page-aligned.
         let plan = plan_transfer_chunks(5000, 1000, 100_000, 1 << 20);
-        assert_eq!(plan[0].offset, 4096, "offset floored to the containing page");
+        assert_eq!(
+            plan[0].offset, 4096,
+            "offset floored to the containing page"
+        );
     }
 
     #[test]
@@ -702,9 +823,18 @@ mod tests {
 
     #[test]
     fn transfer_empty_for_zero_length_or_past_eof() {
-        assert!(plan_transfer_chunks(0, 0, 1000, 1 << 20).is_empty(), "zero length → nothing");
-        assert!(plan_transfer_chunks(2000, 100, 1000, 1 << 20).is_empty(), "offset past EOF → nothing");
-        assert!(plan_transfer_chunks(0, 100, 0, 1 << 20).is_empty(), "empty file → nothing");
+        assert!(
+            plan_transfer_chunks(0, 0, 1000, 1 << 20).is_empty(),
+            "zero length → nothing"
+        );
+        assert!(
+            plan_transfer_chunks(2000, 100, 1000, 1 << 20).is_empty(),
+            "offset past EOF → nothing"
+        );
+        assert!(
+            plan_transfer_chunks(0, 100, 0, 1 << 20).is_empty(),
+            "empty file → nothing"
+        );
     }
 
     #[test]
@@ -715,8 +845,20 @@ mod tests {
         assert!(!plan.is_empty());
         // 10000 / 4096 → pages 0..4096, 4096..8192, 8192..10000 (short final).
         assert_eq!(plan.len(), 3);
-        assert_eq!(plan[0], TransferChunk { offset: 0, length: 4096 });
-        assert_eq!(plan[2], TransferChunk { offset: 8192, length: 10_000 - 8192 });
+        assert_eq!(
+            plan[0],
+            TransferChunk {
+                offset: 0,
+                length: 4096
+            }
+        );
+        assert_eq!(
+            plan[2],
+            TransferChunk {
+                offset: 8192,
+                length: 10_000 - 8192
+            }
+        );
     }
 
     // --- B6.1: pin/unpin → hydrate/dehydrate decision -----------------------------------
@@ -726,15 +868,28 @@ mod tests {
         assert_eq!(PinState::from_raw(1), PinState::Pinned);
         assert_eq!(PinState::from_raw(2), PinState::Unpinned);
         for other in [0, 3, 4, -1, 99] {
-            assert_eq!(PinState::from_raw(other), PinState::Other, "raw {other} → Other");
+            assert_eq!(
+                PinState::from_raw(other),
+                PinState::Other,
+                "raw {other} → Other"
+            );
         }
     }
 
     #[test]
     fn pin_hydration_action_files_hydrate_unpin_dehydrate() {
-        assert_eq!(pin_hydration_action(PinState::Pinned, Kind::File), HydrationAction::Hydrate);
-        assert_eq!(pin_hydration_action(PinState::Unpinned, Kind::File), HydrationAction::Dehydrate);
-        assert_eq!(pin_hydration_action(PinState::Other, Kind::File), HydrationAction::None);
+        assert_eq!(
+            pin_hydration_action(PinState::Pinned, Kind::File),
+            HydrationAction::Hydrate
+        );
+        assert_eq!(
+            pin_hydration_action(PinState::Unpinned, Kind::File),
+            HydrationAction::Dehydrate
+        );
+        assert_eq!(
+            pin_hydration_action(PinState::Other, Kind::File),
+            HydrationAction::None
+        );
     }
 
     #[test]
@@ -755,8 +910,14 @@ mod tests {
         let idx = PathIndex::new();
         let dir = Path::new("root").join("proj");
         idx.insert_children(&dir, [(10u64, "a.stl"), (11u64, "sub")]);
-        assert_eq!(idx.get(10), Some(PathBuf::from("root").join("proj").join("a.stl")));
-        assert_eq!(idx.get(11), Some(PathBuf::from("root").join("proj").join("sub")));
+        assert_eq!(
+            idx.get(10),
+            Some(PathBuf::from("root").join("proj").join("a.stl"))
+        );
+        assert_eq!(
+            idx.get(11),
+            Some(PathBuf::from("root").join("proj").join("sub"))
+        );
         assert_eq!(idx.get(99), None, "unknown ino → miss");
     }
 
@@ -811,7 +972,10 @@ mod tests {
         let mut tree = std::collections::HashMap::new();
         tree.insert(2u64, (fs_provider::ROOT_INO, "lamp.scad"));
         let chain = ancestor_chain(2, tree_lookup(&tree)).expect("resolvable");
-        assert!(chain.is_empty(), "root-level file → no ancestor dirs, got {chain:?}");
+        assert!(
+            chain.is_empty(),
+            "root-level file → no ancestor dirs, got {chain:?}"
+        );
     }
 
     #[test]

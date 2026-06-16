@@ -88,7 +88,9 @@ fn creds_key(server: &str, email: &str) -> String {
 fn load_token(server: &str, email: &str) -> Option<String> {
     let data = std::fs::read_to_string(creds_path()).ok()?;
     let map: serde_json::Value = serde_json::from_str(&data).ok()?;
-    map.get(creds_key(server, email))?.as_str().map(str::to_string)
+    map.get(creds_key(server, email))?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn save_token(server: &str, email: &str, token: &str) {
@@ -96,7 +98,10 @@ fn save_token(server: &str, email: &str, token: &str) {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    map.insert(creds_key(server, email), serde_json::Value::String(token.to_string()));
+    map.insert(
+        creds_key(server, email),
+        serde_json::Value::String(token.to_string()),
+    );
     let _ = std::fs::create_dir_all(app_base());
     if let Ok(json) = serde_json::to_string_pretty(&map) {
         let _ = std::fs::write(creds_path(), json);
@@ -205,7 +210,9 @@ fn browse(server_url: String, email: String) -> Result<Vec<BrowseEntry>, String>
     let mut out = Vec::new();
     let mut after = 0;
     loop {
-        let tree = client.tree(after).map_err(|e| format!("browse failed: {e}"))?;
+        let tree = client
+            .tree(after)
+            .map_err(|e| format!("browse failed: {e}"))?;
         if tree.nodes.is_empty() {
             break;
         }
@@ -236,15 +243,25 @@ struct VersionEntry {
 
 /// Version history of a file (newest first) — the basis for restore.
 #[tauri::command]
-fn file_versions(server_url: String, email: String, node_id: String) -> Result<Vec<VersionEntry>, String> {
+fn file_versions(
+    server_url: String,
+    email: String,
+    node_id: String,
+) -> Result<Vec<VersionEntry>, String> {
     use sync_client::ServerClient;
     let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
     let client = ServerClient::with_token(&server_url, token);
-    let vs = client.versions(&node_id).map_err(|e| format!("versions failed: {e}"))?;
+    let vs = client
+        .versions(&node_id)
+        .map_err(|e| format!("versions failed: {e}"))?;
     Ok(vs
         .versions
         .into_iter()
-        .map(|v| VersionEntry { version_id: v.version_id, size: v.size, created_at: v.created_at })
+        .map(|v| VersionEntry {
+            version_id: v.version_id,
+            size: v.size,
+            created_at: v.created_at,
+        })
         .collect())
 }
 
@@ -260,7 +277,9 @@ fn restore_version(
     use sync_client::ServerClient;
     let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
     let client = ServerClient::with_token(&server_url, token);
-    client.restore(&node_id, &version_id).map_err(|e| format!("restore failed: {e}"))?;
+    client
+        .restore(&node_id, &version_id)
+        .map_err(|e| format!("restore failed: {e}"))?;
     Ok("restored".into())
 }
 
@@ -283,7 +302,12 @@ struct ConflictOut {
 }
 
 fn side(s: sync_client::ConflictSide) -> ConflictSideOut {
-    ConflictSideOut { version_id: s.version_id, size: s.size, created_at: s.created_at, device_name: s.device_name }
+    ConflictSideOut {
+        version_id: s.version_id,
+        size: s.size,
+        created_at: s.created_at,
+        device_name: s.device_name,
+    }
 }
 
 /// Unresolved conflicts, with both sides' device + time + size, for the resolution prompt.
@@ -292,31 +316,51 @@ fn conflicts(server_url: String, email: String) -> Result<Vec<ConflictOut>, Stri
     use sync_client::ServerClient;
     let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
     let client = ServerClient::with_token(&server_url, token);
-    let cs = client.conflicts().map_err(|e| format!("conflicts failed: {e}"))?;
+    let cs = client
+        .conflicts()
+        .map_err(|e| format!("conflicts failed: {e}"))?;
     Ok(cs
         .conflicts
         .into_iter()
-        .map(|c| ConflictOut { node_id: c.node_id, name: c.name, current: c.current.map(side), incoming: c.incoming.map(side) })
+        .map(|c| ConflictOut {
+            node_id: c.node_id,
+            name: c.name,
+            current: c.current.map(side),
+            incoming: c.incoming.map(side),
+        })
         .collect())
 }
 
 /// Resolve a conflict: keep one version as current (the other stays in history).
 #[tauri::command]
-fn resolve_conflict_keep(server_url: String, email: String, node_id: String, version_id: String) -> Result<String, String> {
+fn resolve_conflict_keep(
+    server_url: String,
+    email: String,
+    node_id: String,
+    version_id: String,
+) -> Result<String, String> {
     use sync_client::ServerClient;
     let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
     let client = ServerClient::with_token(&server_url, token);
-    client.resolve_conflict_keep(&node_id, &version_id).map_err(|e| format!("resolve failed: {e}"))?;
+    client
+        .resolve_conflict_keep(&node_id, &version_id)
+        .map_err(|e| format!("resolve failed: {e}"))?;
     Ok("kept".into())
 }
 
 /// Resolve a conflict: keep both — the incoming side becomes a new sibling file.
 #[tauri::command]
-fn resolve_conflict_split(server_url: String, email: String, node_id: String) -> Result<String, String> {
+fn resolve_conflict_split(
+    server_url: String,
+    email: String,
+    node_id: String,
+) -> Result<String, String> {
     use sync_client::ServerClient;
     let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
     let client = ServerClient::with_token(&server_url, token);
-    client.resolve_conflict_split(&node_id).map_err(|e| format!("split failed: {e}"))?;
+    client
+        .resolve_conflict_split(&node_id)
+        .map_err(|e| format!("split failed: {e}"))?;
     Ok("split".into())
 }
 
@@ -345,7 +389,11 @@ fn maker_list_items(
 }
 
 #[tauri::command]
-fn maker_get_item(server_url: String, email: String, id: i64) -> Result<sync_client::ItemDetail, String> {
+fn maker_get_item(
+    server_url: String,
+    email: String,
+    id: i64,
+) -> Result<sync_client::ItemDetail, String> {
     let c = maker_client(&server_url, &email)?;
     c.get_item(id).map_err(|e| format!("open item failed: {e}"))
 }
@@ -357,7 +405,8 @@ fn maker_create_item(
     input: sync_client::ItemInput,
 ) -> Result<sync_client::ItemDetail, String> {
     let c = maker_client(&server_url, &email)?;
-    c.create_item(&input).map_err(|e| format!("create item failed: {e}"))
+    c.create_item(&input)
+        .map_err(|e| format!("create item failed: {e}"))
 }
 
 #[tauri::command]
@@ -368,13 +417,15 @@ fn maker_update_item(
     input: sync_client::ItemInput,
 ) -> Result<sync_client::ItemDetail, String> {
     let c = maker_client(&server_url, &email)?;
-    c.update_item(id, &input).map_err(|e| format!("update item failed: {e}"))
+    c.update_item(id, &input)
+        .map_err(|e| format!("update item failed: {e}"))
 }
 
 #[tauri::command]
 fn maker_delete_item(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
-    c.delete_item(id).map_err(|e| format!("delete item failed: {e}"))
+    c.delete_item(id)
+        .map_err(|e| format!("delete item failed: {e}"))
 }
 
 // -- file attachments --
@@ -387,27 +438,36 @@ fn maker_attach_file(
     input: sync_client::FileAttachmentInput,
 ) -> Result<sync_client::FileAttachment, String> {
     let c = maker_client(&server_url, &email)?;
-    c.attach_file(item_id, &input).map_err(|e| format!("attach failed: {e}"))
+    c.attach_file(item_id, &input)
+        .map_err(|e| format!("attach failed: {e}"))
 }
 
 #[tauri::command]
 fn maker_detach_file(server_url: String, email: String, attachment_id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
-    c.detach_file(attachment_id).map_err(|e| format!("detach failed: {e}"))
+    c.detach_file(attachment_id)
+        .map_err(|e| format!("detach failed: {e}"))
 }
 
 // -- tags & taggings --
 
 #[tauri::command]
-fn maker_tag_item(server_url: String, email: String, item_id: i64, name: String) -> Result<String, String> {
+fn maker_tag_item(
+    server_url: String,
+    email: String,
+    item_id: i64,
+    name: String,
+) -> Result<String, String> {
     let c = maker_client(&server_url, &email)?;
-    c.tag_item(item_id, &name).map_err(|e| format!("tag failed: {e}"))
+    c.tag_item(item_id, &name)
+        .map_err(|e| format!("tag failed: {e}"))
 }
 
 #[tauri::command]
 fn maker_untag(server_url: String, email: String, tagging_id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
-    c.untag(tagging_id).map_err(|e| format!("untag failed: {e}"))
+    c.untag(tagging_id)
+        .map_err(|e| format!("untag failed: {e}"))
 }
 
 #[tauri::command]
@@ -419,9 +479,13 @@ fn maker_list_tags(server_url: String, email: String) -> Result<Vec<sync_client:
 // -- collections --
 
 #[tauri::command]
-fn maker_list_collections(server_url: String, email: String) -> Result<Vec<sync_client::Collection>, String> {
+fn maker_list_collections(
+    server_url: String,
+    email: String,
+) -> Result<Vec<sync_client::Collection>, String> {
     let c = maker_client(&server_url, &email)?;
-    c.list_collections().map_err(|e| format!("list collections failed: {e}"))
+    c.list_collections()
+        .map_err(|e| format!("list collections failed: {e}"))
 }
 
 #[tauri::command]
@@ -474,9 +538,14 @@ fn maker_remove_from_collection(
 // -- tasks --
 
 #[tauri::command]
-fn maker_list_tasks(server_url: String, email: String, open_only: bool) -> Result<Vec<sync_client::Task>, String> {
+fn maker_list_tasks(
+    server_url: String,
+    email: String,
+    open_only: bool,
+) -> Result<Vec<sync_client::Task>, String> {
     let c = maker_client(&server_url, &email)?;
-    c.list_tasks(open_only).map_err(|e| format!("list tasks failed: {e}"))
+    c.list_tasks(open_only)
+        .map_err(|e| format!("list tasks failed: {e}"))
 }
 
 #[tauri::command]
@@ -486,7 +555,8 @@ fn maker_create_task(
     input: sync_client::TaskInput,
 ) -> Result<sync_client::Task, String> {
     let c = maker_client(&server_url, &email)?;
-    c.create_task(&input).map_err(|e| format!("create task failed: {e}"))
+    c.create_task(&input)
+        .map_err(|e| format!("create task failed: {e}"))
 }
 
 #[tauri::command]
@@ -497,13 +567,15 @@ fn maker_update_task(
     input: sync_client::TaskInput,
 ) -> Result<sync_client::Task, String> {
     let c = maker_client(&server_url, &email)?;
-    c.update_task(id, &input).map_err(|e| format!("update task failed: {e}"))
+    c.update_task(id, &input)
+        .map_err(|e| format!("update task failed: {e}"))
 }
 
 #[tauri::command]
 fn maker_delete_task(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
-    c.delete_task(id).map_err(|e| format!("delete task failed: {e}"))
+    c.delete_task(id)
+        .map_err(|e| format!("delete task failed: {e}"))
 }
 
 #[tauri::command]

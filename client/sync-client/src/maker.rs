@@ -135,7 +135,10 @@ pub struct ItemInput {
 impl ItemInput {
     /// Convenience: a fresh item with just a title (the only required field).
     pub fn new(title: impl Into<String>) -> Self {
-        Self { title: Some(title.into()), ..Default::default() }
+        Self {
+            title: Some(title.into()),
+            ..Default::default()
+        }
     }
 }
 
@@ -267,7 +270,10 @@ pub struct TaskInput {
 impl TaskInput {
     /// Convenience: a fresh standalone task with just a title.
     pub fn new(title: impl Into<String>) -> Self {
-        Self { title: Some(title.into()), ..Default::default() }
+        Self {
+            title: Some(title.into()),
+            ..Default::default()
+        }
     }
 }
 
@@ -342,7 +348,10 @@ impl ServerClient {
     /// Attach a synced file (by `node_id`) to an item with a role. Returns the new attachment.
     pub fn attach_file(&self, item_id: i64, input: &FileAttachmentInput) -> Result<FileAttachment> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/maker/items/{item_id}/file_attachments"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/maker/items/{item_id}/file_attachments"))),
+            )?
             .json(&serde_json::json!({ "file_attachment": input }))
             .send()?;
         Self::json(resp)
@@ -351,7 +360,10 @@ impl ServerClient {
     /// Detach a file from its item (shallow route — keyed by the *attachment* id).
     pub fn detach_file(&self, attachment_id: i64) -> Result<()> {
         let resp = self
-            .authed(self.http.delete(self.url(&format!("/v1/maker/file_attachments/{attachment_id}"))))?
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/v1/maker/file_attachments/{attachment_id}"))),
+            )?
             .send()?;
         Self::ok_no_content(resp)
     }
@@ -362,7 +374,10 @@ impl ServerClient {
     /// normalized tag name the server stored.
     pub fn tag_item(&self, item_id: i64, name: &str) -> Result<String> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/maker/items/{item_id}/taggings"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/maker/items/{item_id}/taggings"))),
+            )?
             .json(&serde_json::json!({ "name": name }))
             .send()?;
         let r: TaggingResponse = Self::json(resp)?;
@@ -372,14 +387,19 @@ impl ServerClient {
     /// Remove a tagging (shallow route — keyed by the *tagging* id, not the tag id).
     pub fn untag(&self, tagging_id: i64) -> Result<()> {
         let resp = self
-            .authed(self.http.delete(self.url(&format!("/v1/maker/taggings/{tagging_id}"))))?
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/v1/maker/taggings/{tagging_id}"))),
+            )?
             .send()?;
         Self::ok_no_content(resp)
     }
 
     /// All of the user's tags (for the tag filter chips / autocomplete).
     pub fn list_tags(&self) -> Result<Vec<Tag>> {
-        let resp = self.authed(self.http.get(self.url("/v1/maker/tags")))?.send()?;
+        let resp = self
+            .authed(self.http.get(self.url("/v1/maker/tags")))?
+            .send()?;
         let r: TagsResponse = Self::json(resp)?;
         Ok(r.tags)
     }
@@ -388,7 +408,9 @@ impl ServerClient {
 
     /// All of the user's collections (name + item_count), alphabetically.
     pub fn list_collections(&self) -> Result<Vec<Collection>> {
-        let resp = self.authed(self.http.get(self.url("/v1/maker/collections")))?.send()?;
+        let resp = self
+            .authed(self.http.get(self.url("/v1/maker/collections")))?
+            .send()?;
         let r: CollectionsResponse = Self::json(resp)?;
         Ok(r.collections)
     }
@@ -397,7 +419,9 @@ impl ServerClient {
     pub fn create_collection(&self, name: &str, description: Option<&str>) -> Result<Collection> {
         let resp = self
             .authed(self.http.post(self.url("/v1/maker/collections")))?
-            .json(&serde_json::json!({ "collection": { "name": name, "description": description } }))
+            .json(
+                &serde_json::json!({ "collection": { "name": name, "description": description } }),
+            )
             .send()?;
         Self::json(resp)
     }
@@ -405,7 +429,10 @@ impl ServerClient {
     /// The items in a collection (id/title/item_type each).
     pub fn collection_items(&self, collection_id: i64) -> Result<Vec<CollectionItem>> {
         let resp = self
-            .authed(self.http.get(self.url(&format!("/v1/maker/collections/{collection_id}/items"))))?
+            .authed(
+                self.http
+                    .get(self.url(&format!("/v1/maker/collections/{collection_id}/items"))),
+            )?
             .send()?;
         let r: CollectionItemsResponse = Self::json(resp)?;
         Ok(r.items)
@@ -414,7 +441,10 @@ impl ServerClient {
     /// Add an item to a collection (idempotent server-side — `find_or_create_by`).
     pub fn add_to_collection(&self, collection_id: i64, item_id: i64) -> Result<()> {
         let resp = self
-            .authed(self.http.post(self.url(&format!("/v1/maker/collections/{collection_id}/items"))))?
+            .authed(
+                self.http
+                    .post(self.url(&format!("/v1/maker/collections/{collection_id}/items"))),
+            )?
             .json(&serde_json::json!({ "item_id": item_id }))
             .send()?;
         Self::ok_no_content(resp)
@@ -535,16 +565,16 @@ mod tests {
     fn input_structs_deserialize_as_tauri_args() {
         // These arrive FROM the JS frontend as Tauri command args, so they must
         // `Deserialize` (the camelCase↔snake_case is handled by Tauri; serde sees snake_case).
-        let item: ItemInput = serde_json::from_str(
-            r#"{"title":"Vase","item_type":"model_3d","favorited":true}"#,
-        )
-        .unwrap();
+        let item: ItemInput =
+            serde_json::from_str(r#"{"title":"Vase","item_type":"model_3d","favorited":true}"#)
+                .unwrap();
         assert_eq!(item.title.as_deref(), Some("Vase"));
         assert_eq!(item.item_type.as_deref(), Some("model_3d"));
         assert_eq!(item.favorited, Some(true));
 
         let att: FileAttachmentInput =
-            serde_json::from_str(r#"{"node_id":"n-1","role":"model","label":"body.step"}"#).unwrap();
+            serde_json::from_str(r#"{"node_id":"n-1","role":"model","label":"body.step"}"#)
+                .unwrap();
         assert_eq!(att.node_id, "n-1");
         assert_eq!(att.role.as_deref(), Some("model"));
 
@@ -568,7 +598,10 @@ mod tests {
     #[test]
     fn item_input_omits_none_fields() {
         // A partial update sends only the keys it sets — Rails leaves the rest untouched.
-        let input = ItemInput { favorited: Some(true), ..Default::default() };
+        let input = ItemInput {
+            favorited: Some(true),
+            ..Default::default()
+        };
         let v = serde_json::to_value(&input).unwrap();
         assert_eq!(v, serde_json::json!({ "favorited": true }));
 
@@ -599,9 +632,16 @@ mod tests {
 
     #[test]
     fn file_attachment_input_omits_optional_fields() {
-        let input = FileAttachmentInput { node_id: "node-abc".into(), role: Some("model".into()), ..Default::default() };
+        let input = FileAttachmentInput {
+            node_id: "node-abc".into(),
+            role: Some("model".into()),
+            ..Default::default()
+        };
         let v = serde_json::to_value(&input).unwrap();
-        assert_eq!(v, serde_json::json!({ "node_id": "node-abc", "role": "model" }));
+        assert_eq!(
+            v,
+            serde_json::json!({ "node_id": "node-abc", "role": "model" })
+        );
     }
 
     #[test]
@@ -637,7 +677,8 @@ mod tests {
         assert_eq!(cols.collections[0].item_count, 3);
 
         let items: CollectionItemsResponse =
-            serde_json::from_str(r#"{"items":[{"id":9,"title":"Knob","item_type":"cad"}]}"#).unwrap();
+            serde_json::from_str(r#"{"items":[{"id":9,"title":"Knob","item_type":"cad"}]}"#)
+                .unwrap();
         assert_eq!(items.items.len(), 1);
         assert_eq!(items.items[0].title, "Knob");
     }
@@ -678,7 +719,13 @@ mod tests {
         );
 
         // A status-only patch (move on the board) sends just `status`.
-        let patch = TaskInput { status: Some("doing".into()), ..Default::default() };
-        assert_eq!(serde_json::to_value(&patch).unwrap(), serde_json::json!({ "status": "doing" }));
+        let patch = TaskInput {
+            status: Some("doing".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            serde_json::json!({ "status": "doing" })
+        );
     }
 }

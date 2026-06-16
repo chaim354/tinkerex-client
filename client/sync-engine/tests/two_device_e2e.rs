@@ -48,7 +48,9 @@ macro_rules! server_url {
         match std::env::var("SYNC_IT_SERVER_URL").or_else(|_| std::env::var("SERVER_URL")) {
             Ok(u) => u,
             Err(_) => {
-                eprintln!("SKIPPED (set SYNC_IT_SERVER_URL or SERVER_URL to run the two-device e2e)");
+                eprintln!(
+                    "SKIPPED (set SYNC_IT_SERVER_URL or SERVER_URL to run the two-device e2e)"
+                );
                 return;
             }
         }
@@ -57,13 +59,24 @@ macro_rules! server_url {
 
 /// Small chunks so even a few-KB file is multi-chunk → dedup + per-chunk transfer get real
 /// coverage (same as integration.rs).
-const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+const TINY: ChunkConfig = ChunkConfig {
+    min: 64,
+    avg: 256,
+    max: 1024,
+};
 
 fn uniq() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), n)
+    format!(
+        "{:x}-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        n
+    )
 }
 
 /// Deterministic pseudo-random bytes (an LCG) — low self-similarity, so a file made of these is
@@ -73,7 +86,9 @@ fn prng(seed: u64, n: usize) -> Vec<u8> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as u8
         })
         .collect()
@@ -96,7 +111,11 @@ impl DeviceCtx {
         let provider =
             SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir).unwrap()), TINY).unwrap();
         let client = ServerClient::with_token(url, token);
-        DeviceCtx { name: name.into(), provider, client }
+        DeviceCtx {
+            name: name.into(),
+            provider,
+            client,
+        }
     }
 
     /// The daemon's loop body: push local outbox, then pull + apply the changelog delta. This
@@ -124,7 +143,11 @@ impl DeviceCtx {
         SyncEngine::hydrate(&self.provider, &self.client, io, &node_id)
             .unwrap_or_else(|e| panic!("{} hydrate {node_id}: {e}", self.name));
         let size = self.provider.getattr(ino).unwrap().size;
-        if size == 0 { Vec::new() } else { self.provider.read(ino, 0, size as u32).unwrap() }
+        if size == 0 {
+            Vec::new()
+        } else {
+            self.provider.read(ino, 0, size as u32).unwrap()
+        }
     }
 
     fn node_id(&self, ino: u64) -> String {
@@ -151,10 +174,13 @@ fn register_and_pair(url: &str) -> (DeviceCtx, DeviceCtx, SharedDirIO) {
     // Brand-new device B enrolls by logging in with the SAME account credentials (the Dropbox
     // model — each device authenticates independently; no pairing codes).
     let mut cb = ServerClient::new(url);
-    let reg_b: RegisterResponse = cb.device_login(&email, password, "device-B").expect("B logs in");
+    let reg_b: RegisterResponse = cb
+        .device_login(&email, password, "device-B")
+        .expect("B logs in");
     let b = DeviceCtx::new("B", url, reg_b.device_token);
 
-    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("e2e-cloud-{}", uniq()))).unwrap();
+    let cloud =
+        SharedDirIO::new(std::env::temp_dir().join(format!("e2e-cloud-{}", uniq()))).unwrap();
     (a, b, cloud)
 }
 
@@ -174,16 +200,30 @@ fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
     a.provider.write(af.ino, 0, &v1).unwrap();
     a.provider.flush(af.ino).unwrap();
     a.sync_tick(&cloud); // outbox → server + chunk store
-    assert!(a.provider.outbox_list().unwrap().is_empty(), "A's outbox drained after push");
+    assert!(
+        a.provider.outbox_list().unwrap().is_empty(),
+        "A's outbox drained after push"
+    );
 
     // --- 2. Device B's daemon pulls + hydrates → byte-for-byte identical.
     b.initial_sync();
-    let b_proj = b.provider.lookup(ROOT_INO, "Projects").expect("B sees Projects");
-    let bf = b.provider.lookup(b_proj.ino, "lamp.scad").expect("B sees lamp.scad");
-    assert_eq!(b.read_hydrated(bf.ino, &cloud), v1, "B reads A's v1 byte-for-byte");
+    let b_proj = b
+        .provider
+        .lookup(ROOT_INO, "Projects")
+        .expect("B sees Projects");
+    let bf = b
+        .provider
+        .lookup(b_proj.ino, "lamp.scad")
+        .expect("B sees lamp.scad");
+    assert_eq!(
+        b.read_hydrated(bf.ino, &cloud),
+        v1,
+        "B reads A's v1 byte-for-byte"
+    );
 
     // --- 3. Device B edits the file through its provider and pushes.
-    let v2: Vec<u8> = b"// v2: B widened the base\nmodule lamp(){ cube([20,20,10]); }\n".repeat(200);
+    let v2: Vec<u8> =
+        b"// v2: B widened the base\nmodule lamp(){ cube([20,20,10]); }\n".repeat(200);
     b.provider.truncate(bf.ino, 0).unwrap();
     b.provider.write(bf.ino, 0, &v2).unwrap();
     b.provider.flush(bf.ino).unwrap();
@@ -191,10 +231,17 @@ fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
 
     // --- 4. Device A's daemon pulls → A sees B's edit byte-for-byte.
     a.sync_tick(&cloud);
-    assert_eq!(a.read_hydrated(af.ino, &cloud), v2, "A reads B's v2 edit byte-for-byte");
+    assert_eq!(
+        a.read_hydrated(af.ino, &cloud),
+        v2,
+        "A reads B's v2 edit byte-for-byte"
+    );
 
     // Sanity: no spurious conflict (these were sequential, each based on the current version).
-    assert!(a.client.conflicts().unwrap().conflicts.is_empty(), "clean sequential edits, no conflict");
+    assert!(
+        a.client.conflicts().unwrap().conflicts.is_empty(),
+        "clean sequential edits, no conflict"
+    );
 }
 
 // ============================================================================================
@@ -213,18 +260,37 @@ fn new_files_and_nested_dirs_propagate() {
     a.provider.write(top.ino, 0, b"# Maker library\n").unwrap();
     a.provider.flush(top.ino).unwrap();
     let deep = a.provider.create(sub.ino, "plan.txt").unwrap();
-    a.provider.write(deep.ino, 0, b"Q3 plan: ship sync\n").unwrap();
+    a.provider
+        .write(deep.ino, 0, b"Q3 plan: ship sync\n")
+        .unwrap();
     a.provider.flush(deep.ino).unwrap();
     a.sync_tick(&cloud);
 
     // B converges on the whole structure.
     b.initial_sync();
     let b_docs = b.provider.lookup(ROOT_INO, "Docs").expect("B has Docs");
-    let b_sub = b.provider.lookup(b_docs.ino, "2026").expect("B has Docs/2026");
-    let b_deep = b.provider.lookup(b_sub.ino, "plan.txt").expect("B has Docs/2026/plan.txt");
-    let b_top = b.provider.lookup(ROOT_INO, "README.md").expect("B has README.md");
-    assert_eq!(b.read_hydrated(b_deep.ino, &cloud), b"Q3 plan: ship sync\n", "nested file content");
-    assert_eq!(b.read_hydrated(b_top.ino, &cloud), b"# Maker library\n", "top-level file content");
+    let b_sub = b
+        .provider
+        .lookup(b_docs.ino, "2026")
+        .expect("B has Docs/2026");
+    let b_deep = b
+        .provider
+        .lookup(b_sub.ino, "plan.txt")
+        .expect("B has Docs/2026/plan.txt");
+    let b_top = b
+        .provider
+        .lookup(ROOT_INO, "README.md")
+        .expect("B has README.md");
+    assert_eq!(
+        b.read_hydrated(b_deep.ino, &cloud),
+        b"Q3 plan: ship sync\n",
+        "nested file content"
+    );
+    assert_eq!(
+        b.read_hydrated(b_top.ino, &cloud),
+        b"# Maker library\n",
+        "top-level file content"
+    );
 }
 
 // ============================================================================================
@@ -242,13 +308,19 @@ fn delete_propagates_a_to_b() {
     a.sync_tick(&cloud);
 
     b.initial_sync();
-    assert!(b.provider.lookup(ROOT_INO, "scratch.txt").is_ok(), "B has the file before the delete");
+    assert!(
+        b.provider.lookup(ROOT_INO, "scratch.txt").is_ok(),
+        "B has the file before the delete"
+    );
 
     // A deletes; B's next tick applies the deletion.
     a.provider.unlink(ROOT_INO, "scratch.txt").unwrap();
     a.sync_tick(&cloud);
     b.sync_tick(&cloud);
-    assert!(b.provider.lookup(ROOT_INO, "scratch.txt").is_err(), "delete converged on B");
+    assert!(
+        b.provider.lookup(ROOT_INO, "scratch.txt").is_err(),
+        "delete converged on B"
+    );
 }
 
 // ============================================================================================
@@ -270,16 +342,31 @@ fn rename_and_move_propagate_a_to_b() {
     b.initial_sync();
     let b_inbox = b.provider.lookup(ROOT_INO, "Inbox").unwrap().ino;
     let b_archive = b.provider.lookup(ROOT_INO, "Archive").unwrap().ino;
-    assert!(b.provider.lookup(b_inbox, "draft.txt").is_ok(), "B has Inbox/draft.txt initially");
+    assert!(
+        b.provider.lookup(b_inbox, "draft.txt").is_ok(),
+        "B has Inbox/draft.txt initially"
+    );
 
     // A renames-and-moves Inbox/draft.txt → Archive/final.txt.
-    a.provider.rename(inbox.ino, "draft.txt", archive.ino, "final.txt").unwrap();
+    a.provider
+        .rename(inbox.ino, "draft.txt", archive.ino, "final.txt")
+        .unwrap();
     a.sync_tick(&cloud);
     b.sync_tick(&cloud);
 
-    let moved = b.provider.lookup(b_archive, "final.txt").expect("B sees the file at the new path");
-    assert_eq!(b.read_hydrated(moved.ino, &cloud), b"keep me", "content preserved across move");
-    assert!(b.provider.lookup(b_inbox, "draft.txt").is_err(), "no stale copy at the old path");
+    let moved = b
+        .provider
+        .lookup(b_archive, "final.txt")
+        .expect("B sees the file at the new path");
+    assert_eq!(
+        b.read_hydrated(moved.ino, &cloud),
+        b"keep me",
+        "content preserved across move"
+    );
+    assert!(
+        b.provider.lookup(b_inbox, "draft.txt").is_err(),
+        "no stale copy at the old path"
+    );
 }
 
 // ============================================================================================
@@ -294,7 +381,11 @@ fn large_file_edit_dedups_unchanged_chunks() {
     let (a, b, _unused) = register_and_pair(&url);
     let cloud_path = std::env::temp_dir().join(format!("e2e-dedup-cloud-{}", uniq()));
     let cloud = SharedDirIO::new(&cloud_path).unwrap();
-    let count = || std::fs::read_dir(&cloud_path).map(|d| d.count()).unwrap_or(0);
+    let count = || {
+        std::fs::read_dir(&cloud_path)
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
 
     // A pushes a large (multi-chunk) file: a stable head, then a tail we'll edit. Use
     // low-self-similarity (deterministic PRNG) bytes so the file is genuinely many *distinct*
@@ -310,7 +401,10 @@ fn large_file_edit_dedups_unchanged_chunks() {
     a.provider.flush(f.ino).unwrap();
     a.sync_tick(&cloud);
     let chunks_after_v1 = count();
-    assert!(chunks_after_v1 > 1, "a >chunk-size file lands as multiple chunks ({chunks_after_v1})");
+    assert!(
+        chunks_after_v1 > 1,
+        "a >chunk-size file lands as multiple chunks ({chunks_after_v1})"
+    );
 
     // B reads v1.
     b.initial_sync();
@@ -342,7 +436,11 @@ fn large_file_edit_dedups_unchanged_chunks() {
 
     // B converges on v2, byte-for-byte (it only hydrates the chunks it's missing).
     b.sync_tick(&cloud);
-    assert_eq!(b.read_hydrated(bf.ino, &cloud), v2, "B reads v2 after a dedup'd edit");
+    assert_eq!(
+        b.read_hydrated(bf.ino, &cloud),
+        v2,
+        "B reads v2 after a dedup'd edit"
+    );
 }
 
 // ============================================================================================
@@ -361,7 +459,9 @@ fn version_history_and_restore_converge() {
     a.sync_tick(&cloud);
 
     a.provider.truncate(f.ino, 0).unwrap();
-    a.provider.write(f.ino, 0, b"spec v2: revised heading").unwrap();
+    a.provider
+        .write(f.ino, 0, b"spec v2: revised heading")
+        .unwrap();
     a.provider.flush(f.ino).unwrap();
     a.sync_tick(&cloud);
 
@@ -370,11 +470,23 @@ fn version_history_and_restore_converge() {
     // B converges on v2.
     b.initial_sync();
     let bf = b.provider.lookup(ROOT_INO, "spec.md").unwrap();
-    assert_eq!(b.read_hydrated(bf.ino, &cloud), b"spec v2: revised heading", "B has v2");
+    assert_eq!(
+        b.read_hydrated(bf.ino, &cloud),
+        b"spec v2: revised heading",
+        "B has v2"
+    );
 
     // The app's `file_versions` command: history newest-first, two entries.
-    let versions = a.client.versions(&node_id).expect("version history").versions;
-    assert!(versions.len() >= 2, "two versions in history (got {})", versions.len());
+    let versions = a
+        .client
+        .versions(&node_id)
+        .expect("version history")
+        .versions;
+    assert!(
+        versions.len() >= 2,
+        "two versions in history (got {})",
+        versions.len()
+    );
 
     // Restore to the OLDEST (v1) — the app's `restore_version` command. This mints a NEW version
     // reusing v1's manifest (lossless), which propagates like any edit.
@@ -421,24 +533,53 @@ fn offline_divergent_edits_conflict_then_resolve() {
 
     // The server flags a conflict (both versions kept) instead of silently dropping B's edit.
     let conflicts = b.client.conflicts().expect("conflicts").conflicts;
-    assert_eq!(conflicts.len(), 1, "B's stale-based edit raised exactly one conflict");
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "B's stale-based edit raised exactly one conflict"
+    );
     let c = &conflicts[0];
     assert_eq!(c.name.as_deref(), Some("design.scad"));
-    assert!(c.current.is_some() && c.incoming.is_some(), "both sides reported (device + time + size)");
+    assert!(
+        c.current.is_some() && c.incoming.is_some(),
+        "both sides reported (device + time + size)"
+    );
 
     // Resolve by SPLIT (the app's `resolve_conflict_split`): incoming side becomes a sibling.
-    let split = b.client.resolve_conflict_split(&c.node_id).expect("split-resolve");
-    assert!(!split.split_node_id.is_empty(), "split created a new sibling node");
-    assert!(b.client.conflicts().unwrap().conflicts.is_empty(), "conflict cleared after split");
+    let split = b
+        .client
+        .resolve_conflict_split(&c.node_id)
+        .expect("split-resolve");
+    assert!(
+        !split.split_node_id.is_empty(),
+        "split created a new sibling node"
+    );
+    assert!(
+        b.client.conflicts().unwrap().conflicts.is_empty(),
+        "conflict cleared after split"
+    );
 
     // Both devices converge on the resolved tree: the original + the split sibling both present.
     a.sync_tick(&cloud);
     b.sync_tick(&cloud);
     let count_scad = |d: &DeviceCtx| {
-        d.provider.readdir(ROOT_INO).unwrap().iter().filter(|e| e.name.contains("design")).count()
+        d.provider
+            .readdir(ROOT_INO)
+            .unwrap()
+            .iter()
+            .filter(|e| e.name.contains("design"))
+            .count()
     };
-    assert_eq!(count_scad(&a), 2, "A sees the original + the conflicted-copy sibling");
-    assert_eq!(count_scad(&b), 2, "B sees the original + the conflicted-copy sibling");
+    assert_eq!(
+        count_scad(&a),
+        2,
+        "A sees the original + the conflicted-copy sibling"
+    );
+    assert_eq!(
+        count_scad(&b),
+        2,
+        "B sees the original + the conflicted-copy sibling"
+    );
 }
 
 // ============================================================================================
@@ -477,7 +618,12 @@ fn cross_device_lock_is_visible_to_the_other_device() {
 /// A chunk transport that's "offline": every fetch fails.
 struct OfflineIO;
 impl ChunkIO for OfflineIO {
-    fn put(&self, hash: &str, _urls: &HashMap<String, String>, _bytes: Vec<u8>) -> sync_engine::Result<()> {
+    fn put(
+        &self,
+        hash: &str,
+        _urls: &HashMap<String, String>,
+        _bytes: Vec<u8>,
+    ) -> sync_engine::Result<()> {
         Err(sync_engine::Error::NoUrl(format!("offline: {hash}")))
     }
     fn get(&self, hash: &str, _url: Option<&str>) -> sync_engine::Result<Vec<u8>> {
@@ -499,12 +645,20 @@ fn hydrated_file_reads_offline_on_b() {
     // B hydrates ONLINE (chunks land in B's local cache).
     b.initial_sync();
     let bf = b.provider.lookup(ROOT_INO, "offline.bin").unwrap();
-    assert_eq!(b.read_hydrated(bf.ino, &cloud), body, "online read after hydrate");
+    assert_eq!(
+        b.read_hydrated(bf.ino, &cloud),
+        body,
+        "online read after hydrate"
+    );
 
     // Now go OFFLINE: re-hydrate must touch nothing (all cached) and the read still serves bytes.
     let node_id = b.node_id(bf.ino);
     SyncEngine::hydrate(&b.provider, &b.client, &OfflineIO, &node_id)
         .expect("offline re-hydrate is a no-op (everything cached)");
     let size = b.provider.getattr(bf.ino).unwrap().size;
-    assert_eq!(b.provider.read(bf.ino, 0, size as u32).unwrap(), body, "reads offline from local cache");
+    assert_eq!(
+        b.provider.read(bf.ino, 0, size as u32).unwrap(),
+        body,
+        "reads offline from local cache"
+    );
 }

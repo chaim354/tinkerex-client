@@ -17,7 +17,10 @@ use fs_provider::Provider;
 fn flush_sets_a_nonzero_mtime() {
     let p = provider();
     let ino = write_file(&p, ROOT, "f.bin", b"hello");
-    assert!(p.getattr(ino).unwrap().mtime > 0, "a committed file carries a real mtime, not 0");
+    assert!(
+        p.getattr(ino).unwrap().mtime > 0,
+        "a committed file carries a real mtime, not 0"
+    );
 }
 
 #[test]
@@ -36,17 +39,27 @@ fn remote_update_serves_fresh_content_and_carries_real_mtime() {
 
     // A overwrites with different content (truncate+write → no stale tail).
     a.truncate(a_ino, 0).unwrap();
-    a.write(a_ino, 0, b"a wholly different second version").unwrap();
+    a.write(a_ino, 0, b"a wholly different second version")
+        .unwrap();
     a.flush(a_ino).unwrap();
     let a_mtime = a.getattr(a_ino).unwrap().mtime; // A's real edit time
     replicate_tree(&a, &b); // B's pull applies the new manifest in place
 
-    assert_ne!(manifest1, node_named(&b, "doc.txt").manifest_id, "new content → new manifest");
+    assert_ne!(
+        manifest1,
+        node_named(&b, "doc.txt").manifest_id,
+        "new content → new manifest"
+    );
     assert_eq!(
-        b.getattr(b_ino).unwrap().mtime, a_mtime,
+        b.getattr(b_ino).unwrap().mtime,
+        a_mtime,
         "B carries A's real edit mtime, not B's sync time"
     );
-    assert_eq!(read_all(&b, b_ino), b"a wholly different second version", "B reads fresh, not stale");
+    assert_eq!(
+        read_all(&b, b_ino),
+        b"a wholly different second version",
+        "B reads fresh, not stale"
+    );
 }
 
 #[test]
@@ -61,13 +74,22 @@ fn pulled_node_keeps_the_source_mtime_not_now() {
     // 2001-09-09T01:46:40Z in unix nanoseconds — far from any "now".
     let old_mtime: i64 = 1_000_000_000 * 1_000_000_000;
     a.set_mtime(a_ino, old_mtime).unwrap();
-    assert_eq!(a.getattr(a_ino).unwrap().mtime, old_mtime, "set_mtime sticks locally");
-    assert_eq!(node_named(&a, "old.txt").mtime, old_mtime, "real mtime is exported for sync");
+    assert_eq!(
+        a.getattr(a_ino).unwrap().mtime,
+        old_mtime,
+        "set_mtime sticks locally"
+    );
+    assert_eq!(
+        node_named(&a, "old.txt").mtime,
+        old_mtime,
+        "real mtime is exported for sync"
+    );
 
     replicate_tree(&a, &b);
     let b_ino = b.lookup(ROOT, "old.txt").unwrap().ino;
     assert_eq!(
-        b.getattr(b_ino).unwrap().mtime, old_mtime,
+        b.getattr(b_ino).unwrap().mtime,
+        old_mtime,
         "B sees the source mtime verbatim — not the sync time"
     );
 }
@@ -80,23 +102,39 @@ fn apply_remote_reports_content_change_for_cache_invalidation() {
     let a_ino = write_file(&a, ROOT, "doc.txt", b"v1");
     // First apply: brand-new node on B → nothing cached → no invalidation needed.
     let first = b.apply_remote(&node_named(&a, "doc.txt")).unwrap();
-    assert!(!first.content_changed, "a new node has nothing cached to invalidate");
-    assert!(first.inserted, "a brand-new node on B → a fresh INSERT (create a placeholder)");
+    assert!(
+        !first.content_changed,
+        "a new node has nothing cached to invalidate"
+    );
+    assert!(
+        first.inserted,
+        "a brand-new node on B → a fresh INSERT (create a placeholder)"
+    );
     let b_ino = b.lookup(ROOT, "doc.txt").unwrap().ino;
     assert_eq!(first.ino, b_ino, "outcome carries the local inode");
 
     // Re-apply the SAME content (metadata-only churn) → not a content change.
     let same = b.apply_remote(&node_named(&a, "doc.txt")).unwrap();
     assert!(!same.content_changed, "same manifest → no invalidation");
-    assert!(!same.inserted, "the node already exists → an UPDATE, not an INSERT");
+    assert!(
+        !same.inserted,
+        "the node already exists → an UPDATE, not an INSERT"
+    );
 
     // A overwrites; the new manifest differs → existing inode must be invalidated.
     a.truncate(a_ino, 0).unwrap();
-    a.write(a_ino, 0, b"a different, longer second version").unwrap();
+    a.write(a_ino, 0, b"a different, longer second version")
+        .unwrap();
     a.flush(a_ino).unwrap();
     let changed = b.apply_remote(&node_named(&a, "doc.txt")).unwrap();
-    assert!(changed.content_changed, "new manifest on an existing inode → invalidate");
-    assert!(!changed.inserted, "a content change to an existing node is not an insert");
+    assert!(
+        changed.content_changed,
+        "new manifest on an existing inode → invalidate"
+    );
+    assert!(
+        !changed.inserted,
+        "a content change to an existing node is not an insert"
+    );
     assert_eq!(changed.ino, b_ino, "same inode, repointed");
 }
 
@@ -109,12 +147,24 @@ fn mode_is_preserved_set_and_synced() {
     assert_eq!(a.getattr(ino).unwrap().mode, 0o644, "default file mode");
 
     a.set_mode(ino, 0o755).unwrap();
-    assert_eq!(a.getattr(ino).unwrap().mode, 0o755, "chmod +x sticks locally");
-    assert_eq!(node_named(&a, "build.sh").mode, 0o755, "mode is exported for sync");
+    assert_eq!(
+        a.getattr(ino).unwrap().mode,
+        0o755,
+        "chmod +x sticks locally"
+    );
+    assert_eq!(
+        node_named(&a, "build.sh").mode,
+        0o755,
+        "mode is exported for sync"
+    );
 
     replicate_tree(&a, &b);
     let b_ino = b.lookup(ROOT, "build.sh").unwrap().ino;
-    assert_eq!(b.getattr(b_ino).unwrap().mode, 0o755, "executable bit synced to device B");
+    assert_eq!(
+        b.getattr(b_ino).unwrap().mode,
+        0o755,
+        "executable bit synced to device B"
+    );
 }
 
 #[test]
@@ -125,13 +175,18 @@ fn mode_survives_a_reopen() {
     let chunks = dir.path().join("chunks");
     std::fs::create_dir_all(&chunks).unwrap();
     {
-        let p = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
+        let p =
+            SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
         let ino = write_file(&p, ROOT, "run", b"x");
         p.set_mode(ino, 0o755).unwrap();
     }
     let p2 = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
     let ino = p2.lookup(ROOT, "run").unwrap().ino;
-    assert_eq!(p2.getattr(ino).unwrap().mode, 0o755, "mode persists across restart");
+    assert_eq!(
+        p2.getattr(ino).unwrap().mode,
+        0o755,
+        "mode persists across restart"
+    );
 }
 
 #[test]
@@ -147,9 +202,16 @@ fn ingest_bytes_replaces_content_and_enqueues_sync() {
 
     p.ingest_bytes(ino, b"shorter").unwrap();
 
-    assert_eq!(read_all(&p, ino), b"shorter", "content replaced, no stale tail");
+    assert_eq!(
+        read_all(&p, ino),
+        b"shorter",
+        "content replaced, no stale tail"
+    );
     assert_eq!(p.getattr(ino).unwrap().size, 7);
-    assert!(p.getattr(ino).unwrap().mtime >= m1, "mtime advances on ingest");
+    assert!(
+        p.getattr(ino).unwrap().mtime >= m1,
+        "mtime advances on ingest"
+    );
     assert_eq!(
         p.outbox_list().unwrap(),
         vec![(node_id, "upsert".to_string())],
@@ -170,7 +232,10 @@ fn bind_library_wipes_a_different_librarys_stale_state() {
     p.set_cursor(42).unwrap();
 
     // First bind → no prior library tag, but there's data → reports a wipe and clears it.
-    assert!(p.bind_library(1001).unwrap(), "data present, no tag → wiped to adopt the library");
+    assert!(
+        p.bind_library(1001).unwrap(),
+        "data present, no tag → wiped to adopt the library"
+    );
     assert!(p.export_tree().unwrap().is_empty(), "tree wiped");
     assert_eq!(p.cursor().unwrap(), 0, "cursor reset");
 

@@ -21,7 +21,12 @@ fn main() {
     use sync_engine::{Daemon, DaemonConfig};
 
     fn findmnt(path: &str) -> bool {
-        match Command::new("findmnt").arg("--noheadings").arg("--target").arg(path).output() {
+        match Command::new("findmnt")
+            .arg("--noheadings")
+            .arg("--target")
+            .arg(path)
+            .output()
+        {
             Ok(out) => {
                 out.status.success()
                     && String::from_utf8_lossy(&out.stdout)
@@ -45,7 +50,10 @@ fn main() {
         "http://127.0.0.1:9".to_string(),
         "smoke-token".to_string(),
     );
-    let cfg = DaemonConfig { poll: Duration::from_millis(500), ..cfg };
+    let cfg = DaemonConfig {
+        poll: Duration::from_millis(500),
+        ..cfg
+    };
 
     eprintln!("SMOKE: Daemon::start at {mnt_s} (dead server)…");
     let daemon = match Daemon::start(cfg) {

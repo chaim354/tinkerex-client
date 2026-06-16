@@ -13,7 +13,9 @@ use sync_engine::{PresignedIO, SyncEngine};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let server = args.next().expect("usage: push_update <server> <token> <filename> <content…>");
+    let server = args
+        .next()
+        .expect("usage: push_update <server> <token> <filename> <content…>");
     let token = args.next().expect("missing device token");
     let name = args.next().expect("missing filename");
     let content: String = args.collect::<Vec<_>>().join(" ");
@@ -25,11 +27,15 @@ fn main() {
     let tag = std::process::id();
     let db = std::env::temp_dir().join(format!("maker-pushupd-{tag}.db"));
     let chunks = std::env::temp_dir().join(format!("maker-pushupd-{tag}-chunks"));
-    let provider = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).expect("chunk dir")))
-        .expect("open db");
+    let provider = SqliteProvider::open(
+        &db,
+        Box::new(LocalChunkStore::new(&chunks).expect("chunk dir")),
+    )
+    .expect("open db");
 
     // Pull the tree so the file's stable node_id + current version are known locally.
-    SyncEngine::pull_snapshot(&provider, &client).expect("pull tree (server reachable? token valid?)");
+    SyncEngine::pull_snapshot(&provider, &client)
+        .expect("pull tree (server reachable? token valid?)");
     let node = provider
         .export_tree()
         .expect("export")
@@ -40,10 +46,16 @@ fn main() {
 
     // Replace its content and push a new version (base = the version we just pulled → a clean
     // fast-forward, recorded as a content change on the same node_id).
-    provider.ingest_bytes(ino, content.as_bytes()).expect("ingest");
-    SyncEngine::push_outbox(&provider, &client, &PresignedIO::new(&client)).expect("push (S3 backend reachable?)");
+    provider
+        .ingest_bytes(ino, content.as_bytes())
+        .expect("ingest");
+    SyncEngine::push_outbox(&provider, &client, &PresignedIO::new(&client))
+        .expect("push (S3 backend reachable?)");
 
-    println!("✓ updated {name} to a new version ({} bytes): {content:?}", content.len());
+    println!(
+        "✓ updated {name} to a new version ({} bytes): {content:?}",
+        content.len()
+    );
     println!("  node_id={}", node.node_id);
     println!("  → on Windows, re-open {name} in MakerCF; it should show the new content.");
 }

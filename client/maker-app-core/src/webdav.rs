@@ -179,7 +179,9 @@ impl Mounter for WebDavMountController {
             return Err(MountError::NotMounted);
         }
         // Unmount the volume first; fall back to a forced diskutil unmount.
-        let umount = Command::new("umount").arg(&self.config.mount_point).status();
+        let umount = Command::new("umount")
+            .arg(&self.config.mount_point)
+            .status();
         if !matches!(umount, Ok(s) if s.success()) {
             let _ = Command::new("diskutil")
                 .args(["unmount", "force", &self.config.mount_point])

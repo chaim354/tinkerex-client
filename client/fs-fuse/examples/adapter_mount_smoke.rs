@@ -23,10 +23,16 @@ fn main() {
     std::fs::create_dir_all(&base).expect("create base dir");
     let db = base.join("a.db");
     let chunks = base.join("chunks");
-    let mnt = std::env::args().nth(1).unwrap_or_else(|| base.join("mnt").to_string_lossy().into_owned());
+    let mnt = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| base.join("mnt").to_string_lossy().into_owned());
     std::fs::create_dir_all(&chunks).ok();
     std::fs::create_dir_all(&mnt).ok();
-    eprintln!("SMOKE: adapter mount at {mnt} (db {}, chunks {})", db.display(), chunks.display());
+    eprintln!(
+        "SMOKE: adapter mount at {mnt} (db {}, chunks {})",
+        db.display(),
+        chunks.display()
+    );
 
     let store = Box::new(LocalChunkStore::new(&chunks).expect("chunk store"));
     let provider = SqliteProvider::open(&db, store).expect("open provider");
@@ -35,9 +41,14 @@ fn main() {
     // Probe it on the main thread first, so a provider panic surfaces HERE (with a clear
     // message) instead of silently aborting the FUSE worker thread → instant mount drop.
     match provider.getattr(fs_fuse::ROOT) {
-        Ok(a) => eprintln!("SMOKE: provider.getattr(ROOT) ok: ino={} kind={:?} mode={:#o}", a.ino, a.kind, a.mode),
+        Ok(a) => eprintln!(
+            "SMOKE: provider.getattr(ROOT) ok: ino={} kind={:?} mode={:#o}",
+            a.ino, a.kind, a.mode
+        ),
         Err(e) => {
-            eprintln!("SMOKE: provider.getattr(ROOT) FAILED: {e:?} — this would abort the FUSE worker");
+            eprintln!(
+                "SMOKE: provider.getattr(ROOT) FAILED: {e:?} — this would abort the FUSE worker"
+            );
             println!("SMOKE: MOUNT DROPPED");
             std::process::exit(1);
         }
@@ -84,7 +95,12 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn findmnt_reports(path: &str) -> bool {
     use std::process::Command;
-    match Command::new("findmnt").arg("--noheadings").arg("--target").arg(path).output() {
+    match Command::new("findmnt")
+        .arg("--noheadings")
+        .arg("--target")
+        .arg(path)
+        .output()
+    {
         Ok(out) => {
             out.status.success()
                 && String::from_utf8_lossy(&out.stdout)

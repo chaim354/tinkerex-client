@@ -20,7 +20,10 @@ fn default_is_everything_in_scope() {
     let node_id = p.node_id_for(ino).unwrap().unwrap();
 
     assert_eq!(p.subscription_default().unwrap(), SubRule::Include);
-    assert!(p.proactively_hydrate(&node_id).unwrap(), "no rules → in scope");
+    assert!(
+        p.proactively_hydrate(&node_id).unwrap(),
+        "no rules → in scope"
+    );
     assert!(p.proactively_hydrate_ino(ino).unwrap());
 }
 
@@ -41,14 +44,29 @@ fn subtree_scope_and_nearest_ancestor_wins() {
 
     // Unsubscribe the whole archive subtree.
     p.unsubscribe(&archive_id).unwrap();
-    assert!(!p.proactively_hydrate(&deep_id).unwrap(), "deep file inherits archive's exclude");
-    assert!(!p.proactively_hydrate(&sub_id).unwrap(), "intermediate dir is excluded too");
-    assert!(p.proactively_hydrate(&active_id).unwrap(), "a sibling outside archive stays in scope");
+    assert!(
+        !p.proactively_hydrate(&deep_id).unwrap(),
+        "deep file inherits archive's exclude"
+    );
+    assert!(
+        !p.proactively_hydrate(&sub_id).unwrap(),
+        "intermediate dir is excluded too"
+    );
+    assert!(
+        p.proactively_hydrate(&active_id).unwrap(),
+        "a sibling outside archive stays in scope"
+    );
 
     // Re-subscribe the nested 2019 folder — the closer rule wins for that subtree.
     p.subscribe(&sub_id).unwrap();
-    assert!(p.proactively_hydrate(&deep_id).unwrap(), "2019's include overrides archive's exclude");
-    assert!(!p.proactively_hydrate(&archive_id).unwrap(), "archive itself still excluded");
+    assert!(
+        p.proactively_hydrate(&deep_id).unwrap(),
+        "2019's include overrides archive's exclude"
+    );
+    assert!(
+        !p.proactively_hydrate(&archive_id).unwrap(),
+        "archive itself still excluded"
+    );
 }
 
 /// The "subscribe to a few folders" shape: flip the default to Exclude, then include only
@@ -64,13 +82,22 @@ fn default_exclude_then_include_selected() {
     p.set_subscription_default(SubRule::Exclude).unwrap();
     let a_id = p.node_id_for(a).unwrap().unwrap();
     let b_id = p.node_id_for(b).unwrap().unwrap();
-    assert!(!p.proactively_hydrate(&a_id).unwrap(), "default exclude → out of scope");
+    assert!(
+        !p.proactively_hydrate(&a_id).unwrap(),
+        "default exclude → out of scope"
+    );
     assert!(!p.proactively_hydrate(&b_id).unwrap());
 
     let projects_id = p.node_id_for(projects.ino).unwrap().unwrap();
     p.subscribe(&projects_id).unwrap();
-    assert!(p.proactively_hydrate(&a_id).unwrap(), "explicitly-included folder is in scope");
-    assert!(!p.proactively_hydrate(&b_id).unwrap(), "everything else still excluded");
+    assert!(
+        p.proactively_hydrate(&a_id).unwrap(),
+        "explicitly-included folder is in scope"
+    );
+    assert!(
+        !p.proactively_hydrate(&b_id).unwrap(),
+        "everything else still excluded"
+    );
 }
 
 /// `proactive_hydration_targets` is the engine's post-pull work list: it lists in-scope
@@ -81,11 +108,17 @@ fn proactive_targets_skips_out_of_scope() {
     // EMPTY local chunk store (separate from A's) — so every pulled file is initially a
     // placeholder with missing chunks. B's target list then reflects its subscription policy.
     use fs_provider::{ChunkConfig, LocalChunkStore, SqliteProvider};
-    let tiny = ChunkConfig { min: 64, avg: 256, max: 1024 };
+    let tiny = ChunkConfig {
+        min: 64,
+        avg: 256,
+        max: 1024,
+    };
     let dir_a = tempdir::Dir::new();
     let dir_b = tempdir::Dir::new();
-    let a = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir_a.path()).unwrap()), tiny).unwrap();
-    let b = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir_b.path()).unwrap()), tiny).unwrap();
+    let a = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir_a.path()).unwrap()), tiny)
+        .unwrap();
+    let b = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir_b.path()).unwrap()), tiny)
+        .unwrap();
 
     let active = a.mkdir(ROOT, "active").unwrap();
     let active_id = a.node_id_for(active.ino).unwrap().unwrap();
@@ -104,11 +137,29 @@ fn proactive_targets_skips_out_of_scope() {
 
     let targets = b.proactive_hydration_targets().unwrap();
     // Find the node_ids B sees for the two files.
-    let f1 = b.export_tree().unwrap().into_iter().find(|n| n.name == "f1.bin").unwrap().node_id;
-    let f2 = b.export_tree().unwrap().into_iter().find(|n| n.name == "f2.bin").unwrap().node_id;
+    let f1 = b
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "f1.bin")
+        .unwrap()
+        .node_id;
+    let f2 = b
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "f2.bin")
+        .unwrap()
+        .node_id;
 
-    assert!(targets.contains(&f1), "in-scope file is a proactive-hydration target");
-    assert!(!targets.contains(&f2), "out-of-scope file is NOT proactively hydrated");
+    assert!(
+        targets.contains(&f1),
+        "in-scope file is a proactive-hydration target"
+    );
+    assert!(
+        !targets.contains(&f2),
+        "out-of-scope file is NOT proactively hydrated"
+    );
 
     // The tree is complete on B regardless of scope — the out-of-scope file's metadata is
     // still present and navigable (tree completeness preserved).
@@ -130,11 +181,26 @@ fn on_demand_read_ignores_subscription() {
     write_file(&a, archive.ino, "doc.bin", &body);
     replicate_tree(&a, &b);
 
-    let archive_id = b.export_tree().unwrap().into_iter().find(|n| n.name == "archive").unwrap().node_id;
+    let archive_id = b
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "archive")
+        .unwrap()
+        .node_id;
     b.unsubscribe(&archive_id).unwrap();
 
-    let doc_id = b.export_tree().unwrap().into_iter().find(|n| n.name == "doc.bin").unwrap().node_id;
-    assert!(!b.proactively_hydrate(&doc_id).unwrap(), "out of scope: not proactively hydrated");
+    let doc_id = b
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "doc.bin")
+        .unwrap()
+        .node_id;
+    assert!(
+        !b.proactively_hydrate(&doc_id).unwrap(),
+        "out of scope: not proactively hydrated"
+    );
 
     // It's NOT in the proactive list…
     assert!(!b.proactive_hydration_targets().unwrap().contains(&doc_id));
@@ -144,7 +210,10 @@ fn on_demand_read_ignores_subscription() {
     // store IS the chunk source here, so `read` reassembles from it directly.
     let doc_ino = b.ino_for_node_id(&doc_id).unwrap().unwrap();
     let out = read_all(&b, doc_ino);
-    assert_eq!(out, body, "on-demand read of an out-of-scope file still works");
+    assert_eq!(
+        out, body,
+        "on-demand read of an out-of-scope file still works"
+    );
 }
 
 /// Unsubscribing a *hydrated* subtree and then dehydrating it reclaims the cached bytes,
@@ -168,8 +237,13 @@ fn dehydrate_subtree_reclaims_only_unshared_chunks() {
 
     // Capture the chunk hashes.
     let unique_hashes = node_manifest_hashes_of(&p, arch_file);
-    let active_id =
-        p.export_tree().unwrap().into_iter().find(|n| n.name == "active_copy.bin").unwrap().node_id;
+    let active_id = p
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "active_copy.bin")
+        .unwrap()
+        .node_id;
     let active_ino = p.ino_for_node_id(&active_id).unwrap().unwrap();
     let shared_hashes = node_manifest_hashes_of(&p, active_ino);
 
@@ -189,14 +263,25 @@ fn dehydrate_subtree_reclaims_only_unshared_chunks() {
     }
     // …but the shared chunks (referenced by the in-scope active_copy.bin) survive.
     for h in &shared_hashes {
-        assert!(p.has_chunk(h), "shared chunk {h} must NOT be dropped (in-scope file needs it)");
+        assert!(
+            p.has_chunk(h),
+            "shared chunk {h} must NOT be dropped (in-scope file needs it)"
+        );
     }
 
     // Tree completeness: the archive file's metadata + manifest are still present (it's a
     // placeholder now, not deleted) — proven by it still being in the exported tree with a
     // manifest_id.
-    let arch_node = p.export_tree().unwrap().into_iter().find(|n| n.name == "unique.bin").unwrap();
-    assert!(arch_node.manifest_id.is_some(), "dehydrated file keeps its manifest (placeholder)");
+    let arch_node = p
+        .export_tree()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.name == "unique.bin")
+        .unwrap();
+    assert!(
+        arch_node.manifest_id.is_some(),
+        "dehydrated file keeps its manifest (placeholder)"
+    );
 
     // And the in-scope copy still reads fine (its chunks were preserved).
     assert_eq!(read_all(&p, active_ino), shared_body);
@@ -217,7 +302,10 @@ fn subscription_survives_rename() {
 
     // Rename the dir — node_id is stable, so the exclude still applies.
     p.rename(ROOT, "old_name", ROOT, "new_name").unwrap();
-    assert!(!p.proactively_hydrate(&f_id).unwrap(), "exclude survives the rename (node_id stable)");
+    assert!(
+        !p.proactively_hydrate(&f_id).unwrap(),
+        "exclude survives the rename (node_id stable)"
+    );
 }
 
 /// `clear_subscription` reverts a node to inheriting from its ancestry / the default.
@@ -230,7 +318,10 @@ fn clear_subscription_reverts_to_default() {
     p.unsubscribe(&f_id).unwrap();
     assert!(!p.proactively_hydrate(&f_id).unwrap());
     p.clear_subscription(&f_id).unwrap();
-    assert!(p.proactively_hydrate(&f_id).unwrap(), "back to the default (include)");
+    assert!(
+        p.proactively_hydrate(&f_id).unwrap(),
+        "back to the default (include)"
+    );
 }
 
 // ---- pin-for-offline (the workshop "always keep this resident") --------------------
@@ -249,14 +340,23 @@ fn pin_forces_in_scope_even_under_default_exclude() {
 
     // Device is in "online-only by default" mode.
     p.set_subscription_default(SubRule::Exclude).unwrap();
-    assert!(!p.proactively_hydrate(&f_id).unwrap(), "default exclude → out of scope");
+    assert!(
+        !p.proactively_hydrate(&f_id).unwrap(),
+        "default exclude → out of scope"
+    );
     assert!(!p.is_pinned(&jobs_id).unwrap(), "not pinned yet");
 
     // Pin the jobs folder → its whole subtree is now in scope.
     p.pin(&jobs_id).unwrap();
     assert!(p.is_pinned(&jobs_id).unwrap(), "jobs is pinned");
-    assert!(p.proactively_hydrate(&f_id).unwrap(), "a pinned subtree is forced in scope");
-    assert!(p.pinned_nodes().unwrap().contains(&jobs_id), "pin shows up in the pin list");
+    assert!(
+        p.proactively_hydrate(&f_id).unwrap(),
+        "a pinned subtree is forced in scope"
+    );
+    assert!(
+        p.pinned_nodes().unwrap().contains(&jobs_id),
+        "pin shows up in the pin list"
+    );
 }
 
 /// A pin overrides an EXCLUDED ancestor (closest-rule-wins), so you can keep one job folder
@@ -272,11 +372,20 @@ fn pin_overrides_an_excluded_ancestor() {
     let f_id = p.node_id_for(f).unwrap().unwrap();
 
     p.unsubscribe(&archive_id).unwrap(); // exclude the whole archive
-    assert!(!p.proactively_hydrate(&f_id).unwrap(), "inherits archive's exclude");
+    assert!(
+        !p.proactively_hydrate(&f_id).unwrap(),
+        "inherits archive's exclude"
+    );
 
     p.pin(&job_id).unwrap(); // pin the nested job
-    assert!(p.proactively_hydrate(&f_id).unwrap(), "the closer pin overrides the excluded ancestor");
-    assert!(!p.proactively_hydrate(&archive_id).unwrap(), "archive itself still excluded");
+    assert!(
+        p.proactively_hydrate(&f_id).unwrap(),
+        "the closer pin overrides the excluded ancestor"
+    );
+    assert!(
+        !p.proactively_hydrate(&archive_id).unwrap(),
+        "archive itself still excluded"
+    );
 }
 
 /// `unpin` removes the pin → the subtree reverts to inheriting from its ancestry / default.
@@ -293,7 +402,10 @@ fn unpin_reverts_to_inherited_scope() {
 
     p.unpin(&f_id).unwrap();
     assert!(!p.is_pinned(&f_id).unwrap(), "no longer pinned");
-    assert!(!p.proactively_hydrate(&f_id).unwrap(), "reverts to default exclude");
+    assert!(
+        !p.proactively_hydrate(&f_id).unwrap(),
+        "reverts to default exclude"
+    );
     assert!(p.pinned_nodes().unwrap().is_empty(), "pin list cleared");
 }
 
@@ -312,8 +424,14 @@ fn pin_survives_rename() {
     assert!(p.proactively_hydrate(&f_id).unwrap());
 
     p.rename(ROOT, "old", ROOT, "renamed").unwrap();
-    assert!(p.is_pinned(&dir_id).unwrap(), "pin survives the rename (node_id stable)");
-    assert!(p.proactively_hydrate(&f_id).unwrap(), "still forced in scope after rename");
+    assert!(
+        p.is_pinned(&dir_id).unwrap(),
+        "pin survives the rename (node_id stable)"
+    );
+    assert!(
+        p.proactively_hydrate(&f_id).unwrap(),
+        "still forced in scope after rename"
+    );
 }
 
 /// A pin is **per-device local state** — it must NEVER leak into the synced tree (it lives
@@ -330,8 +448,15 @@ fn pin_is_local_only_never_synced() {
 
     p.pin(&dir_id).unwrap();
 
-    assert!(p.outbox_list_topo().unwrap().is_empty(), "pinning enqueues nothing to the outbox");
-    assert_eq!(p.export_tree().unwrap(), tree_before, "pinning does not change the synced tree");
+    assert!(
+        p.outbox_list_topo().unwrap().is_empty(),
+        "pinning enqueues nothing to the outbox"
+    );
+    assert_eq!(
+        p.export_tree().unwrap(),
+        tree_before,
+        "pinning does not change the synced tree"
+    );
 }
 
 // ---- small local helpers (the suite's common mod has no node-id manifest helper) ----

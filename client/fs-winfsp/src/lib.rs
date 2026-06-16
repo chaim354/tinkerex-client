@@ -67,7 +67,11 @@ fn unix_to_filetime(nanos: i64) -> u64 {
 /// Populate a WinFsp `FileInfo` from our provider `Attr`.
 fn fill_file_info(fi: &mut FileInfo, attr: &Attr) {
     let is_dir = attr.kind == Kind::Dir;
-    fi.file_attributes = if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+    fi.file_attributes = if is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
     fi.file_size = attr.size;
     fi.allocation_size = attr.size.div_ceil(4096) * 4096;
     let ft = unix_to_filetime(attr.mtime);
@@ -113,7 +117,10 @@ pub struct WinFspAdapter<P: Provider> {
 impl<P: Provider> WinFspAdapter<P> {
     /// Local-only (no hydration — a chunk-cache miss is an error). For `maker-mount-win`.
     pub fn new(provider: P) -> Self {
-        Self { provider, hydrate: None }
+        Self {
+            provider,
+            hydrate: None,
+        }
     }
 
     /// With a hydrate hook so reads pull missing chunks from the cloud (the sync daemon).
@@ -163,7 +170,11 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: 0,
-            attributes: if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL },
+            attributes: if is_dir {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            },
         })
     }
 
@@ -278,7 +289,9 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
             // Chunk-cache miss on a known file: hydrate from the cloud, then retry.
             Err(FsError::ChunkMissing(_)) if self.hydrate.is_some() => {
                 (self.hydrate.as_ref().unwrap())(context.ino);
-                self.provider.read(context.ino, offset, len).map_err(to_fsp)?
+                self.provider
+                    .read(context.ino, offset, len)
+                    .map_err(to_fsp)?
             }
             Err(e) => return Err(to_fsp(e)),
         };
@@ -301,7 +314,10 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
         } else {
             offset
         };
-        let n = self.provider.write(context.ino, off, buffer).map_err(to_fsp)?;
+        let n = self
+            .provider
+            .write(context.ino, off, buffer)
+            .map_err(to_fsp)?;
         let attr = self.provider.getattr(context.ino).map_err(to_fsp)?;
         fill_file_info(file_info, &attr);
         Ok(n)
@@ -388,7 +404,9 @@ impl<P: Provider + 'static> FileSystemContext for WinFspAdapter<P> {
         // Resize to exactly `new_size`: the Provider truncate shrinks (dropping any
         // stale tail past the new EOF) or grows with zero-fill, so an
         // overwrite-with-shorter leaves no stale bytes.
-        self.provider.truncate(context.ino, new_size).map_err(to_fsp)?;
+        self.provider
+            .truncate(context.ino, new_size)
+            .map_err(to_fsp)?;
         let attr = self.provider.getattr(context.ino).map_err(to_fsp)?;
         fill_file_info(file_info, &attr);
         Ok(())

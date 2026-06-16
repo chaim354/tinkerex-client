@@ -11,14 +11,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_client::ServerClient;
 
 fn uniq() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 fn main() {
     let server = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://localhost:3001".into());
 
     let mut client = ServerClient::new(&server);
-    client.enroll(&format!("nudge-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register");
+    client
+        .enroll(
+            &format!("nudge-{}@example.com", uniq()),
+            "correct horse battery staple",
+            "device-A",
+        )
+        .expect("register");
 
     // Subscribe in a background thread; forward each head_seq nudge over a channel.
     let (tx, rx) = mpsc::channel::<i64>();
@@ -36,7 +48,9 @@ fn main() {
 
     // Trigger a server-side change → the server broadcasts {head_seq}.
     let started = Instant::now();
-    let resp = client.mkdir(&uniq(), None, &format!("nudge-{}", uniq()), 0o755, 0).expect("mkdir");
+    let resp = client
+        .mkdir(&uniq(), None, &format!("nudge-{}", uniq()), 0o755, 0)
+        .expect("mkdir");
     println!("✓ committed a mkdir (server head_seq {})", resp.seq);
 
     // The nudge should arrive within a beat (not the 2s poll interval).

@@ -36,7 +36,10 @@ fn main() {
         "http://127.0.0.1:9".to_string(), // 9 = discard, nothing listening
         "smoke-token".to_string(),
     );
-    let cfg = DaemonConfig { poll: Duration::from_millis(500), ..cfg };
+    let cfg = DaemonConfig {
+        poll: Duration::from_millis(500),
+        ..cfg
+    };
 
     eprintln!("SMOKE: Daemon::start at {} (dead server)…", mnt.display());
     let daemon = match Daemon::start(cfg) {
@@ -47,7 +50,10 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("SMOKE: Daemon::start Ok, is_running={}", daemon.is_running());
+    eprintln!(
+        "SMOKE: Daemon::start Ok, is_running={}",
+        daemon.is_running()
+    );
 
     // Watch for ~3s: if the mount drops, is_running() flips false.
     let deadline = Instant::now() + Duration::from_secs(3);

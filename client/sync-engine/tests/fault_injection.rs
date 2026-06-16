@@ -69,7 +69,9 @@ struct Rng {
 }
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self { state: seed ^ 0x9e37_79b9_7f4a_7c15 }
+        Self {
+            state: seed ^ 0x9e37_79b9_7f4a_7c15,
+        }
     }
     fn next(&mut self) -> u64 {
         self.state = self
@@ -88,10 +90,17 @@ impl Rng {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
-const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+const TINY: ChunkConfig = ChunkConfig {
+    min: 64,
+    avg: 256,
+    max: 1024,
+};
 
 fn uniq() -> u64 {
     static CTR: AtomicU64 = AtomicU64::new(0);
@@ -102,14 +111,18 @@ fn uniq() -> u64 {
 /// a cache, or the data plane / hydration never gets tested — same rule as integration.rs).
 fn device() -> (SqliteProvider, tempdir::Dir) {
     let dir = tempdir::Dir::new();
-    let p =
-        SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir.path()).unwrap()), TINY).unwrap();
+    let p = SqliteProvider::in_memory(Box::new(LocalChunkStore::new(dir.path()).unwrap()), TINY)
+        .unwrap();
     (p, dir)
 }
 
 fn read_all(p: &SqliteProvider, ino: u64) -> Vec<u8> {
     let size = p.getattr(ino).unwrap().size;
-    if size == 0 { Vec::new() } else { p.read(ino, 0, size as u32).unwrap() }
+    if size == 0 {
+        Vec::new()
+    } else {
+        p.read(ino, 0, size as u32).unwrap()
+    }
 }
 
 // ----------------------------------------------------------------------------------------
@@ -155,7 +168,10 @@ impl FaultPlan {
     }
     /// Schedule `count` failures of `kind` for `hash` (count = u64::MAX → persistent).
     fn fail(&self, hash: &str, kind: FailKind, count: u64) {
-        self.budget.lock().unwrap().insert((hash.to_string(), kind), count);
+        self.budget
+            .lock()
+            .unwrap()
+            .insert((hash.to_string(), kind), count);
     }
     /// Consume one failure of `kind` for `hash` if budgeted; returns true if we should fail.
     fn should_fail(&self, hash: &str, kind: FailKind) -> bool {
@@ -181,16 +197,27 @@ struct FaultyChunkIO {
 
 impl FaultyChunkIO {
     fn new(dir: impl Into<std::path::PathBuf>) -> Self {
-        Self { inner: SharedDirIO::new(dir.into()).unwrap(), plan: FaultPlan::new() }
+        Self {
+            inner: SharedDirIO::new(dir.into()).unwrap(),
+            plan: FaultPlan::new(),
+        }
     }
 }
 
 fn io_err(msg: &str) -> EngineError {
-    EngineError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg.to_string()))
+    EngineError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        msg.to_string(),
+    ))
 }
 
 impl ChunkIO for FaultyChunkIO {
-    fn put(&self, hash: &str, urls: &HashMap<String, String>, bytes: Vec<u8>) -> sync_engine::Result<()> {
+    fn put(
+        &self,
+        hash: &str,
+        urls: &HashMap<String, String>,
+        bytes: Vec<u8>,
+    ) -> sync_engine::Result<()> {
         self.plan.puts.fetch_add(1, Ordering::Relaxed);
         if self.plan.should_fail(hash, FailKind::PutBeforeWrite) {
             return Err(io_err("injected: PUT failed before write"));
@@ -247,7 +274,13 @@ struct MockCloud {
 
 impl MockCloud {
     fn new() -> Self {
-        Self { nodes: HashMap::new(), log: Vec::new(), head_seq: 0, next_version: 0, conflicts: Vec::new() }
+        Self {
+            nodes: HashMap::new(),
+            log: Vec::new(),
+            head_seq: 0,
+            next_version: 0,
+            conflicts: Vec::new(),
+        }
     }
 
     fn new_version(&mut self) -> String {
@@ -269,7 +302,12 @@ impl MockCloud {
                     self.head_seq += 1;
                     let seq = self.head_seq;
                     self.conflicts.push(node.node_id.clone());
-                    self.log.push(ChangelogEntry { seq, node_id: node.node_id.clone(), op: "conflict".into(), node: None });
+                    self.log.push(ChangelogEntry {
+                        seq,
+                        node_id: node.node_id.clone(),
+                        op: "conflict".into(),
+                        node: None,
+                    });
                     return Err(format!(
                         "conflict on {} (base {:?} != current {:?})",
                         node.node_id, node.version_id, server_current
@@ -304,8 +342,19 @@ impl MockCloud {
         node.version_id = Some(v.clone());
         self.head_seq += 1;
         let seq = self.head_seq;
-        self.nodes.insert(node.node_id.clone(), CloudNode { node: node.clone(), deleted: false });
-        self.log.push(ChangelogEntry { seq, node_id: node.node_id.clone(), op: "upsert".into(), node: Some(node) });
+        self.nodes.insert(
+            node.node_id.clone(),
+            CloudNode {
+                node: node.clone(),
+                deleted: false,
+            },
+        );
+        self.log.push(ChangelogEntry {
+            seq,
+            node_id: node.node_id.clone(),
+            op: "upsert".into(),
+            node: Some(node),
+        });
         Ok(v)
     }
 
@@ -318,7 +367,9 @@ impl MockCloud {
             let children: Vec<String> = self
                 .nodes
                 .iter()
-                .filter(|(nid, cn)| cn.node.parent_node_id.as_deref() == Some(&parent) && !to_del.contains(nid))
+                .filter(|(nid, cn)| {
+                    cn.node.parent_node_id.as_deref() == Some(&parent) && !to_del.contains(nid)
+                })
                 .map(|(nid, _)| nid.clone())
                 .collect();
             to_del.extend(children);
@@ -330,7 +381,12 @@ impl MockCloud {
                     cn.deleted = true;
                     self.head_seq += 1;
                     let seq = self.head_seq;
-                    self.log.push(ChangelogEntry { seq, node_id: nid.clone(), op: "delete".into(), node: None });
+                    self.log.push(ChangelogEntry {
+                        seq,
+                        node_id: nid.clone(),
+                        op: "delete".into(),
+                        node: None,
+                    });
                 }
             }
         }
@@ -339,7 +395,12 @@ impl MockCloud {
     /// Changelog delta `seq > cursor`, capped at `page` entries (the server paginates →
     /// a far-behind device must loop; a mid-pull drop just resumes from its cursor).
     fn changes(&self, cursor: i64, page: usize) -> Vec<ChangelogEntry> {
-        self.log.iter().filter(|e| e.seq > cursor).take(page).cloned().collect()
+        self.log
+            .iter()
+            .filter(|e| e.seq > cursor)
+            .take(page)
+            .cloned()
+            .collect()
     }
 }
 
@@ -404,7 +465,11 @@ impl HermeticEngine {
     /// [`bug_move_into_newer_dir_reorders_outbox_child_before_parent`]. We sort here so the
     /// rest of the fault scenarios can still drive convergence rather than tripping over that
     /// one ordering defect on nearly every randomized seed.
-    fn push_outbox(provider: &SqliteProvider, cloud: &mut MockCloud, io: &FaultyChunkIO) -> (usize, usize, usize) {
+    fn push_outbox(
+        provider: &SqliteProvider,
+        cloud: &mut MockCloud,
+        io: &FaultyChunkIO,
+    ) -> (usize, usize, usize) {
         let (mut pushed, mut failed, mut conflicted) = (0, 0, 0);
         for (node_id, op) in topo_ordered_outbox(provider) {
             let result = if op == "delete" {
@@ -506,7 +571,12 @@ impl HermeticEngine {
                     if applied >= limit {
                         // mid-pull crash: flush what we can defer-resolve, then stop.
                         let dropped = retry_deferred(provider, &mut deferred);
-                        let r = Self::settle_reconcile(provider, cloud, needs_reconcile || dropped, allow_clear);
+                        let r = Self::settle_reconcile(
+                            provider,
+                            cloud,
+                            needs_reconcile || dropped,
+                            allow_clear,
+                        );
                         return (cursor, r);
                     }
                 }
@@ -530,7 +600,12 @@ impl HermeticEngine {
     ///   - `true` (the settled-cloud final pass): reconcile from the full tree and, if the local
     ///     tree now matches the cloud's reachable live set, clear the flag.
     /// Returns whether a reconcile ran (only possible when `allow_clear`).
-    fn settle_reconcile(provider: &SqliteProvider, cloud: &MockCloud, fresh: bool, allow_clear: bool) -> bool {
+    fn settle_reconcile(
+        provider: &SqliteProvider,
+        cloud: &MockCloud,
+        fresh: bool,
+        allow_clear: bool,
+    ) -> bool {
         if fresh {
             provider.set_needs_resync(true).unwrap();
         }
@@ -550,7 +625,11 @@ impl HermeticEngine {
     }
 
     /// Hydrate a node's chunks from the cloud (faulty GET). Returns Err if any chunk fails.
-    fn hydrate(provider: &SqliteProvider, io: &FaultyChunkIO, node_id: &str) -> std::result::Result<(), EngineError> {
+    fn hydrate(
+        provider: &SqliteProvider,
+        io: &FaultyChunkIO,
+        node_id: &str,
+    ) -> std::result::Result<(), EngineError> {
         let hashes = provider.node_manifest_hashes(node_id)?;
         for h in &hashes {
             if provider.has_chunk(h) {
@@ -638,7 +717,8 @@ fn cloud_reachable(cloud: &MockCloud, node_id: &str) -> bool {
 /// correctness floor; it heals anything the changelog delta dropped under a race.
 fn reconcile_full(provider: &SqliteProvider, cloud: &MockCloud) {
     let live: Vec<&CloudNode> = cloud.nodes.values().filter(|c| !c.deleted).collect();
-    let live_ids: std::collections::HashSet<&String> = live.iter().map(|c| &c.node.node_id).collect();
+    let live_ids: std::collections::HashSet<&String> =
+        live.iter().map(|c| &c.node.node_id).collect();
 
     // (1) SWEEP FIRST: remove every local node the cloud no longer holds live. Doing this
     // *before* re-applying live nodes clears any stale row still squatting a (parent, name)
@@ -689,7 +769,13 @@ fn reconciled_matches_cloud(provider: &SqliteProvider, cloud: &MockCloud) -> boo
         .filter(|c| !c.deleted && cloud_reachable(cloud, &c.node.node_id))
         .map(|c| {
             let n = &c.node;
-            (n.node_id.clone(), n.parent_node_id.clone(), n.name.clone(), n.kind == Kind::Dir, n.manifest_id.clone())
+            (
+                n.node_id.clone(),
+                n.parent_node_id.clone(),
+                n.name.clone(),
+                n.kind == Kind::Dir,
+                n.manifest_id.clone(),
+            )
         })
         .collect();
     expected.sort();
@@ -706,17 +792,30 @@ fn assert_well_formed(p: &SqliteProvider, ctx: &str) {
     let nodes = p.export_tree().unwrap();
     let mut ids = std::collections::HashSet::new();
     for n in &nodes {
-        assert!(ids.insert(n.node_id.clone()), "{ctx}: duplicate node_id {}", n.node_id);
+        assert!(
+            ids.insert(n.node_id.clone()),
+            "{ctx}: duplicate node_id {}",
+            n.node_id
+        );
     }
     let mut seen = std::collections::HashSet::new();
     for n in &nodes {
         let key = (n.parent_node_id.clone(), n.name.clone());
-        assert!(seen.insert(key.clone()), "{ctx}: duplicate (parent,name) {:?}", key);
+        assert!(
+            seen.insert(key.clone()),
+            "{ctx}: duplicate (parent,name) {:?}",
+            key
+        );
     }
     let id_set: std::collections::HashSet<&String> = nodes.iter().map(|n| &n.node_id).collect();
     for n in &nodes {
         if let Some(pid) = &n.parent_node_id {
-            assert!(id_set.contains(pid), "{ctx}: orphaned node {} (parent {} missing)", n.node_id, pid);
+            assert!(
+                id_set.contains(pid),
+                "{ctx}: orphaned node {} (parent {} missing)",
+                n.node_id,
+                pid
+            );
         }
     }
 }
@@ -728,7 +827,15 @@ fn snapshot(p: &SqliteProvider) -> Vec<(String, Option<String>, String, bool, Op
         .export_tree()
         .unwrap()
         .into_iter()
-        .map(|n| (n.node_id, n.parent_node_id, n.name, n.kind == Kind::Dir, n.manifest_id))
+        .map(|n| {
+            (
+                n.node_id,
+                n.parent_node_id,
+                n.name,
+                n.kind == Kind::Dir,
+                n.manifest_id,
+            )
+        })
         .collect();
     v.sort();
     v
@@ -751,11 +858,23 @@ struct LocalEntry {
 /// driven through their own `base` never collide at a shared path — which keeps each
 /// device's model valid even as it pulls in the *other* device's nodes (those land outside
 /// `base`, untouched by this device's ops). Returns a label.
-fn random_local_op(writer: &SqliteProvider, base: u64, entries: &mut Vec<LocalEntry>, rng: &mut Rng, ctr: &mut u64, iter: usize) -> String {
+fn random_local_op(
+    writer: &SqliteProvider,
+    base: u64,
+    entries: &mut Vec<LocalEntry>,
+    rng: &mut Rng,
+    ctr: &mut u64,
+    iter: usize,
+) -> String {
     let dirs: Vec<u64> = std::iter::once(base)
         .chain(entries.iter().filter(|e| e.dir).map(|e| e.ino))
         .collect();
-    let files: Vec<usize> = entries.iter().enumerate().filter(|(_, e)| !e.dir).map(|(i, _)| i).collect();
+    let files: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.dir)
+        .map(|(i, _)| i)
+        .collect();
 
     match rng.below(7) {
         0 => {
@@ -764,7 +883,13 @@ fn random_local_op(writer: &SqliteProvider, base: u64, entries: &mut Vec<LocalEn
             let name = format!("d{ctr}");
             match writer.mkdir(parent, &name) {
                 Ok(a) => {
-                    entries.push(LocalEntry { ino: a.ino, parent, name: name.clone(), dir: true, body: vec![] });
+                    entries.push(LocalEntry {
+                        ino: a.ino,
+                        parent,
+                        name: name.clone(),
+                        dir: true,
+                        body: vec![],
+                    });
                     format!("mkdir {name}")
                 }
                 Err(_) => "mkdir(skip-collision)".into(),
@@ -774,13 +899,21 @@ fn random_local_op(writer: &SqliteProvider, base: u64, entries: &mut Vec<LocalEn
             let parent = dirs[rng.below(dirs.len())];
             *ctr += 1;
             let name = format!("f{ctr}");
-            let body: Vec<u8> = (0..(40 + rng.below(500))).map(|i| (i ^ *ctr as usize) as u8).collect();
+            let body: Vec<u8> = (0..(40 + rng.below(500)))
+                .map(|i| (i ^ *ctr as usize) as u8)
+                .collect();
             match writer.create(parent, &name) {
                 Ok(a) => {
                     writer.write(a.ino, 0, &body).unwrap();
                     writer.flush(a.ino).unwrap();
                     let len = body.len();
-                    entries.push(LocalEntry { ino: a.ino, parent, name: name.clone(), dir: false, body });
+                    entries.push(LocalEntry {
+                        ino: a.ino,
+                        parent,
+                        name: name.clone(),
+                        dir: false,
+                        body,
+                    });
                     format!("create {name} ({len} B)")
                 }
                 Err(_) => "create(skip-collision)".into(),
@@ -798,7 +931,9 @@ fn random_local_op(writer: &SqliteProvider, base: u64, entries: &mut Vec<LocalEn
                 entries.remove(i);
                 return "edit(skip-gone)".into();
             }
-            let body: Vec<u8> = (0..(20 + rng.below(300))).map(|j| j.wrapping_add(iter) as u8).collect();
+            let body: Vec<u8> = (0..(20 + rng.below(300)))
+                .map(|j| j.wrapping_add(iter) as u8)
+                .collect();
             writer.truncate(ino, 0).unwrap();
             writer.write(ino, 0, &body).unwrap();
             writer.flush(ino).unwrap();
@@ -954,14 +1089,18 @@ fn transient_put_failure_eventually_pushes() {
         let mut cloud = MockCloud::new();
 
         let f = writer.create(ROOT_INO, "design.3mf").unwrap();
-        let body: Vec<u8> = (0..8000u32).map(|i| (i.wrapping_mul(seed as u32 + 7) % 251) as u8).collect();
+        let body: Vec<u8> = (0..8000u32)
+            .map(|i| (i.wrapping_mul(seed as u32 + 7) % 251) as u8)
+            .collect();
         writer.write(f.ino, 0, &body).unwrap();
         writer.flush(f.ino).unwrap();
 
         // Schedule transient failures on every chunk, both before- and after-write.
         for c in &writer.export_tree().unwrap()[0].chunks {
-            io.plan.fail(&c.hash, FailKind::PutBeforeWrite, 1 + (seed % 2));
-            io.plan.fail(&c.hash, FailKind::PutAfterWrite, 1 + (seed % 2));
+            io.plan
+                .fail(&c.hash, FailKind::PutBeforeWrite, 1 + (seed % 2));
+            io.plan
+                .fail(&c.hash, FailKind::PutAfterWrite, 1 + (seed % 2));
         }
 
         let mut ticks = 0;
@@ -971,16 +1110,24 @@ fn transient_put_failure_eventually_pushes() {
                 break;
             }
             ticks += 1;
-            assert!(ticks < 50, "seed {seed}: push never drained under transient faults");
+            assert!(
+                ticks < 50,
+                "seed {seed}: push never drained under transient faults"
+            );
         }
 
         // INVARIANT: the committed write is retrievable byte-for-byte on a fresh device.
         let (reader, _rd) = device();
         HermeticEngine::pull_changes(&reader, &cloud, 0, 500, None);
         let node_id = cloud.nodes.keys().next().unwrap().clone();
-        HermeticEngine::hydrate(&reader, &io, &node_id).expect("hydrate after transient PUT faults");
+        HermeticEngine::hydrate(&reader, &io, &node_id)
+            .expect("hydrate after transient PUT faults");
         let ino = reader.lookup(ROOT_INO, "design.3mf").unwrap().ino;
-        assert_eq!(read_all(&reader, ino), body, "seed {seed}: no data loss after transient PUT failures");
+        assert_eq!(
+            read_all(&reader, ino),
+            body,
+            "seed {seed}: no data loss after transient PUT failures"
+        );
     }
 }
 
@@ -1025,20 +1172,39 @@ fn bug_move_into_newer_dir_reorders_outbox_child_before_parent() {
     // lists the moved child F before its new parent D — the move re-`upsert`s F but keeps its
     // older insertion id (the `ON CONFLICT(node_id) DO UPDATE` coalesce). The fix is in the
     // *drain order*, not the outbox id.
-    let raw: Vec<String> = writer.outbox_list().unwrap().into_iter().map(|(n, _)| n).collect();
+    let raw: Vec<String> = writer
+        .outbox_list()
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     let f_pos = raw.iter().position(|n| n == &f_id).unwrap();
     let d_pos = raw.iter().position(|n| n == &d_id).unwrap();
-    assert!(f_pos < d_pos, "precondition: raw outbox still lists moved child F before its new parent D");
+    assert!(
+        f_pos < d_pos,
+        "precondition: raw outbox still lists moved child F before its new parent D"
+    );
 
     // THE FIX: `outbox_list_topo` reorders parents-first, so D precedes F.
-    let topo: Vec<String> = writer.outbox_list_topo().unwrap().into_iter().map(|(n, _)| n).collect();
+    let topo: Vec<String> = writer
+        .outbox_list_topo()
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     let f_topo = topo.iter().position(|n| n == &f_id).unwrap();
     let d_topo = topo.iter().position(|n| n == &d_id).unwrap();
-    assert!(d_topo < f_topo, "FIX: outbox_list_topo orders parent D before moved child F");
+    assert!(
+        d_topo < f_topo,
+        "FIX: outbox_list_topo orders parent D before moved child F"
+    );
 
     // Drain in the production order (`push_outbox` → `outbox_list_topo`) into the cloud.
     HermeticEngine::push_outbox(&writer, &mut cloud, &io);
-    assert!(writer.outbox_list().unwrap().is_empty(), "outbox fully drained");
+    assert!(
+        writer.outbox_list().unwrap().is_empty(),
+        "outbox fully drained"
+    );
 
     // A fresh device applies the changelog in raw seq order — exactly as the real server feed
     // delivers it. Because D's create now precedes F's upsert in the log, `apply_remote(F)`
@@ -1057,8 +1223,15 @@ fn bug_move_into_newer_dir_reorders_outbox_child_before_parent() {
     // F is live under D on the fresh device — the move converged via the changelog delta alone.
     let d_ino = reader.lookup(ROOT_INO, "D").unwrap().ino;
     let rf = reader.lookup(d_ino, "F.txt").expect("F resolved under D");
-    assert_eq!(reader.node_id_for(rf.ino).unwrap().unwrap(), f_id, "the same node F moved into D");
-    assert!(reader.lookup(ROOT_INO, "F.txt").is_err(), "F no longer at root");
+    assert_eq!(
+        reader.node_id_for(rf.ino).unwrap().unwrap(),
+        f_id,
+        "the same node F moved into D"
+    );
+    assert!(
+        reader.lookup(ROOT_INO, "F.txt").is_err(),
+        "F no longer at root"
+    );
 }
 
 // ========================================================================================
@@ -1109,7 +1282,11 @@ fn bug_move_out_then_delete_parent_aborts_changelog_pull() {
     let (rep, _rd) = device();
     HermeticEngine::pull_changes(&rep, &cloud, 0, 500, None);
     let rep_cursor_before = cloud.head_seq;
-    assert!(rep.lookup(rep.lookup(ROOT_INO, "P").unwrap().ino, "C").is_ok(), "replica has C under P");
+    assert!(
+        rep.lookup(rep.lookup(ROOT_INO, "P").unwrap().ino, "C")
+            .is_ok(),
+        "replica has C under P"
+    );
 
     // Source: move C (with its leaf) OUT of P into Q, then delete P.
     src.rename(p.ino, "C", q.ino, "C").unwrap();
@@ -1142,7 +1319,10 @@ fn bug_move_out_then_delete_parent_aborts_changelog_pull() {
     // the SAME delta and CONVERGES the replica from the changelog ALONE — no reconcile
     // backstop. A parentless upsert is buffered and re-applied once its parent arrives.
     let rep_cursor = HermeticEngine::pull_changes(&rep, &cloud, rep_cursor_before, 500, None);
-    assert_eq!(rep_cursor, cloud.head_seq, "replica caught up to head via the delta");
+    assert_eq!(
+        rep_cursor, cloud.head_seq,
+        "replica caught up to head via the delta"
+    );
 
     let c_id = src.node_id_for(c.ino).unwrap().unwrap();
     let q_id = src.node_id_for(q.ino).unwrap().unwrap();
@@ -1150,18 +1330,34 @@ fn bug_move_out_then_delete_parent_aborts_changelog_pull() {
         .sync_node(&c_id)
         .unwrap()
         .expect("FIX: C survives the move-out + parent delete via defer-and-retry (no backstop)");
-    assert_eq!(rc.parent_node_id.as_deref(), Some(q_id.as_str()), "C re-parented to Q, not lost");
+    assert_eq!(
+        rc.parent_node_id.as_deref(),
+        Some(q_id.as_str()),
+        "C re-parented to Q, not lost"
+    );
     let gc_id = src.node_id_for(gc.ino).unwrap().unwrap();
-    assert!(rep.sync_node(&gc_id).unwrap().is_some(), "the grandchild leaf survived (no data loss)");
-    assert!(rep.lookup(ROOT_INO, "P").is_err(), "P is gone on the replica");
+    assert!(
+        rep.sync_node(&gc_id).unwrap().is_some(),
+        "the grandchild leaf survived (no data loss)"
+    );
+    assert!(
+        rep.lookup(ROOT_INO, "P").is_err(),
+        "P is gone on the replica"
+    );
 
     // The defer-and-retry result already matches the cloud's reachable live set; the reconcile
     // backstop (kept as the correctness floor) must be a NO-OP here — idempotent, no change.
     let before = snapshot(&rep);
     reconcile_full(&rep, &cloud);
-    assert_eq!(snapshot(&rep), before, "backstop is a no-op: the delta already converged");
+    assert_eq!(
+        snapshot(&rep),
+        before,
+        "backstop is a no-op: the delta already converged"
+    );
 
-    eprintln!("BUG #2: old raw-seq-order path would have aborted on NotFound: {old_path_would_abort}");
+    eprintln!(
+        "BUG #2: old raw-seq-order path would have aborted on NotFound: {old_path_would_abort}"
+    );
 }
 
 // ========================================================================================
@@ -1184,7 +1380,9 @@ fn persistent_put_failure_isolates_to_one_node() {
             let mut s = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             (0..n)
                 .map(|_| {
-                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     (s >> 33) as u8
                 })
                 .collect()
@@ -1202,7 +1400,10 @@ fn persistent_put_failure_isolates_to_one_node() {
         let mut healthy_ids = vec![];
         for k in 0..4 {
             let f = writer.create(ROOT_INO, &format!("ok{k}.txt")).unwrap();
-            let body = stream(0xABCD ^ (seed << 8) ^ (k as u64 + 1), 200 + (seed as usize + k) * 13);
+            let body = stream(
+                0xABCD ^ (seed << 8) ^ (k as u64 + 1),
+                200 + (seed as usize + k) * 13,
+            );
             writer.write(f.ino, 0, &body).unwrap();
             writer.flush(f.ino).unwrap();
             healthy_ids.push((writer.node_id_for(f.ino).unwrap().unwrap(), body));
@@ -1213,23 +1414,40 @@ fn persistent_put_failure_isolates_to_one_node() {
         }
 
         // INVARIANT: poison never commits; healthy all commit (per-node isolation).
-        assert!(!cloud.nodes.contains_key(&poison_id), "seed {seed}: poison must NOT commit");
         assert!(
-            writer.outbox_list().unwrap().iter().any(|(id, _)| id == &poison_id),
+            !cloud.nodes.contains_key(&poison_id),
+            "seed {seed}: poison must NOT commit"
+        );
+        assert!(
+            writer
+                .outbox_list()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &poison_id),
             "seed {seed}: poison stays queued for retry"
         );
         for (id, body) in &healthy_ids {
-            assert!(cloud.nodes.contains_key(id), "seed {seed}: healthy node {id} committed despite poison sibling");
+            assert!(
+                cloud.nodes.contains_key(id),
+                "seed {seed}: healthy node {id} committed despite poison sibling"
+            );
             let (r, _d) = device();
             HermeticEngine::pull_changes(&r, &cloud, 0, 500, None);
             HermeticEngine::hydrate(&r, &io, id).unwrap();
             let name = &cloud.nodes[id].node.name;
             let ino = r.lookup(ROOT_INO, name).unwrap().ino;
-            assert_eq!(&read_all(&r, ino), body, "seed {seed}: healthy node {id} byte-exact");
+            assert_eq!(
+                &read_all(&r, ino),
+                body,
+                "seed {seed}: healthy node {id} byte-exact"
+            );
         }
         // INVARIANT: no partial/duplicate commit for the poison node.
         assert!(
-            !cloud.log.iter().any(|e| e.node_id == poison_id && e.op == "upsert"),
+            !cloud
+                .log
+                .iter()
+                .any(|e| e.node_id == poison_id && e.op == "upsert"),
             "seed {seed}: poison must produce NO upsert changelog entry"
         );
     }
@@ -1249,7 +1467,9 @@ fn hydrate_survives_get_failures() {
         let mut cloud = MockCloud::new();
 
         let f = writer.create(ROOT_INO, "big.stl").unwrap();
-        let body: Vec<u8> = (0..12000u32).map(|i| (i.wrapping_add(seed as u32) % 251) as u8).collect();
+        let body: Vec<u8> = (0..12000u32)
+            .map(|i| (i.wrapping_add(seed as u32) % 251) as u8)
+            .collect();
         writer.write(f.ino, 0, &body).unwrap();
         writer.flush(f.ino).unwrap();
         HermeticEngine::push_outbox(&writer, &mut cloud, &io);
@@ -1266,11 +1486,18 @@ fn hydrate_survives_get_failures() {
             attempts += 1;
             match HermeticEngine::hydrate(&reader, &io, &node_id) {
                 Ok(()) => break,
-                Err(_) => assert!(attempts < 50, "seed {seed}: hydrate never succeeded under GET faults"),
+                Err(_) => assert!(
+                    attempts < 50,
+                    "seed {seed}: hydrate never succeeded under GET faults"
+                ),
             }
         }
         let ino = reader.lookup(ROOT_INO, "big.stl").unwrap().ino;
-        assert_eq!(read_all(&reader, ino), body, "seed {seed}: hydrate byte-exact after GET failures");
+        assert_eq!(
+            read_all(&reader, ino),
+            body,
+            "seed {seed}: hydrate byte-exact after GET failures"
+        );
     }
 }
 
@@ -1306,7 +1533,11 @@ fn mid_pull_crash_resumes_and_converges() {
         let mut cursor = 0i64;
         let mut rounds = 0;
         loop {
-            let interrupt = if rng.chance(70) { Some(1 + rng.below(4)) } else { None };
+            let interrupt = if rng.chance(70) {
+                Some(1 + rng.below(4))
+            } else {
+                None
+            };
             // Replay the same delta from `cursor` an extra time ~30% of rounds (idempotency).
             if rng.chance(30) {
                 let _ = HermeticEngine::pull_changes(&reader, &cloud, cursor, 3, interrupt);
@@ -1322,7 +1553,11 @@ fn mid_pull_crash_resumes_and_converges() {
         }
 
         HermeticEngine::pull_changes(&reader, &cloud, cursor, 500, None);
-        assert_eq!(snapshot(&reader), snapshot(&writer), "seed {seed}: reader diverged from writer after mid-pull crashes");
+        assert_eq!(
+            snapshot(&reader),
+            snapshot(&writer),
+            "seed {seed}: reader diverged from writer after mid-pull crashes"
+        );
 
         // No data loss: every surviving file hydrates byte-for-byte.
         for e in &entries {
@@ -1338,7 +1573,12 @@ fn mid_pull_crash_resumes_and_converges() {
             }
             HermeticEngine::hydrate(&reader, &io, &nid).unwrap();
             let rino = reader.ino_for_node_id(&nid).unwrap().unwrap();
-            assert_eq!(read_all(&reader, rino), e.body, "seed {seed}: file {} lost/corrupted", e.name);
+            assert_eq!(
+                read_all(&reader, rino),
+                e.body,
+                "seed {seed}: file {} lost/corrupted",
+                e.name
+            );
         }
     }
 }
@@ -1357,7 +1597,9 @@ fn push_crash_between_upload_and_finalize_is_idempotent() {
         let mut cloud = MockCloud::new();
 
         let f = writer.create(ROOT_INO, "model.step").unwrap();
-        let body: Vec<u8> = (0..9000u32).map(|i| (i.wrapping_mul(3).wrapping_add(seed as u32) % 251) as u8).collect();
+        let body: Vec<u8> = (0..9000u32)
+            .map(|i| (i.wrapping_mul(3).wrapping_add(seed as u32) % 251) as u8)
+            .collect();
         writer.write(f.ino, 0, &body).unwrap();
         writer.flush(f.ino).unwrap();
         let node_id = writer.node_id_for(f.ino).unwrap().unwrap();
@@ -1369,25 +1611,43 @@ fn push_crash_between_upload_and_finalize_is_idempotent() {
         io.plan.fail(&last, FailKind::PutAfterWrite, 1);
 
         HermeticEngine::push_outbox(&writer, &mut cloud, &io);
-        assert!(!cloud.nodes.contains_key(&node_id), "seed {seed}: must not finalize on upload crash");
         assert!(
-            writer.outbox_list().unwrap().iter().any(|(id, _)| id == &node_id),
+            !cloud.nodes.contains_key(&node_id),
+            "seed {seed}: must not finalize on upload crash"
+        );
+        assert!(
+            writer
+                .outbox_list()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &node_id),
             "seed {seed}: node stays queued after upload crash"
         );
 
         // Retry: re-PUTs are no-ops on the already-present chunks; commit now succeeds.
         HermeticEngine::push_outbox(&writer, &mut cloud, &io);
-        assert!(cloud.nodes.contains_key(&node_id), "seed {seed}: retry finalized the commit");
+        assert!(
+            cloud.nodes.contains_key(&node_id),
+            "seed {seed}: retry finalized the commit"
+        );
 
         // Exactly ONE upsert in the changelog (no duplicate commit from the orphaned attempt).
-        let upserts = cloud.log.iter().filter(|e| e.node_id == node_id && e.op == "upsert").count();
+        let upserts = cloud
+            .log
+            .iter()
+            .filter(|e| e.node_id == node_id && e.op == "upsert")
+            .count();
         assert_eq!(upserts, 1, "seed {seed}: exactly one commit (no duplicate)");
 
         let (reader, _rd) = device();
         HermeticEngine::pull_changes(&reader, &cloud, 0, 500, None);
         HermeticEngine::hydrate(&reader, &io, &node_id).unwrap();
         let ino = reader.lookup(ROOT_INO, "model.step").unwrap().ino;
-        assert_eq!(read_all(&reader, ino), body, "seed {seed}: byte-exact after upload-crash + retry");
+        assert_eq!(
+            read_all(&reader, ino),
+            body,
+            "seed {seed}: byte-exact after upload-crash + retry"
+        );
     }
 }
 
@@ -1418,29 +1678,43 @@ fn concurrent_edit_raises_conflict_no_data_loss() {
         let b_ino = b.lookup(ROOT_INO, "shared.scad").unwrap().ino;
 
         // A edits again → V2 on the server. B does NOT pull (still based on V1).
-        let va: Vec<u8> = (0..1500u32).map(|i| (i.wrapping_add(1 + seed as u32) % 251) as u8).collect();
+        let va: Vec<u8> = (0..1500u32)
+            .map(|i| (i.wrapping_add(1 + seed as u32) % 251) as u8)
+            .collect();
         a.truncate(f.ino, 0).unwrap();
         a.write(f.ino, 0, &va).unwrap();
         a.flush(f.ino).unwrap();
         HermeticEngine::push_outbox(&a, &mut cloud, &io);
 
         // B edits its (stale, V1-based) copy and pushes → must conflict.
-        let vb: Vec<u8> = (0..900u32).map(|i| (i.wrapping_add(99 + seed as u32) % 251) as u8).collect();
+        let vb: Vec<u8> = (0..900u32)
+            .map(|i| (i.wrapping_add(99 + seed as u32) % 251) as u8)
+            .collect();
         b.truncate(b_ino, 0).unwrap();
         b.write(b_ino, 0, &vb).unwrap();
         b.flush(b_ino).unwrap();
         let (_p, _f, conflicted) = HermeticEngine::push_outbox(&b, &mut cloud, &io);
 
         // INVARIANT: B's stale-based edit raised a conflict (not silently dropped).
-        assert_eq!(conflicted, 1, "seed {seed}: concurrent stale-based edit must conflict");
-        assert!(cloud.conflicts.contains(&node_id), "seed {seed}: server recorded the conflict");
+        assert_eq!(
+            conflicted, 1,
+            "seed {seed}: concurrent stale-based edit must conflict"
+        );
+        assert!(
+            cloud.conflicts.contains(&node_id),
+            "seed {seed}: server recorded the conflict"
+        );
 
         // INVARIANT: A's V2 is still the current/winning version and intact (both kept).
         let (reader, _rd) = device();
         HermeticEngine::pull_changes(&reader, &cloud, 0, 500, None);
         HermeticEngine::hydrate(&reader, &io, &node_id).unwrap();
         let ino = reader.lookup(ROOT_INO, "shared.scad").unwrap().ino;
-        assert_eq!(read_all(&reader, ino), va, "seed {seed}: winning version (A's V2) intact, not clobbered");
+        assert_eq!(
+            read_all(&reader, ino),
+            va,
+            "seed {seed}: winning version (A's V2) intact, not clobbered"
+        );
     }
 }
 
@@ -1464,39 +1738,69 @@ fn crash_restart_mid_drain_preserves_outbox() {
         let mut bodies: Vec<(String, Vec<u8>)> = vec![];
         // Phase 1: create files, then "crash" (drop the provider) BEFORE pushing.
         {
-            let p = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
+            let p = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap()))
+                .unwrap();
             for k in 0..5 {
                 let f = p.create(ROOT_INO, &format!("part{k}.bin")).unwrap();
-                let body: Vec<u8> = (0..(500 + (seed as usize + k) * 31)).map(|i| (i % 251) as u8).collect();
+                let body: Vec<u8> = (0..(500 + (seed as usize + k) * 31))
+                    .map(|i| (i % 251) as u8)
+                    .collect();
                 p.write(f.ino, 0, &body).unwrap();
                 p.flush(f.ino).unwrap();
                 bodies.push((p.node_id_for(f.ino).unwrap().unwrap(), body));
             }
-            assert_eq!(p.outbox_list().unwrap().len(), 5, "seed {seed}: 5 queued before crash");
+            assert_eq!(
+                p.outbox_list().unwrap().len(),
+                5,
+                "seed {seed}: 5 queued before crash"
+            );
         } // drop p → simulated crash; nothing pushed yet.
 
         // Phase 2: reopen (restart). The outbox must have survived on disk.
-        let p2 = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
-        assert_eq!(p2.outbox_list().unwrap().len(), 5, "seed {seed}: outbox survived restart");
+        let p2 =
+            SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
+        assert_eq!(
+            p2.outbox_list().unwrap().len(),
+            5,
+            "seed {seed}: outbox survived restart"
+        );
 
         // Push, "crash" again (drop), reopen, finish the drain.
         HermeticEngine::push_outbox(&p2, &mut cloud, &io);
         drop(p2);
-        let p3 = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
+        let p3 =
+            SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).unwrap())).unwrap();
         HermeticEngine::push_outbox(&p3, &mut cloud, &io);
 
         // INVARIANT: all 5 committed exactly once, retrievable byte-for-byte, outbox empty.
-        assert!(p3.outbox_list().unwrap().is_empty(), "seed {seed}: outbox fully drained after restarts");
+        assert!(
+            p3.outbox_list().unwrap().is_empty(),
+            "seed {seed}: outbox fully drained after restarts"
+        );
         for (id, body) in &bodies {
-            assert!(cloud.nodes.contains_key(id), "seed {seed}: node {id} committed across restarts");
-            let upserts = cloud.log.iter().filter(|e| &e.node_id == id && e.op == "upsert").count();
-            assert_eq!(upserts, 1, "seed {seed}: node {id} committed exactly once (no dup across restart)");
+            assert!(
+                cloud.nodes.contains_key(id),
+                "seed {seed}: node {id} committed across restarts"
+            );
+            let upserts = cloud
+                .log
+                .iter()
+                .filter(|e| &e.node_id == id && e.op == "upsert")
+                .count();
+            assert_eq!(
+                upserts, 1,
+                "seed {seed}: node {id} committed exactly once (no dup across restart)"
+            );
             let (r, _d) = device();
             HermeticEngine::pull_changes(&r, &cloud, 0, 500, None);
             HermeticEngine::hydrate(&r, &io, id).unwrap();
             let name = &cloud.nodes[id].node.name;
             let ino = r.lookup(ROOT_INO, name).unwrap().ino;
-            assert_eq!(&read_all(&r, ino), body, "seed {seed}: {name} byte-exact across restarts");
+            assert_eq!(
+                &read_all(&r, ino),
+                body,
+                "seed {seed}: {name} byte-exact across restarts"
+            );
         }
     }
 }
@@ -1556,7 +1860,12 @@ fn run_randomized(seed: u64, iters: usize) -> (usize, u64, u64, u64) {
             5 => {
                 // Inject a transient fault on a random queued node's chunks ~30% of ticks.
                 if rng.chance(30) {
-                    if let Some((nid, _)) = a.outbox_list().unwrap().into_iter().find(|(_, op)| op != "delete") {
+                    if let Some((nid, _)) = a
+                        .outbox_list()
+                        .unwrap()
+                        .into_iter()
+                        .find(|(_, op)| op != "delete")
+                    {
                         if let Ok(Some(n)) = a.sync_node(&nid) {
                             for c in &n.chunks {
                                 io.plan.fail(&c.hash, FailKind::PutBeforeWrite, 1);
@@ -1565,21 +1874,37 @@ fn run_randomized(seed: u64, iters: usize) -> (usize, u64, u64, u64) {
                     }
                 }
                 let (p, f, c) = HermeticEngine::push_outbox(&a, &mut cloud, &io);
-                log.push(format!("[{iter}] A.push: pushed={p} failed={f} conflict={c}"));
+                log.push(format!(
+                    "[{iter}] A.push: pushed={p} failed={f} conflict={c}"
+                ));
             }
             6 => {
                 let (p, f, c) = HermeticEngine::push_outbox(&b, &mut cloud, &io);
-                log.push(format!("[{iter}] B.push: pushed={p} failed={f} conflict={c}"));
+                log.push(format!(
+                    "[{iter}] B.push: pushed={p} failed={f} conflict={c}"
+                ));
             }
             7 => {
-                let interrupt = if rng.chance(40) { Some(1 + rng.below(3)) } else { None };
+                let interrupt = if rng.chance(40) {
+                    Some(1 + rng.below(3))
+                } else {
+                    None
+                };
                 a_cursor = HermeticEngine::pull_changes(&a, &cloud, a_cursor, 3, interrupt);
-                log.push(format!("[{iter}] A.pull -> cursor {a_cursor} (interrupt={interrupt:?})"));
+                log.push(format!(
+                    "[{iter}] A.pull -> cursor {a_cursor} (interrupt={interrupt:?})"
+                ));
             }
             8 => {
-                let interrupt = if rng.chance(40) { Some(1 + rng.below(3)) } else { None };
+                let interrupt = if rng.chance(40) {
+                    Some(1 + rng.below(3))
+                } else {
+                    None
+                };
                 b_cursor = HermeticEngine::pull_changes(&b, &cloud, b_cursor, 3, interrupt);
-                log.push(format!("[{iter}] B.pull -> cursor {b_cursor} (interrupt={interrupt:?})"));
+                log.push(format!(
+                    "[{iter}] B.pull -> cursor {b_cursor} (interrupt={interrupt:?})"
+                ));
             }
             _ => {
                 let ids: Vec<String> = cloud
@@ -1603,14 +1928,35 @@ fn run_randomized(seed: u64, iters: usize) -> (usize, u64, u64, u64) {
             let mut seen = std::collections::HashSet::new();
             for n in &nodes {
                 if !seen.insert((n.parent_node_id.clone(), n.name.clone())) {
-                    panic!("{}", report(seed, &log, &format!("{who}: duplicate (parent,name) for {} after iter {iter}", n.name)));
+                    panic!(
+                        "{}",
+                        report(
+                            seed,
+                            &log,
+                            &format!(
+                                "{who}: duplicate (parent,name) for {} after iter {iter}",
+                                n.name
+                            )
+                        )
+                    );
                 }
             }
-            let id_set: std::collections::HashSet<&String> = nodes.iter().map(|n| &n.node_id).collect();
+            let id_set: std::collections::HashSet<&String> =
+                nodes.iter().map(|n| &n.node_id).collect();
             for n in &nodes {
                 if let Some(pid) = &n.parent_node_id {
                     if !id_set.contains(pid) {
-                        panic!("{}", report(seed, &log, &format!("{who}: orphan {} (parent {} missing) after iter {iter}", n.node_id, pid)));
+                        panic!(
+                            "{}",
+                            report(
+                                seed,
+                                &log,
+                                &format!(
+                                    "{who}: orphan {} (parent {} missing) after iter {iter}",
+                                    n.node_id, pid
+                                )
+                            )
+                        );
                     }
                 }
             }
@@ -1630,8 +1976,10 @@ fn run_randomized(seed: u64, iters: usize) -> (usize, u64, u64, u64) {
     for _ in 0..80 {
         HermeticEngine::push_outbox(&a, &mut cloud, &io);
         HermeticEngine::push_outbox(&b, &mut cloud, &io);
-        let (na, ra) = HermeticEngine::pull_changes_signaled(&a, &cloud, a_cursor, 500, None, false);
-        let (nb, rb) = HermeticEngine::pull_changes_signaled(&b, &cloud, b_cursor, 500, None, false);
+        let (na, ra) =
+            HermeticEngine::pull_changes_signaled(&a, &cloud, a_cursor, 500, None, false);
+        let (nb, rb) =
+            HermeticEngine::pull_changes_signaled(&b, &cloud, b_cursor, 500, None, false);
         a_cursor = na;
         b_cursor = nb;
         reconcile_triggered |= ra || rb;
@@ -1674,7 +2022,13 @@ fn run_randomized(seed: u64, iters: usize) -> (usize, u64, u64, u64) {
         .filter(|c| !c.deleted && cloud_reachable(&cloud, &c.node.node_id))
         .map(|c| {
             let n = &c.node;
-            (n.node_id.clone(), n.parent_node_id.clone(), n.name.clone(), n.kind == Kind::Dir, n.manifest_id.clone())
+            (
+                n.node_id.clone(),
+                n.parent_node_id.clone(),
+                n.name.clone(),
+                n.kind == Kind::Dir,
+                n.manifest_id.clone(),
+            )
         })
         .collect();
     expected.sort();
@@ -1723,19 +2077,34 @@ fn run_randomized(seed: u64, iters: usize) -> (usize, u64, u64, u64) {
             ok = HermeticEngine::hydrate(&r, &io, id).is_ok();
         }
         if !ok {
-            panic!("{}", report(seed, &log, &format!("data loss: node {id} never hydrated")));
+            panic!(
+                "{}",
+                report(seed, &log, &format!("data loss: node {id} never hydrated"))
+            );
         }
         if let Ok(Some(ino)) = r.ino_for_node_id(id) {
             let got = read_all(&r, ino).len() as u64;
             let want: u64 = c.node.chunks.iter().map(|ch| ch.length).sum();
             if got != want {
-                panic!("{}", report(seed, &log, &format!("data loss: node {id} hydrated {got} B, manifest says {want} B")));
+                panic!(
+                    "{}",
+                    report(
+                        seed,
+                        &log,
+                        &format!("data loss: node {id} hydrated {got} B, manifest says {want} B")
+                    )
+                );
             }
         }
     }
 
     let n = cloud.nodes.values().filter(|c| !c.deleted).count();
-    (n, io.plan.puts.load(Ordering::Relaxed), io.plan.gets.load(Ordering::Relaxed), io.plan.injected.load(Ordering::Relaxed))
+    (
+        n,
+        io.plan.puts.load(Ordering::Relaxed),
+        io.plan.gets.load(Ordering::Relaxed),
+        io.plan.injected.load(Ordering::Relaxed),
+    )
 }
 
 #[test]
@@ -1758,8 +2127,14 @@ fn randomized_fault_injection_converges_no_data_loss() {
     }
     let backstop = BACKSTOP_NEEDED.with(|c| *c.borrow());
     // Sanity floor: the sweep must have built trees AND actually injected faults.
-    assert!(total_nodes > 0, "harness built no nodes across {count} seeds");
-    assert!(total_inj > 0, "harness injected no faults across {count} seeds — fault plan is dead");
+    assert!(
+        total_nodes > 0,
+        "harness built no nodes across {count} seeds"
+    );
+    assert!(
+        total_inj > 0,
+        "harness injected no faults across {count} seeds — fault plan is dead"
+    );
     eprintln!(
         "TRINITY: {count} seeds x {iters} ops — {total_nodes} live nodes, {total_inj} injected faults, \
          all converged with ZERO silent losses (convergence asserted on the production-faithful drain \
@@ -1780,7 +2155,12 @@ mod tempdir {
     impl Dir {
         pub fn new() -> Self {
             let n = CTR.fetch_add(1, Ordering::Relaxed);
-            let p = std::env::temp_dir().join(format!("trinity-{}-{}-{}", std::process::id(), super::uniq(), n));
+            let p = std::env::temp_dir().join(format!(
+                "trinity-{}-{}-{}",
+                std::process::id(),
+                super::uniq(),
+                n
+            ));
             std::fs::create_dir_all(&p).unwrap();
             Dir(p)
         }

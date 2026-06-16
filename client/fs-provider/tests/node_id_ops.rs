@@ -26,7 +26,9 @@ fn delete_by_node_id_removes_file_and_enqueues_delete() {
     // from write_file's flush, coalesced to "delete" on the same node_id).
     let outbox = p.outbox_list().unwrap();
     assert!(
-        outbox.iter().any(|(id, op)| id == &node_id && op == "delete"),
+        outbox
+            .iter()
+            .any(|(id, op)| id == &node_id && op == "delete"),
         "expected a delete entry for {node_id} in outbox, got {outbox:?}"
     );
 }
@@ -49,15 +51,29 @@ fn delete_by_node_id_removes_dir_and_subtree() {
     p.delete_by_node_id(&dir_id).unwrap();
 
     // Everything in the subtree is gone.
-    assert!(p.ino_for_node_id(&dir_id).unwrap().is_none(), "dir itself gone");
-    assert!(p.ino_for_node_id(&child_id).unwrap().is_none(), "direct child gone");
-    assert!(p.ino_for_node_id(&sub_id).unwrap().is_none(), "nested dir gone");
-    assert!(p.ino_for_node_id(&deep_id).unwrap().is_none(), "deep file gone");
+    assert!(
+        p.ino_for_node_id(&dir_id).unwrap().is_none(),
+        "dir itself gone"
+    );
+    assert!(
+        p.ino_for_node_id(&child_id).unwrap().is_none(),
+        "direct child gone"
+    );
+    assert!(
+        p.ino_for_node_id(&sub_id).unwrap().is_none(),
+        "nested dir gone"
+    );
+    assert!(
+        p.ino_for_node_id(&deep_id).unwrap().is_none(),
+        "deep file gone"
+    );
 
     // At minimum the top-level dir_id has a "delete" outbox entry.
     let outbox = p.outbox_list().unwrap();
     assert!(
-        outbox.iter().any(|(id, op)| id == &dir_id && op == "delete"),
+        outbox
+            .iter()
+            .any(|(id, op)| id == &dir_id && op == "delete"),
         "expected delete for dir_id in outbox, got {outbox:?}"
     );
 }
@@ -69,7 +85,10 @@ fn delete_by_node_id_nonexistent_is_noop() {
     let p = provider();
     // No nodes created — outbox is empty.
     p.delete_by_node_id("does-not-exist").unwrap();
-    assert!(p.outbox_list().unwrap().is_empty(), "no outbox entry for nonexistent node");
+    assert!(
+        p.outbox_list().unwrap().is_empty(),
+        "no outbox entry for nonexistent node"
+    );
 }
 
 /// Calling delete_by_node_id twice on the same (already-deleted) node is idempotent.
@@ -84,7 +103,10 @@ fn delete_by_node_id_idempotent_after_first_delete() {
     let outbox_before = p.outbox_list().unwrap();
     p.delete_by_node_id(&node_id).unwrap();
     let outbox_after = p.outbox_list().unwrap();
-    assert_eq!(outbox_before, outbox_after, "second delete must not change the outbox");
+    assert_eq!(
+        outbox_before, outbox_after,
+        "second delete must not change the outbox"
+    );
 }
 
 // ---- resolve_path ---------------------------------------------------------------
@@ -98,7 +120,10 @@ fn resolve_path_top_level_file_returns_root_ino() {
     assert_eq!(parent_ino, ROOT, "top-level file's parent is root");
     assert_eq!(leaf, "readme.txt");
     // No directories were created in the tree.
-    assert!(p.export_tree().unwrap().is_empty(), "resolve_path must not create the leaf");
+    assert!(
+        p.export_tree().unwrap().is_empty(),
+        "resolve_path must not create the leaf"
+    );
 }
 
 /// A multi-component path creates the intermediate directories and returns the parent
@@ -132,7 +157,10 @@ fn resolve_path_is_stable_on_repeat_call() {
 
     // Only two directories total (x and y) — no duplicates.
     let tree = p.export_tree().unwrap();
-    let dirs: Vec<_> = tree.iter().filter(|n| n.kind == fs_provider::Kind::Dir).collect();
+    let dirs: Vec<_> = tree
+        .iter()
+        .filter(|n| n.kind == fs_provider::Kind::Dir)
+        .collect();
     assert_eq!(dirs.len(), 2, "exactly two intermediate dirs (x, y)");
 }
 
@@ -163,7 +191,8 @@ fn rename_by_node_id_moves_to_new_parent_and_name() {
 
     let dst_dir = p.mkdir(ROOT, "dst").unwrap();
 
-    p.rename_by_node_id(&node_id, dst_dir.ino, "new.txt").unwrap();
+    p.rename_by_node_id(&node_id, dst_dir.ino, "new.txt")
+        .unwrap();
 
     // Old location is gone.
     assert!(matches!(p.lookup(ROOT, "old.txt"), Err(FsError::NotFound)));
@@ -180,7 +209,9 @@ fn rename_by_node_id_moves_to_new_parent_and_name() {
     // existing Provider::rename path).
     let outbox = p.outbox_list().unwrap();
     assert!(
-        outbox.iter().any(|(id, op)| id == &node_id && op == "upsert"),
+        outbox
+            .iter()
+            .any(|(id, op)| id == &node_id && op == "upsert"),
         "expected upsert for {node_id} in outbox after rename, got {outbox:?}"
     );
 }
@@ -190,7 +221,10 @@ fn rename_by_node_id_moves_to_new_parent_and_name() {
 fn rename_by_node_id_unknown_node_id_is_not_found() {
     let p = provider();
     let err = p.rename_by_node_id("ghost-id", ROOT, "anywhere.txt");
-    assert!(matches!(err, Err(FsError::NotFound)), "expected NotFound, got {err:?}");
+    assert!(
+        matches!(err, Err(FsError::NotFound)),
+        "expected NotFound, got {err:?}"
+    );
 }
 
 // ---- additional pinning tests (review fixes) ------------------------------------
@@ -255,6 +289,12 @@ fn parent_and_name_returns_parent_ino_and_leaf() {
 #[test]
 fn parent_and_name_root_and_unknown_are_none() {
     let p = provider();
-    assert!(p.parent_and_name(ROOT).unwrap().is_none(), "root has no parent");
-    assert!(p.parent_and_name(999_999).unwrap().is_none(), "unknown ino → None");
+    assert!(
+        p.parent_and_name(ROOT).unwrap().is_none(),
+        "root has no parent"
+    );
+    assert!(
+        p.parent_and_name(999_999).unwrap().is_none(),
+        "unknown ino → None"
+    );
 }

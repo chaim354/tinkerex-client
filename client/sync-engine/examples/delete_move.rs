@@ -13,14 +13,24 @@ use sync_client::ServerClient;
 use sync_engine::{SharedDirIO, SyncEngine};
 
 fn uniq() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 fn provider(tag: &str) -> SqliteProvider {
     let base = std::env::temp_dir().join(format!("maker-dm-{tag}-{}", uniq()));
     let cache = base.join("cache");
     std::fs::create_dir_all(&cache).unwrap();
-    SqliteProvider::open(&base.join("meta.db"), Box::new(LocalChunkStore::new(cache).unwrap())).unwrap()
+    SqliteProvider::open(
+        &base.join("meta.db"),
+        Box::new(LocalChunkStore::new(cache).unwrap()),
+    )
+    .unwrap()
 }
 
 fn write_file(p: &SqliteProvider, parent: u64, name: &str, body: &[u8]) {
@@ -42,7 +52,13 @@ fn main() {
     write_file(&a, inbox.ino, "trash.txt", b"delete me");
 
     let mut client_a = ServerClient::new(&server);
-    client_a.enroll(&format!("dm-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
+    client_a
+        .enroll(
+            &format!("dm-{}@example.com", uniq()),
+            "correct horse battery staple",
+            "device-A",
+        )
+        .expect("register A");
     SyncEngine::push_outbox(&a, &client_a, &io).expect("A initial push");
     println!("✓ A pushed Inbox/{{note.txt, trash.txt}} + Archive/");
 
@@ -55,12 +71,15 @@ fn main() {
     let b_inbox = b.lookup(ROOT_INO, "Inbox").expect("B has Inbox").ino;
     let b_archive = b.lookup(ROOT_INO, "Archive").expect("B has Archive").ino;
     b.lookup(b_inbox, "note.txt").expect("B has Inbox/note.txt");
-    b.lookup(b_inbox, "trash.txt").expect("B has Inbox/trash.txt");
+    b.lookup(b_inbox, "trash.txt")
+        .expect("B has Inbox/trash.txt");
     println!("✓ B snapshotted at seq {cursor}: Inbox/{{note.txt, trash.txt}}, Archive/ (empty)");
 
     // --- Device A: delete trash.txt, move note.txt Inbox -> Archive -----------
-    a.unlink(inbox.ino, "trash.txt").expect("A delete trash.txt");
-    a.rename(inbox.ino, "note.txt", archive.ino, "note.txt").expect("A move note.txt");
+    a.unlink(inbox.ino, "trash.txt")
+        .expect("A delete trash.txt");
+    a.rename(inbox.ino, "note.txt", archive.ino, "note.txt")
+        .expect("A move note.txt");
     SyncEngine::push_outbox(&a, &client_a, &io).expect("A push delete+move");
     println!("✓ A deleted trash.txt and moved note.txt -> Archive/, pushed the delta");
 
@@ -69,11 +88,18 @@ fn main() {
     println!("✓ B pulled changelog delta {cursor} -> {new_cursor}");
 
     // Deleted file is gone on B.
-    assert!(b.lookup(b_inbox, "trash.txt").is_err(), "trash.txt must be deleted on B");
+    assert!(
+        b.lookup(b_inbox, "trash.txt").is_err(),
+        "trash.txt must be deleted on B"
+    );
     // Moved file is at the new path...
-    b.lookup(b_archive, "note.txt").expect("note.txt must now be under Archive/ on B");
+    b.lookup(b_archive, "note.txt")
+        .expect("note.txt must now be under Archive/ on B");
     // ...and NOT duplicated at the old path.
-    assert!(b.lookup(b_inbox, "note.txt").is_err(), "note.txt must not remain in Inbox/ (no duplicate)");
+    assert!(
+        b.lookup(b_inbox, "note.txt").is_err(),
+        "note.txt must not remain in Inbox/ (no duplicate)"
+    );
 
     // The whole tree matches A exactly (same node_id/parent/name set).
     let norm = |p: &SqliteProvider| {
@@ -81,7 +107,14 @@ fn main() {
             .export_tree()
             .unwrap()
             .into_iter()
-            .map(|n| (n.node_id, n.parent_node_id, n.name, n.kind == fs_provider::Kind::Dir))
+            .map(|n| {
+                (
+                    n.node_id,
+                    n.parent_node_id,
+                    n.name,
+                    n.kind == fs_provider::Kind::Dir,
+                )
+            })
             .collect();
         v.sort();
         v

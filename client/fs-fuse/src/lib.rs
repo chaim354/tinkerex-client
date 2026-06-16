@@ -65,7 +65,9 @@ fn time_or_now_nanos(t: TimeOrNow) -> i64 {
         TimeOrNow::SpecificTime(st) => st,
         TimeOrNow::Now => SystemTime::now(),
     };
-    st.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+    st.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 fn file_attr(a: &Attr) -> FileAttr {
@@ -158,12 +160,22 @@ impl<P: Provider> FuseAdapter<P> {
     /// A mount with no hydrator — reads serve only what's already in the local cache
     /// (a cache miss is `EIO`). Used by the plain `maker-mount` binary and tests.
     pub fn new(provider: P) -> Self {
-        Self { provider, hydrator: None, freshness: None, remote_lock: None }
+        Self {
+            provider,
+            hydrator: None,
+            freshness: None,
+            remote_lock: None,
+        }
     }
 
     /// A mount whose read path hydrates missing chunks on demand (the sync daemon).
     pub fn with_hydrator(provider: P, hydrator: Arc<dyn Hydrate>) -> Self {
-        Self { provider, hydrator: Some(hydrator), freshness: None, remote_lock: None }
+        Self {
+            provider,
+            hydrator: Some(hydrator),
+            freshness: None,
+            remote_lock: None,
+        }
     }
 
     /// Add a freshness checker: every open first does a quick catch-up pull.
@@ -193,7 +205,13 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
 
     // fuser 0.15+ added the `fh: Option<FileHandle>` arg to getattr (a stat on an open fd);
     // we don't use file handles, so it's ignored.
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
+    fn getattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: Option<fuser::FileHandle>,
+        reply: ReplyAttr,
+    ) {
         match self.provider.getattr(ino.0) {
             Ok(a) => reply.attr(&TTL, &file_attr(&a)),
             Err(e) => reply.error(errno(&e)),
@@ -259,7 +277,14 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
 
     // fuser 0.17: `fh` is a `FileHandle` and `offset` is now `u64` (was `i64`); also
     // `ReplyDirectory::add` takes an `INodeNo` and a `u64` offset.
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: fuser::FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
         let ino = ino.0;
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (ino, FileType::Directory, ".".into()),
@@ -316,7 +341,10 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
             // not the whole file. Write-open already full-hydrated up front (`open`), so
             // random writes never reach this miss path with a partial cache.
             Err(FsError::ChunkMissing(_)) if self.hydrator.is_some() => {
-                self.hydrator.as_ref().unwrap().hydrate_range(ino, offset, size);
+                self.hydrator
+                    .as_ref()
+                    .unwrap()
+                    .hydrate_range(ino, offset, size);
                 match self.provider.read(ino, offset, size) {
                     Ok(data) => reply.data(&data),
                     Err(e) => reply.error(errno(&e)),
@@ -368,7 +396,13 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
                     let _ = self.provider.set_mode(a.ino, mode);
                 }
                 let a = self.provider.getattr(a.ino).unwrap_or(a);
-                reply.created(&TTL, &file_attr(&a), Generation(0), fuser::FileHandle(0), FopenFlags::empty())
+                reply.created(
+                    &TTL,
+                    &file_attr(&a),
+                    Generation(0),
+                    fuser::FileHandle(0),
+                    FopenFlags::empty(),
+                )
             }
             Err(e) => reply.error(errno(&e)),
         }
@@ -441,7 +475,10 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
     ) {
         use std::os::unix::ffi::OsStrExt;
         let target_bytes = target.as_os_str().as_bytes();
-        match self.provider.symlink(parent.0, &link_name.to_string_lossy(), target_bytes) {
+        match self
+            .provider
+            .symlink(parent.0, &link_name.to_string_lossy(), target_bytes)
+        {
             Ok(a) => reply.entry(&TTL, &file_attr(&a), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
@@ -523,7 +560,14 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
     }
 
     // fuser 0.17: `ino: INodeNo`, `fh: FileHandle`, `lock_owner: LockOwner` (no longer Option).
-    fn flush(&self, _req: &Request, ino: INodeNo, _fh: fuser::FileHandle, _lock_owner: fuser::LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
         match self.provider.flush(ino.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -584,7 +628,13 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
             let _ = self.provider.unlock(ino, lock_owner, start, end);
             return reply.ok();
         }
-        let lock = LockRange { owner: lock_owner, start, end, exclusive: typ == libc::F_WRLCK, pid };
+        let lock = LockRange {
+            owner: lock_owner,
+            start,
+            end,
+            exclusive: typ == libc::F_WRLCK,
+            pid,
+        };
         match self.provider.set_lock(ino, lock) {
             Ok(()) => reply.ok(),
             Err(_) => reply.error(fuser::Errno::EAGAIN),
@@ -608,10 +658,20 @@ impl<P: Provider + 'static> Filesystem for FuseAdapter<P> {
     ) {
         let ino = ino.0;
         let lock_owner = lock_owner.0;
-        let probe = LockRange { owner: lock_owner, start, end, exclusive: typ == libc::F_WRLCK, pid };
+        let probe = LockRange {
+            owner: lock_owner,
+            start,
+            end,
+            exclusive: typ == libc::F_WRLCK,
+            pid,
+        };
         match self.provider.test_lock(ino, probe) {
             Ok(Some(c)) => {
-                let t = if c.exclusive { libc::F_WRLCK } else { libc::F_RDLCK };
+                let t = if c.exclusive {
+                    libc::F_WRLCK
+                } else {
+                    libc::F_RDLCK
+                };
                 reply.locked(c.start, c.end, t, c.pid)
             }
             // F_UNLCK in the reply means "no conflict — the lock could be placed".

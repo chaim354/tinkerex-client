@@ -28,7 +28,10 @@ pub struct LocalTree {
 impl LocalTree {
     /// Seed from a full-tree snapshot (`GET /v1/tree`).
     pub fn from_snapshot(nodes: &[TreeNode], head_seq: i64) -> Self {
-        let mut t = Self { cursor: head_seq, ..Default::default() };
+        let mut t = Self {
+            cursor: head_seq,
+            ..Default::default()
+        };
         for n in nodes {
             t.nodes.insert(
                 n.node_id.clone(),
@@ -116,8 +119,16 @@ mod tests {
                 mtime: Some(0),
                 symlink_target: None,
             }),
-            manifest: Some(vec![ChunkRef { hash: "h".into(), offset: 0, length: 1 }]),
-            version: Some(VersionView { version_id: format!("v{seq}"), manifest_id: "m".into(), size: 1 }),
+            manifest: Some(vec![ChunkRef {
+                hash: "h".into(),
+                offset: 0,
+                length: 1,
+            }]),
+            version: Some(VersionView {
+                version_id: format!("v{seq}"),
+                manifest_id: "m".into(),
+                size: 1,
+            }),
         }
     }
 
@@ -134,7 +145,10 @@ mod tests {
         del.node.as_mut().unwrap().deleted = true;
         t.apply(&del);
         assert_eq!(t.cursor, 2);
-        assert!(t.get("n1").is_none(), "deleted node is filtered from live view");
+        assert!(
+            t.get("n1").is_none(),
+            "deleted node is filtered from live view"
+        );
     }
 
     #[test]

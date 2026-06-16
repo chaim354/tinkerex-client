@@ -25,16 +25,21 @@ fn main() {
     use sync_engine::{DaemonConfig, WebdavMount};
 
     let mut args = std::env::args().skip(1);
-    let (mountpoint, db, chunk_dir, server_url, token) =
-        match (args.next(), args.next(), args.next(), args.next(), args.next()) {
-            (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
-            _ => {
-                eprintln!(
+    let (mountpoint, db, chunk_dir, server_url, token) = match (
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, c, d, e),
+        _ => {
+            eprintln!(
                     "usage: maker-webdavd <mountpoint> <db> <chunk_dir> <server_url> <device_token> [webdav_port]"
                 );
-                std::process::exit(2);
-            }
-        };
+            std::process::exit(2);
+        }
+    };
     // Distinct WebDAV ports let two instances run at once on one box (the two-device test).
     let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(9988);
 
@@ -54,7 +59,9 @@ fn main() {
 
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
-        println!("WebDAV mounted at {mp} (port {port}) — browse it in Finder. Press Enter to unmount.");
+        println!(
+            "WebDAV mounted at {mp} (port {port}) — browse it in Finder. Press Enter to unmount."
+        );
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
         drop(mount); // unmount + stop loops

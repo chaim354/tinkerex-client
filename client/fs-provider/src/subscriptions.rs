@@ -81,7 +81,10 @@ impl SqliteProvider {
         )?;
         // Migrate a pre-existing table that lacks `pinned`. SQLite has no "ADD COLUMN IF NOT
         // EXISTS"; a duplicate-column error just means the migration already ran.
-        if let Err(e) = conn.execute("ALTER TABLE subscriptions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []) {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE subscriptions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
                 return Err(e);
@@ -134,7 +137,11 @@ impl SqliteProvider {
     pub fn set_subscription(&self, node_id: &str, rule: SubRule) -> Result<u64> {
         let conn = self.conn_lock();
         let ino: Option<i64> = conn
-            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| r.get(0))
+            .query_row(
+                "SELECT ino FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )
             .optional()?;
         let ino = ino.ok_or(FsError::NotFound)?;
         conn.execute(
@@ -158,7 +165,11 @@ impl SqliteProvider {
     pub fn pin(&self, node_id: &str) -> Result<u64> {
         let conn = self.conn_lock();
         let ino: Option<i64> = conn
-            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| r.get(0))
+            .query_row(
+                "SELECT ino FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )
             .optional()?;
         let ino = ino.ok_or(FsError::NotFound)?;
         conn.execute(
@@ -177,7 +188,10 @@ impl SqliteProvider {
     /// matching "stop forcing it" rather than "exclude it".)
     pub fn unpin(&self, node_id: &str) -> Result<()> {
         let conn = self.conn_lock();
-        conn.execute("DELETE FROM subscriptions WHERE node_id = ?1 AND pinned = 1", params![node_id])?;
+        conn.execute(
+            "DELETE FROM subscriptions WHERE node_id = ?1 AND pinned = 1",
+            params![node_id],
+        )?;
         Ok(())
     }
 
@@ -200,7 +214,8 @@ impl SqliteProvider {
     /// Every pinned `node_id` on this device (for the app/CLI to render the offline set).
     pub fn pinned_nodes(&self) -> Result<Vec<String>> {
         let conn = self.conn_lock();
-        let mut stmt = conn.prepare("SELECT node_id FROM subscriptions WHERE pinned = 1 ORDER BY node_id")?;
+        let mut stmt =
+            conn.prepare("SELECT node_id FROM subscriptions WHERE pinned = 1 ORDER BY node_id")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -209,7 +224,10 @@ impl SqliteProvider {
     /// the default policy says. Idempotent (a no-op if no rule was set).
     pub fn clear_subscription(&self, node_id: &str) -> Result<()> {
         let conn = self.conn_lock();
-        conn.execute("DELETE FROM subscriptions WHERE node_id = ?1", params![node_id])?;
+        conn.execute(
+            "DELETE FROM subscriptions WHERE node_id = ?1",
+            params![node_id],
+        )?;
         Ok(())
     }
 
@@ -219,7 +237,10 @@ impl SqliteProvider {
         let conn = self.conn_lock();
         let mut stmt = conn.prepare("SELECT node_id, rule FROM subscriptions")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, SubRule::from_str(&r.get::<_, String>(1)?)))
+            Ok((
+                r.get::<_, String>(0)?,
+                SubRule::from_str(&r.get::<_, String>(1)?),
+            ))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -249,7 +270,11 @@ impl SqliteProvider {
     pub fn scope_rule(&self, node_id: &str) -> Result<SubRule> {
         let conn = self.conn_lock();
         let ino: Option<i64> = conn
-            .query_row("SELECT ino FROM nodes WHERE node_id = ?1", params![node_id], |r| r.get(0))
+            .query_row(
+                "SELECT ino FROM nodes WHERE node_id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )
             .optional()?;
         let dflt = self.default_rule(&conn)?;
         match ino {

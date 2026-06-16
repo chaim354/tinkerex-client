@@ -36,8 +36,11 @@ fn main() {
     let tag = std::process::id();
     let db = std::env::temp_dir().join(format!("maker-verify-{tag}.db"));
     let chunks = std::env::temp_dir().join(format!("maker-verify-{tag}-chunks"));
-    let provider = SqliteProvider::open(&db, Box::new(LocalChunkStore::new(&chunks).expect("chunk dir")))
-        .expect("open local db");
+    let provider = SqliteProvider::open(
+        &db,
+        Box::new(LocalChunkStore::new(&chunks).expect("chunk dir")),
+    )
+    .expect("open local db");
     let io = PresignedIO::new(&client);
 
     if let Err(e) = SyncEngine::pull_snapshot(&provider, &client) {
@@ -49,7 +52,12 @@ fn main() {
     // node_id -> (name, parent_node_id) so we can reconstruct full paths.
     let by_id: HashMap<String, (String, Option<String>)> = nodes
         .iter()
-        .map(|n| (n.node_id.clone(), (n.name.clone(), n.parent_node_id.clone())))
+        .map(|n| {
+            (
+                n.node_id.clone(),
+                (n.name.clone(), n.parent_node_id.clone()),
+            )
+        })
         .collect();
     let path_of = |start: &str| -> String {
         let mut parts: Vec<String> = Vec::new();

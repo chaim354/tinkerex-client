@@ -10,7 +10,13 @@ use sync_client::ServerClient;
 use sync_engine::{DaemonConfig, WebdavMount};
 
 fn uniq() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 fn main() {
@@ -21,7 +27,9 @@ fn main() {
 
     let mut client = ServerClient::new(&server);
     let email = format!("webdav-{tag}@example.com");
-    let reg = client.enroll(&email, "correct horse battery staple", "webdav-test").expect("register");
+    let reg = client
+        .enroll(&email, "correct horse battery staple", "webdav-test")
+        .expect("register");
     println!("✓ registered {email}");
 
     let _ = std::fs::remove_file("/tmp/maker-webdav-live.db");
@@ -56,10 +64,19 @@ fn main() {
     let found = tree.nodes.iter().find(|n| n.name == fname);
     match found {
         Some(n) => {
-            let size: u64 = n.manifest.as_ref().map(|m| m.iter().map(|c| c.length).sum()).unwrap_or(0);
-            println!("✓ SERVER has {fname} ({size} B) — WebDAV write → sync push → server confirmed");
+            let size: u64 = n
+                .manifest
+                .as_ref()
+                .map(|m| m.iter().map(|c| c.length).sum())
+                .unwrap_or(0);
+            println!(
+                "✓ SERVER has {fname} ({size} B) — WebDAV write → sync push → server confirmed"
+            );
         }
-        None => println!("✗ {fname} NOT found on server (tree has {} nodes)", tree.nodes.len()),
+        None => println!(
+            "✗ {fname} NOT found on server (tree has {} nodes)",
+            tree.nodes.len()
+        ),
     }
 
     drop(mount); // unmount + stop loops

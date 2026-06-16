@@ -15,22 +15,43 @@ use sync_client::ServerClient;
 use sync_engine::{PresignedIO, SyncEngine};
 
 fn uniq() -> String {
-    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }
 
 fn fresh(tag: &str, cfg: ChunkConfig) -> SqliteProvider {
     let base = std::env::temp_dir().join(format!("maker-phw-{tag}-{}", uniq()));
     std::fs::create_dir_all(&base).unwrap();
-    SqliteProvider::in_memory(Box::new(LocalChunkStore::new(base.join("cache")).unwrap()), cfg).unwrap()
+    SqliteProvider::in_memory(
+        Box::new(LocalChunkStore::new(base.join("cache")).unwrap()),
+        cfg,
+    )
+    .unwrap()
 }
 
 fn main() {
     let server = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://localhost:3001".into());
-    let size = std::env::var("PHW_SIZE_KB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(3072) * 1024;
-    let par: usize = std::env::var("PHW_PAR").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let size = std::env::var("PHW_SIZE_KB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(3072)
+        * 1024;
+    let par: usize = std::env::var("PHW_PAR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     // Small chunks so a modest file yields many of them — the regime where per-chunk RTT
     // dominates and parallelism matters most (also what a block-delta'd CAD file looks like).
-    let cfg = ChunkConfig { min: 16 * 1024, avg: 32 * 1024, max: 64 * 1024 };
+    let cfg = ChunkConfig {
+        min: 16 * 1024,
+        avg: 32 * 1024,
+        max: 64 * 1024,
+    };
 
     // High-entropy, position-dependent bytes so every chunk is distinct (nothing dedups away).
     let content: Vec<u8> = (0..size)
@@ -48,7 +69,13 @@ fn main() {
     a.flush(f.ino).unwrap();
 
     let mut client_a = ServerClient::new(&server);
-    client_a.enroll(&format!("phw-{}@example.com", uniq()), "correct horse battery staple", "A").expect("register A");
+    client_a
+        .enroll(
+            &format!("phw-{}@example.com", uniq()),
+            "correct horse battery staple",
+            "A",
+        )
+        .expect("register A");
     let io_a = PresignedIO::new(&client_a);
     SyncEngine::push_outbox(&a, &client_a, &io_a).expect("A push"); // upload chunks to storage
 
@@ -56,13 +83,18 @@ fn main() {
     let n_chunks = a.node_manifest_hashes(&a_node).unwrap().len();
     println!(
         "pushed {} KB as {} chunks (~{} KB avg) to {}",
-        size / 1024, n_chunks, cfg.avg / 1024, server
+        size / 1024,
+        n_chunks,
+        cfg.avg / 1024,
+        server
     );
 
     // A fresh device pulls the metadata, then hydrates the file at the given concurrency.
     let hydrate_time = |label: &str, concurrency: usize| -> std::time::Duration {
         let b = fresh(label, ChunkConfig::default());
-        let dev = client_a.create_device(&format!("B-{label}")).expect("device");
+        let dev = client_a
+            .create_device(&format!("B-{label}"))
+            .expect("device");
         let client = ServerClient::with_token(&server, dev.device_token);
         let io = PresignedIO::new(&client);
         // pull_changes = metadata-only (NO proactive hydrate), so the timed hydrate below
@@ -76,7 +108,12 @@ fn main() {
         let hashes = b.node_manifest_hashes(&node_id).unwrap();
         let unique: std::collections::HashSet<_> = hashes.iter().collect();
         let missing = unique.iter().filter(|h| !b.has_chunk(h)).count();
-        println!("  [{label}] manifest entries={} unique={} missing_before={}", hashes.len(), unique.len(), missing);
+        println!(
+            "  [{label}] manifest entries={} unique={} missing_before={}",
+            hashes.len(),
+            unique.len(),
+            missing
+        );
 
         let t = Instant::now();
         SyncEngine::hydrate_concurrent(&b, &client, &io, &node_id, concurrency).expect("hydrate");

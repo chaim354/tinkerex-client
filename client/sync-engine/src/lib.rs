@@ -24,11 +24,11 @@ pub use daemon::{DaemonConfig, Debounce, WebdavMount, DEFAULT_HYDRATE_CONCURRENC
 /// decorator that token-bucket rate-limits the bytes any [`ChunkIO`] transfers (separate
 /// up/down caps; unlimited by default). See `docs/research-sync-competitors.md` §4 #6.
 pub mod throttle;
-pub use throttle::{RateLimiter, ThrottledChunkIO};
 #[cfg(target_os = "linux")]
 pub use daemon::Daemon;
 #[cfg(target_os = "windows")]
 pub use daemon::{CfApiMount, WinfspMount};
+pub use throttle::{RateLimiter, ThrottledChunkIO};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -205,7 +205,9 @@ impl<'a> PresignedIO<'a> {
 
 impl ChunkIO for PresignedIO<'_> {
     fn put(&self, hash: &str, put_urls: &HashMap<String, String>, bytes: Vec<u8>) -> Result<()> {
-        let url = put_urls.get(hash).ok_or_else(|| Error::NoUrl(hash.to_string()))?;
+        let url = put_urls
+            .get(hash)
+            .ok_or_else(|| Error::NoUrl(hash.to_string()))?;
         self.client.upload_chunk(url, bytes)?;
         Ok(())
     }
@@ -246,7 +248,11 @@ impl SyncEngine {
     /// success clears its outbox row; a failure is logged and **left queued** for the next
     /// tick's retry. The drain returns `Ok` even with failures (they're transient + retried);
     /// only an outbox read/clear DB error — a local-state problem — propagates.
-    pub fn push_outbox(provider: &SqliteProvider, client: &ServerClient, io: &dyn ChunkIO) -> Result<()> {
+    pub fn push_outbox(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+    ) -> Result<()> {
         // No debounce by default — drain everything ready (window 0 == disabled). The daemon
         // loop calls `push_outbox_debounced` with its configured window.
         Self::push_outbox_debounced(provider, client, io, 0, 0)
@@ -268,7 +274,11 @@ impl SyncEngine {
     ) -> Result<()> {
         let entries = provider.outbox_ready_topo(window_ms, max_age_ms)?;
         if !entries.is_empty() {
-            eprintln!("push_outbox: {} queued entr{}", entries.len(), if entries.len() == 1 { "y" } else { "ies" });
+            eprintln!(
+                "push_outbox: {} queued entr{}",
+                entries.len(),
+                if entries.len() == 1 { "y" } else { "ies" }
+            );
         }
         for (node_id, op) in entries {
             let result: Result<()> = if op == "delete" {
@@ -296,7 +306,9 @@ impl SyncEngine {
                 // Leave the entry queued so the next tick retries it; don't let it block
                 // the siblings still in this drain.
                 Err(e) => {
-                    eprintln!("push_outbox: node={node_id} op={op} failed (left queued, will retry): {e}");
+                    eprintln!(
+                        "push_outbox: node={node_id} op={op} failed (left queued, will retry): {e}"
+                    );
                 }
             }
         }
@@ -306,7 +318,11 @@ impl SyncEngine {
     /// Force-drain the **entire** outbox ignoring any debounce window — the
     /// flush-on-close/unmount path so a debounced final edit can't be left un-pushed when
     /// the daemon stops. Equivalent to `push_outbox` (window 0).
-    pub fn flush_outbox(provider: &SqliteProvider, client: &ServerClient, io: &dyn ChunkIO) -> Result<()> {
+    pub fn flush_outbox(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        io: &dyn ChunkIO,
+    ) -> Result<()> {
         Self::push_outbox_debounced(provider, client, io, 0, 0)
     }
 
@@ -332,7 +348,11 @@ impl SyncEngine {
     /// Pages through the delta — the server caps each response, so a device that's many
     /// changes behind (the offline-reconnect case) **must** loop or it silently skips
     /// every entry past the first page. Uses the default page size.
-    pub fn pull_changes(provider: &SqliteProvider, client: &ServerClient, cursor: i64) -> Result<i64> {
+    pub fn pull_changes(
+        provider: &SqliteProvider,
+        client: &ServerClient,
+        cursor: i64,
+    ) -> Result<i64> {
         Self::pull_changes_paged(provider, client, cursor, 500)
     }
 
@@ -522,7 +542,10 @@ impl SyncEngine {
         concurrency: usize,
     ) -> Result<()> {
         let hashes = provider.manifest_range_hashes(node_id, offset, size)?;
-        let missing: Vec<String> = hashes.into_iter().filter(|h| !provider.has_chunk(h)).collect();
+        let missing: Vec<String> = hashes
+            .into_iter()
+            .filter(|h| !provider.has_chunk(h))
+            .collect();
         if missing.is_empty() {
             return Ok(());
         }
@@ -659,7 +682,11 @@ impl SyncEngine {
             // Count only the bytes actually fetched this call (the still-missing chunks), so a
             // re-run over a resident subtree reports 0 bytes (idempotency is observable).
             let hashes = provider.node_manifest_hashes(&file.node_id)?;
-            let missing: Vec<String> = hashes.iter().filter(|h| !provider.has_chunk(h)).cloned().collect();
+            let missing: Vec<String> = hashes
+                .iter()
+                .filter(|h| !provider.has_chunk(h))
+                .cloned()
+                .collect();
             if missing.is_empty() {
                 continue; // already fully resident — nothing to do
             }
@@ -796,7 +823,10 @@ impl SyncEngine {
 fn verify_chunk(expected: &str, bytes: &[u8]) -> Result<()> {
     let got = hex::encode(Sha256::digest(bytes));
     if got != expected {
-        return Err(Error::ChunkCorrupt { expected: expected.to_string(), got });
+        return Err(Error::ChunkCorrupt {
+            expected: expected.to_string(),
+            got,
+        });
     }
     Ok(())
 }
@@ -898,7 +928,13 @@ fn push_node(
 ) -> Result<()> {
     match node.kind {
         Kind::Dir => {
-            client.mkdir(&node.node_id, node.parent_node_id.as_deref(), &node.name, node.mode, node.mtime)?;
+            client.mkdir(
+                &node.node_id,
+                node.parent_node_id.as_deref(),
+                &node.name,
+                node.mode,
+                node.mtime,
+            )?;
         }
         Kind::Symlink => {
             // A symlink is metadata-only — its target is the whole content (tiny inline bytes,
@@ -919,7 +955,11 @@ fn push_node(
             let manifest: Vec<ChunkRef> = node
                 .chunks
                 .iter()
-                .map(|c| ChunkRef { hash: c.hash.clone(), offset: c.offset, length: c.length })
+                .map(|c| ChunkRef {
+                    hash: c.hash.clone(),
+                    offset: c.offset,
+                    length: c.length,
+                })
                 .collect();
             let size = node.chunks.iter().map(|c| c.length).sum();
             let commit_id = uuid::Uuid::new_v4().to_string();
@@ -977,8 +1017,16 @@ impl EngineHydrator {
     }
 
     /// Hydrator with a bounded chunk-fetch worker pool of `concurrency` (0/1 = serial).
-    pub fn with_concurrency(provider: Arc<SqliteProvider>, client: ServerClient, concurrency: usize) -> Self {
-        Self { provider, client, concurrency }
+    pub fn with_concurrency(
+        provider: Arc<SqliteProvider>,
+        client: ServerClient,
+        concurrency: usize,
+    ) -> Self {
+        Self {
+            provider,
+            client,
+            concurrency,
+        }
     }
 }
 
@@ -1001,11 +1049,17 @@ impl EngineHydrator {
 #[cfg(target_os = "linux")]
 impl fs_fuse::Hydrate for EngineHydrator {
     fn hydrate(&self, ino: u64) {
-        let Some(node_id) = self.node_id_or_log(ino) else { return };
+        let Some(node_id) = self.node_id_or_log(ino) else {
+            return;
+        };
         let io = PresignedIO::new(&self.client);
-        if let Err(e) =
-            SyncEngine::hydrate_concurrent(&self.provider, &self.client, &io, &node_id, self.concurrency)
-        {
+        if let Err(e) = SyncEngine::hydrate_concurrent(
+            &self.provider,
+            &self.client,
+            &io,
+            &node_id,
+            self.concurrency,
+        ) {
             eprintln!("hydrate: ino {ino} (node {node_id}) failed: {e}");
         }
     }
@@ -1013,7 +1067,9 @@ impl fs_fuse::Hydrate for EngineHydrator {
     /// Range hydration: fetch only the chunks overlapping the read's `[offset, size)` (the
     /// header-of-a-huge-file case), not the whole file — also over the bounded worker pool.
     fn hydrate_range(&self, ino: u64, offset: u64, size: u32) {
-        let Some(node_id) = self.node_id_or_log(ino) else { return };
+        let Some(node_id) = self.node_id_or_log(ino) else {
+            return;
+        };
         let io = PresignedIO::new(&self.client);
         if let Err(e) = SyncEngine::hydrate_range_concurrent(
             &self.provider,
@@ -1024,7 +1080,9 @@ impl fs_fuse::Hydrate for EngineHydrator {
             size as u64,
             self.concurrency,
         ) {
-            eprintln!("hydrate_range: ino {ino} (node {node_id}) off={offset} len={size} failed: {e}");
+            eprintln!(
+                "hydrate_range: ino {ino} (node {node_id}) off={offset} len={size} failed: {e}"
+            );
         }
     }
 }
@@ -1049,7 +1107,9 @@ pub struct EngineInvalidate {
 #[cfg(target_os = "linux")]
 impl EngineInvalidate {
     pub fn new() -> Self {
-        Self { notifier: Arc::new(std::sync::OnceLock::new()) }
+        Self {
+            notifier: Arc::new(std::sync::OnceLock::new()),
+        }
     }
     /// Inject the FUSE notifier once the session is mounted (idempotent).
     pub fn set_notifier(&self, notifier: fuser::Notifier) {
@@ -1090,8 +1150,18 @@ pub struct EngineFreshness {
 
 #[cfg(target_os = "linux")]
 impl EngineFreshness {
-    pub fn new(provider: Arc<SqliteProvider>, client: ServerClient, inval: Option<Arc<dyn Invalidate>>) -> Self {
-        Self { provider, client, throttle: std::time::Duration::from_millis(750), last: std::sync::Mutex::new(None), inval }
+    pub fn new(
+        provider: Arc<SqliteProvider>,
+        client: ServerClient,
+        inval: Option<Arc<dyn Invalidate>>,
+    ) -> Self {
+        Self {
+            provider,
+            client,
+            throttle: std::time::Duration::from_millis(750),
+            last: std::sync::Mutex::new(None),
+            inval,
+        }
     }
 }
 
@@ -1145,7 +1215,13 @@ impl fs_fuse::Freshness for EngineFreshness {
             *last = Some(std::time::Instant::now());
         }
         let cursor = self.provider.cursor().unwrap_or(0);
-        match SyncEngine::pull_changes_paged_inval(&self.provider, &self.client, cursor, 500, self.inval.as_deref()) {
+        match SyncEngine::pull_changes_paged_inval(
+            &self.provider,
+            &self.client,
+            cursor,
+            500,
+            self.inval.as_deref(),
+        ) {
             // Advance the cursor monotonically — the sync loop may also be advancing it
             // concurrently; a regression would just re-pull an already-applied (idempotent)
             // delta, so max() is the safe reconciliation.
@@ -1163,7 +1239,11 @@ fn tree_node_to_sync(n: &TreeNode) -> SyncNode {
     let manifest_id = (!manifest.is_empty()).then(|| sync_client::manifest_id(&manifest));
     let chunks = manifest
         .into_iter()
-        .map(|c| ChunkLoc { hash: c.hash, offset: c.offset, length: c.length })
+        .map(|c| ChunkLoc {
+            hash: c.hash,
+            offset: c.offset,
+            length: c.length,
+        })
         .collect();
     SyncNode {
         node_id: n.node_id.clone(),
@@ -1173,7 +1253,9 @@ fn tree_node_to_sync(n: &TreeNode) -> SyncNode {
         manifest_id,
         chunks,
         version_id: n.version_id.clone(),
-        mode: n.mode.unwrap_or(if n.kind == "dir" { 0o755 } else { 0o644 }),
+        mode: n
+            .mode
+            .unwrap_or(if n.kind == "dir" { 0o755 } else { 0o644 }),
         // A server that predates mtime sync sends `None` — fall back to `now` so the kernel
         // still sees a fresh stamp (the old behavior); a real synced mtime is applied verbatim.
         mtime: n.mtime.unwrap_or_else(now_nanos),
@@ -1359,7 +1441,11 @@ fn change_to_sync(ch: &Change) -> Option<SyncNode> {
     let manifest_id = (!manifest.is_empty()).then(|| sync_client::manifest_id(&manifest));
     let chunks = manifest
         .into_iter()
-        .map(|c| ChunkLoc { hash: c.hash, offset: c.offset, length: c.length })
+        .map(|c| ChunkLoc {
+            hash: c.hash,
+            offset: c.offset,
+            length: c.length,
+        })
         .collect();
     Some(SyncNode {
         node_id: view.node_id.clone(),
@@ -1369,7 +1455,9 @@ fn change_to_sync(ch: &Change) -> Option<SyncNode> {
         manifest_id,
         chunks,
         version_id: ch.version.as_ref().map(|v| v.version_id.clone()),
-        mode: view.mode.unwrap_or(if view.kind == "dir" { 0o755 } else { 0o644 }),
+        mode: view
+            .mode
+            .unwrap_or(if view.kind == "dir" { 0o755 } else { 0o644 }),
         mtime: view.mtime.unwrap_or_else(now_nanos),
         // A symlink change carries its target inline (decoded from base64 by sync-client).
         symlink_target: view.symlink_target.clone(),
@@ -1397,7 +1485,11 @@ mod apply_tests {
     use std::sync::Mutex;
     use sync_client::NodeView;
 
-    const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+    const TINY: ChunkConfig = ChunkConfig {
+        min: 64,
+        avg: 256,
+        max: 1024,
+    };
 
     fn provider() -> SqliteProvider {
         SqliteProvider::in_memory(Box::new(LocalChunkStore::temp().unwrap()), TINY).unwrap()
@@ -1446,7 +1538,14 @@ mod apply_tests {
     }
 
     fn delete_change(node_id: &str) -> Change {
-        Change { seq: 0, op: "delete".into(), node_id: node_id.into(), node: None, manifest: None, version: None }
+        Change {
+            seq: 0,
+            op: "delete".into(),
+            node_id: node_id.into(),
+            node: None,
+            manifest: None,
+            version: None,
+        }
     }
 
     /// A pulled `delete` must resolve the node's ino BEFORE removing the row and fire
@@ -1458,14 +1557,31 @@ mod apply_tests {
         let inval = RecordingInval::default();
 
         // Seed a node via a pulled upsert, then look up its ino.
-        apply_change(&p, &upsert_change("N", None, "a.txt"), Some(&inval), &mut deferred).unwrap();
+        apply_change(
+            &p,
+            &upsert_change("N", None, "a.txt"),
+            Some(&inval),
+            &mut deferred,
+        )
+        .unwrap();
         let ino = p.ino_for_node_id("N").unwrap().unwrap();
-        assert_eq!(*inval.created.lock().unwrap(), vec![ino], "the insert fired created");
+        assert_eq!(
+            *inval.created.lock().unwrap(),
+            vec![ino],
+            "the insert fired created"
+        );
 
         // Now delete it — removed(ino) must fire with the SAME ino, and the row is gone.
         apply_change(&p, &delete_change("N"), Some(&inval), &mut deferred).unwrap();
-        assert_eq!(*inval.removed.lock().unwrap(), vec![ino], "delete fired removed with the node's ino");
-        assert!(p.ino_for_node_id("N").unwrap().is_none(), "node removed from the tree");
+        assert_eq!(
+            *inval.removed.lock().unwrap(),
+            vec![ino],
+            "delete fired removed with the node's ino"
+        );
+        assert!(
+            p.ino_for_node_id("N").unwrap().is_none(),
+            "node removed from the tree"
+        );
     }
 
     /// A pulled upsert that relocates an EXISTING node (new parent/name, same node_id) must fire
@@ -1478,31 +1594,65 @@ mod apply_tests {
         let mut deferred = Vec::new();
         let inval = RecordingInval::default();
 
-        apply_change(&p, &upsert_change("N", None, "old.txt"), Some(&inval), &mut deferred).unwrap();
-        let ino = p.ino_for_node_id("N").unwrap().unwrap();
-
-        // Rename within the root: a move.
-        apply_change(&p, &upsert_change("N", None, "new.txt"), Some(&inval), &mut deferred).unwrap();
-        // Move into a subdir (seed the dir first via its own insert).
         apply_change(
             &p,
-            &Change { op: "upsert".into(), ..{
-                let mut c = upsert_change("D", None, "d");
-                if let Some(n) = c.node.as_mut() { n.kind = "dir".into(); }
-                c
-            } },
+            &upsert_change("N", None, "old.txt"),
             Some(&inval),
             &mut deferred,
         )
         .unwrap();
-        apply_change(&p, &upsert_change("N", Some("D"), "new.txt"), Some(&inval), &mut deferred).unwrap();
+        let ino = p.ino_for_node_id("N").unwrap().unwrap();
+
+        // Rename within the root: a move.
+        apply_change(
+            &p,
+            &upsert_change("N", None, "new.txt"),
+            Some(&inval),
+            &mut deferred,
+        )
+        .unwrap();
+        // Move into a subdir (seed the dir first via its own insert).
+        apply_change(
+            &p,
+            &Change {
+                op: "upsert".into(),
+                ..{
+                    let mut c = upsert_change("D", None, "d");
+                    if let Some(n) = c.node.as_mut() {
+                        n.kind = "dir".into();
+                    }
+                    c
+                }
+            },
+            Some(&inval),
+            &mut deferred,
+        )
+        .unwrap();
+        apply_change(
+            &p,
+            &upsert_change("N", Some("D"), "new.txt"),
+            Some(&inval),
+            &mut deferred,
+        )
+        .unwrap();
 
         let moved = inval.moved.lock().unwrap().clone();
-        assert_eq!(moved, vec![ino, ino], "rename + reparent each fired moved(ino)");
+        assert_eq!(
+            moved,
+            vec![ino, ino],
+            "rename + reparent each fired moved(ino)"
+        );
         // The relocations must NOT have been misreported as content invalidations.
-        assert!(inval.invalidated.lock().unwrap().is_empty(), "a move is not a content invalidate");
+        assert!(
+            inval.invalidated.lock().unwrap().is_empty(),
+            "a move is not a content invalidate"
+        );
         // created fired only for the two INSERTs (N's first appearance + the dir D), never for a move.
-        assert_eq!(inval.created.lock().unwrap().len(), 2, "created only for the two inserts");
+        assert_eq!(
+            inval.created.lock().unwrap().len(),
+            2,
+            "created only for the two inserts"
+        );
     }
 
     fn dir_upsert(node_id: &str, parent: Option<&str>, name: &str) -> Change {
@@ -1517,8 +1667,10 @@ mod apply_tests {
     /// (it's in a cycle / orphaned). The post-pull invariant: the local tree is fully reachable.
     fn tree_is_acyclic_reachable(p: &SqliteProvider) -> bool {
         let nodes = p.export_tree().unwrap();
-        let parent_of: std::collections::HashMap<String, Option<String>> =
-            nodes.iter().map(|n| (n.node_id.clone(), n.parent_node_id.clone())).collect();
+        let parent_of: std::collections::HashMap<String, Option<String>> = nodes
+            .iter()
+            .map(|n| (n.node_id.clone(), n.parent_node_id.clone()))
+            .collect();
         for n in &nodes {
             let mut cur = n.parent_node_id.clone();
             let mut hops = 0;
@@ -1557,15 +1709,30 @@ mod apply_tests {
         // Y.parent := X — now a CYCLE (X is below Y). Must be DEFERRED, not Err, not applied.
         let r2 = apply_change(&p, &dir_upsert("Y", Some("X"), "Y"), None, &mut deferred)
             .expect("a cyclic reparent must be deferred, not propagated as an error");
-        assert!(!r2, "deferring doesn't itself signal reconcile (the drop does)");
+        assert!(
+            !r2,
+            "deferring doesn't itself signal reconcile (the drop does)"
+        );
         assert_eq!(deferred.len(), 1, "the cyclic upsert is buffered for retry");
-        assert!(tree_is_acyclic_reachable(&p), "tree stays reachable while the cycle is deferred");
+        assert!(
+            tree_is_acyclic_reachable(&p),
+            "tree stays reachable while the cycle is deferred"
+        );
 
         // End-of-pull drain: the cycle can't resolve from the delta alone → dropped, reconcile.
         let dropped = retry_deferred(&p, &mut deferred, None, true);
-        assert!(dropped, "an unresolvable cyclic upsert is dropped → caller hits the reconcile floor");
-        assert!(deferred.is_empty(), "deferred is cleared after the final pass");
-        assert!(tree_is_acyclic_reachable(&p), "tree stays reachable (no detached cycle)");
+        assert!(
+            dropped,
+            "an unresolvable cyclic upsert is dropped → caller hits the reconcile floor"
+        );
+        assert!(
+            deferred.is_empty(),
+            "deferred is cleared after the final pass"
+        );
+        assert!(
+            tree_is_acyclic_reachable(&p),
+            "tree stays reachable (no detached cycle)"
+        );
     }
 
     /// A cyclic interleaving that RESOLVES mid-delta: X under Y is deferred while it would cycle,
@@ -1594,7 +1761,10 @@ mod apply_tests {
         let dropped = retry_deferred(&p, &mut deferred, None, true);
         assert!(!dropped, "the interleaving resolved → no reconcile floor");
         assert!(deferred.is_empty());
-        assert!(tree_is_acyclic_reachable(&p), "converged to a reachable tree");
+        assert!(
+            tree_is_acyclic_reachable(&p),
+            "converged to a reachable tree"
+        );
 
         // Y is now under X, X under ROOT — exactly the resolved authoritative shape.
         let nodes = p.export_tree().unwrap();
@@ -1619,7 +1789,11 @@ mod apply_tests {
 
         // A.parent := C — A is C's grand-ancestor, so this closes a 3-node loop. Deferred.
         apply_change(&p, &dir_upsert("A", Some("C"), "A"), None, &mut deferred).unwrap();
-        assert_eq!(deferred.len(), 1, "the deep cyclic upsert is buffered, not applied");
+        assert_eq!(
+            deferred.len(),
+            1,
+            "the deep cyclic upsert is buffered, not applied"
+        );
         assert!(tree_is_acyclic_reachable(&p), "tree stays reachable");
 
         let dropped = retry_deferred(&p, &mut deferred, None, true);
@@ -1640,7 +1814,11 @@ mod hydrate_integrity_tests {
     use fs_provider::{ChunkConfig, LocalChunkStore, Provider};
     use std::sync::Mutex;
 
-    const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+    const TINY: ChunkConfig = ChunkConfig {
+        min: 64,
+        avg: 256,
+        max: 1024,
+    };
 
     fn provider() -> SqliteProvider {
         SqliteProvider::in_memory(Box::new(LocalChunkStore::temp().unwrap()), TINY).unwrap()
@@ -1666,7 +1844,11 @@ mod hydrate_integrity_tests {
             name: "f.bin".into(),
             kind: Kind::File,
             manifest_id: Some(manifest_id),
-            chunks: vec![ChunkLoc { hash, offset: 0, length: content.len() as u64 }],
+            chunks: vec![ChunkLoc {
+                hash,
+                offset: 0,
+                length: content.len() as u64,
+            }],
             version_id: Some("v1".into()),
             mode: 0o644,
             mtime: 0,
@@ -1722,17 +1904,25 @@ mod hydrate_integrity_tests {
                         and a bit more so the manifest is non-trivial";
         let node_id = seed_placeholder(&p, content);
         let expected_hash = sha256_hex(content);
-        assert!(!p.has_chunk(&expected_hash), "precondition: chunk not yet local");
+        assert!(
+            !p.has_chunk(&expected_hash),
+            "precondition: chunk not yet local"
+        );
 
         let client = ServerClient::new("http://127.0.0.1:0"); // never contacted (needs_urls=false)
-        let io = CorruptingIO { served: Mutex::new(Vec::new()) };
+        let io = CorruptingIO {
+            served: Mutex::new(Vec::new()),
+        };
 
         let err = SyncEngine::hydrate(&p, &client, &io, &node_id)
             .expect_err("hydrate must FAIL when the cloud returns bytes that don't match the hash");
 
         match err {
             Error::ChunkCorrupt { expected, .. } => {
-                assert_eq!(expected, expected_hash, "the error names the expected manifest hash");
+                assert_eq!(
+                    expected, expected_hash,
+                    "the error names the expected manifest hash"
+                );
             }
             other => panic!("expected Error::ChunkCorrupt, got {other:?}"),
         }
@@ -1743,7 +1933,11 @@ mod hydrate_integrity_tests {
             "corrupt bytes must never enter the local cache under the chunk's hash"
         );
         // And the transport was actually exercised (we really fetched + rejected).
-        assert_eq!(io.served.lock().unwrap().len(), 1, "the corrupt chunk was fetched once");
+        assert_eq!(
+            io.served.lock().unwrap().len(),
+            1,
+            "the corrupt chunk was fetched once"
+        );
     }
 
     /// GREEN companion: a correct chunk (bytes hash to the requested hash) hydrates fine and is
@@ -1761,10 +1955,16 @@ mod hydrate_integrity_tests {
         let client = ServerClient::new("http://127.0.0.1:0");
 
         SyncEngine::hydrate(&p, &client, &io, &node_id).expect("a correct chunk hydrates");
-        assert!(p.has_chunk(&hash), "the verified chunk is now in the local cache");
+        assert!(
+            p.has_chunk(&hash),
+            "the verified chunk is now in the local cache"
+        );
         // And the file reads back byte-for-byte.
         let ino = p.ino_for_node_id(&node_id).unwrap().unwrap();
         let got = p.read(ino, 0, content.len() as u32).unwrap();
-        assert_eq!(got, content, "the hydrated file reads back its real content");
+        assert_eq!(
+            got, content,
+            "the hydrated file reads back its real content"
+        );
     }
 }

@@ -48,16 +48,30 @@ macro_rules! server_url {
 
 /// Small chunks so even a few-KB file is multi-chunk → the data plane + dedup get real
 /// coverage under load (same rationale as integration.rs's TINY).
-const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+const TINY: ChunkConfig = ChunkConfig {
+    min: 64,
+    avg: 256,
+    max: 1024,
+};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn uniq() -> String {
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), n)
+    format!(
+        "{:x}-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        n
+    )
 }
 
 fn dev() -> SqliteProvider {
@@ -67,14 +81,20 @@ fn dev() -> SqliteProvider {
 
 fn read_all(p: &SqliteProvider, ino: u64) -> Vec<u8> {
     let size = p.getattr(ino).unwrap().size;
-    if size == 0 { Vec::new() } else { p.read(ino, 0, size as u32).unwrap() }
+    if size == 0 {
+        Vec::new()
+    } else {
+        p.read(ino, 0, size as u32).unwrap()
+    }
 }
 
 fn prng(seed: u64, n: usize) -> Vec<u8> {
     let mut s = seed ^ 0x9e37_79b9_7f4a_7c15;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as u8
         })
         .collect()
@@ -84,10 +104,18 @@ fn prng(seed: u64, n: usize) -> Vec<u8> {
 /// token per device. Each device gets its own `ServerClient` + provider in its thread.
 fn library_with_devices(url: &str, n: usize) -> (ServerClient, Vec<String>) {
     let mut admin = ServerClient::new(url);
-    admin.enroll(&format!("load-{}@example.com", uniq()), "correct horse battery staple", "device-0").expect("register");
+    admin
+        .enroll(
+            &format!("load-{}@example.com", uniq()),
+            "correct horse battery staple",
+            "device-0",
+        )
+        .expect("register");
     let mut tokens = vec![admin.token().unwrap().to_string()];
     for i in 1..n {
-        let d = admin.create_device(&format!("device-{i}")).expect("create_device");
+        let d = admin
+            .create_device(&format!("device-{i}"))
+            .expect("create_device");
         tokens.push(d.device_token);
     }
     (admin, tokens)
@@ -103,14 +131,20 @@ struct SharedCloud {
 impl SharedCloud {
     fn new() -> Self {
         Self {
-            inner: SharedDirIO::new(std::env::temp_dir().join(format!("load-cloud-{}", uniq()))).unwrap(),
+            inner: SharedDirIO::new(std::env::temp_dir().join(format!("load-cloud-{}", uniq())))
+                .unwrap(),
             puts: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
         }
     }
 }
 impl ChunkIO for SharedCloud {
-    fn put(&self, hash: &str, urls: &HashMap<String, String>, bytes: Vec<u8>) -> sync_engine::Result<()> {
+    fn put(
+        &self,
+        hash: &str,
+        urls: &HashMap<String, String>,
+        bytes: Vec<u8>,
+    ) -> sync_engine::Result<()> {
         self.puts.fetch_add(1, Ordering::Relaxed);
         self.inner.put(hash, urls, bytes)
     }
@@ -175,7 +209,10 @@ fn concurrent_distinct_commits_no_loss_changelog_monotonic() {
             let mut mine = Vec::new();
             for k in 0..per_device {
                 let name = format!("d{dev_idx}_f{k}.bin");
-                let body = prng((dev_idx as u64) << 32 | k as u64, 2000 + dev_idx * 37 + k * 11);
+                let body = prng(
+                    (dev_idx as u64) << 32 | k as u64,
+                    2000 + dev_idx * 37 + k * 11,
+                );
                 let f = p.create(ROOT_INO, &name).unwrap();
                 p.write(f.ino, 0, &body).unwrap();
                 p.flush(f.ino).unwrap();
@@ -183,7 +220,10 @@ fn concurrent_distinct_commits_no_loss_changelog_monotonic() {
             }
             barrier.wait();
             push_with_retry(&p, &client, &*cloud, 10);
-            assert!(p.outbox_list().unwrap().is_empty(), "device {dev_idx}: outbox not drained");
+            assert!(
+                p.outbox_list().unwrap().is_empty(),
+                "device {dev_idx}: outbox not drained"
+            );
             let mut e = expected.lock().unwrap();
             for (name, body) in mine {
                 e.insert(name, body);
@@ -200,10 +240,17 @@ fn concurrent_distinct_commits_no_loss_changelog_monotonic() {
     SyncEngine::pull_snapshot(&reader, &admin).expect("reader snapshot");
     let expected = expected.lock().unwrap();
     for (name, body) in expected.iter() {
-        let bf = reader.lookup(ROOT_INO, name).unwrap_or_else(|_| panic!("LOST commit: {name}"));
+        let bf = reader
+            .lookup(ROOT_INO, name)
+            .unwrap_or_else(|_| panic!("LOST commit: {name}"));
         let nid = reader.node_id_for(bf.ino).unwrap().unwrap();
-        SyncEngine::hydrate(&reader, &admin, &*cloud, &nid).unwrap_or_else(|e| panic!("hydrate {name}: {e}"));
-        assert_eq!(&read_all(&reader, bf.ino), body, "{name}: corrupted under concurrent commits");
+        SyncEngine::hydrate(&reader, &admin, &*cloud, &nid)
+            .unwrap_or_else(|e| panic!("hydrate {name}: {e}"));
+        assert_eq!(
+            &read_all(&reader, bf.ino),
+            body,
+            "{name}: corrupted under concurrent commits"
+        );
     }
 
     // The changelog must be a clean, strictly-increasing, gapless-on-read sequence — the proof
@@ -213,9 +260,18 @@ fn concurrent_distinct_commits_no_loss_changelog_monotonic() {
     let n_entries = seqs.len();
     seqs.sort();
     seqs.dedup();
-    assert_eq!(seqs.len(), n_entries, "changelog has DUPLICATE seq values (torn commit under load)");
+    assert_eq!(
+        seqs.len(),
+        n_entries,
+        "changelog has DUPLICATE seq values (torn commit under load)"
+    );
     for w in seqs.windows(2) {
-        assert!(w[1] > w[0], "changelog seq not strictly increasing: {} then {}", w[0], w[1]);
+        assert!(
+            w[1] > w[0],
+            "changelog seq not strictly increasing: {} then {}",
+            w[0],
+            w[1]
+        );
     }
 
     eprintln!(
@@ -280,7 +336,9 @@ fn concurrent_same_node_edits_one_wins_rest_conflict() {
             let p = dev();
             let client = ServerClient::with_token(&url, token);
             SyncEngine::pull_snapshot(&p, &client).expect("pull V1");
-            let bf = p.lookup(ROOT_INO, "contended.scad").expect("has the shared file");
+            let bf = p
+                .lookup(ROOT_INO, "contended.scad")
+                .expect("has the shared file");
             let nid = p.node_id_for(bf.ino).unwrap().unwrap();
             if let Some(v) = p.sync_node(&nid).unwrap().unwrap().version_id {
                 bases.lock().unwrap().insert(v);
@@ -324,10 +382,17 @@ fn concurrent_same_node_edits_one_wins_rest_conflict() {
         let rf = r.lookup(ROOT_INO, "contended.scad").unwrap();
         r.node_id_for(rf.ino).unwrap().unwrap()
     };
-    let node_entries: Vec<&_> = all.changes.iter().filter(|c| c.node_id == node_id).collect();
+    let node_entries: Vec<&_> = all
+        .changes
+        .iter()
+        .filter(|c| c.node_id == node_id)
+        .collect();
     let puts = node_entries.iter().filter(|c| c.op == "put").count();
     let conflict_ops = node_entries.iter().filter(|c| c.op == "conflict").count();
-    assert_eq!(puts, 2, "exactly the seed V1 + ONE winning fast-forward (got {puts} puts on the node)");
+    assert_eq!(
+        puts, 2,
+        "exactly the seed V1 + ONE winning fast-forward (got {puts} puts on the node)"
+    );
     assert_eq!(
         conflict_ops,
         n_devices - 1,
@@ -340,10 +405,15 @@ fn concurrent_same_node_edits_one_wins_rest_conflict() {
     // surfaced through the version history / conflict-resolution flow.
     let reader = dev();
     SyncEngine::pull_snapshot(&reader, &admin).expect("reader snapshot");
-    let rf = reader.lookup(ROOT_INO, "contended.scad").expect("winner present");
+    let rf = reader
+        .lookup(ROOT_INO, "contended.scad")
+        .expect("winner present");
     SyncEngine::hydrate(&reader, &admin, &*cloud, &node_id).expect("winner hydrates");
     let winner = read_all(&reader, rf.ino);
-    assert!(!winner.is_empty(), "winning version must have content (not lost)");
+    assert!(
+        !winner.is_empty(),
+        "winning version must have content (not lost)"
+    );
     let versions = admin.versions(&node_id).expect("versions").versions;
     assert!(
         versions.len() >= n_devices,
@@ -353,7 +423,10 @@ fn concurrent_same_node_edits_one_wins_rest_conflict() {
 
     // The UI surfaces ONE unresolved conflict for the node (per-node prompt), and it resolves.
     let ledger = admin.conflicts().expect("conflicts").conflicts;
-    assert!(ledger.iter().any(|c| c.node_id == node_id), "an unresolved conflict is surfaced for the node");
+    assert!(
+        ledger.iter().any(|c| c.node_id == node_id),
+        "an unresolved conflict is surfaced for the node"
+    );
 
     eprintln!(
         "\n==== CONCURRENT SAME-NODE EDITS ====\n{n_devices} devices raced one base V1 simultaneously: changelog recorded \
@@ -457,7 +530,11 @@ fn concurrent_pulls_and_hydrates_while_writing() {
         h.join().expect("reader thread panicked");
     }
 
-    assert_eq!(torn.load(Ordering::Relaxed), 0, "a reader hit a TORN MANIFEST (committed node with unresolvable chunks)");
+    assert_eq!(
+        torn.load(Ordering::Relaxed),
+        0,
+        "a reader hit a TORN MANIFEST (committed node with unresolvable chunks)"
+    );
 
     // Final convergence: a fresh reader sees exactly all writer files, byte-for-byte.
     let reader = dev();
@@ -467,9 +544,12 @@ fn concurrent_pulls_and_hydrates_while_writing() {
         for r in 0..rounds {
             let name = format!("w{wi}_r{r}.bin");
             let body = prng((wi as u64) << 40 | r as u64, 1500 + wi * 31 + r * 17);
-            let bf = reader.lookup(ROOT_INO, &name).unwrap_or_else(|_| panic!("missing {name} at convergence"));
+            let bf = reader
+                .lookup(ROOT_INO, &name)
+                .unwrap_or_else(|_| panic!("missing {name} at convergence"));
             let nid = reader.node_id_for(bf.ino).unwrap().unwrap();
-            SyncEngine::hydrate(&reader, &admin, &*cloud, &nid).unwrap_or_else(|e| panic!("hydrate {name}: {e}"));
+            SyncEngine::hydrate(&reader, &admin, &*cloud, &nid)
+                .unwrap_or_else(|e| panic!("hydrate {name}: {e}"));
             assert_eq!(read_all(&reader, bf.ino), body, "{name}: corrupted");
             count += 1;
         }
@@ -563,7 +643,11 @@ fn far_behind_device_pages_backlog_while_others_write() {
             let bf = laggard_p
                 .lookup(ROOT_INO, &name)
                 .unwrap_or_else(|_| panic!("laggard DROPPED {name} while paging the backlog"));
-            assert_eq!(read_all(&laggard_p, bf.ino), body, "{name}: corrupted in laggard's paged pull");
+            assert_eq!(
+                read_all(&laggard_p, bf.ino),
+                body,
+                "{name}: corrupted in laggard's paged pull"
+            );
             verified += 1;
         }
     }
@@ -571,11 +655,22 @@ fn far_behind_device_pages_backlog_while_others_write() {
     // Sanity: the laggard's tree equals a fresh full-snapshot reader's tree (full convergence).
     let fresh = dev();
     SyncEngine::pull_snapshot(&fresh, &admin).expect("fresh snapshot");
-    let laggard_names: std::collections::BTreeSet<String> =
-        laggard_p.readdir(ROOT_INO).unwrap().into_iter().map(|e| e.name).collect();
-    let fresh_names: std::collections::BTreeSet<String> =
-        fresh.readdir(ROOT_INO).unwrap().into_iter().map(|e| e.name).collect();
-    assert_eq!(laggard_names, fresh_names, "laggard's paged tree != fresh snapshot tree (paging dropped entries)");
+    let laggard_names: std::collections::BTreeSet<String> = laggard_p
+        .readdir(ROOT_INO)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let fresh_names: std::collections::BTreeSet<String> = fresh
+        .readdir(ROOT_INO)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(
+        laggard_names, fresh_names,
+        "laggard's paged tree != fresh snapshot tree (paging dropped entries)"
+    );
 
     eprintln!(
         "\n==== FAR-BEHIND DEVICE PAGES BACKLOG WHILE OTHERS WRITE ====\n{n_writers} writers x {per_writer} = {} backlog files; \

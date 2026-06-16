@@ -80,7 +80,13 @@ fn main() {
                 reply.error(fuser::Errno::ENOENT);
             }
         }
-        fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
+        fn getattr(
+            &self,
+            _req: &Request,
+            ino: INodeNo,
+            _fh: Option<fuser::FileHandle>,
+            reply: ReplyAttr,
+        ) {
             match u64::from(ino) {
                 1 => reply.attr(&TTL, &dir_attr()),
                 2 => reply.attr(&TTL, &file_attr()),
@@ -104,7 +110,14 @@ fn main() {
                 reply.error(fuser::Errno::ENOENT);
             }
         }
-        fn readdir(&self, _req: &Request, ino: INodeNo, _fh: fuser::FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        fn readdir(
+            &self,
+            _req: &Request,
+            ino: INodeNo,
+            _fh: fuser::FileHandle,
+            offset: u64,
+            mut reply: ReplyDirectory,
+        ) {
             if u64::from(ino) != 1 {
                 reply.error(fuser::Errno::ENOENT);
                 return;
@@ -130,7 +143,10 @@ fn main() {
         p.to_string_lossy().into_owned()
     });
     std::fs::create_dir_all(&mnt).ok();
-    eprintln!("SMOKE: mounting at {mnt} (fuser {})", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "SMOKE: mounting at {mnt} (fuser {})",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // EXACTLY the daemon's Config: FSName + DefaultPermissions, via spawn_mount2.
     let mut config = fuser::Config::default();
@@ -178,7 +194,12 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn findmnt_reports(path: &str) -> bool {
     use std::process::Command;
-    match Command::new("findmnt").arg("--noheadings").arg("--target").arg(path).output() {
+    match Command::new("findmnt")
+        .arg("--noheadings")
+        .arg("--target")
+        .arg(path)
+        .output()
+    {
         Ok(out) => {
             out.status.success()
                 && String::from_utf8_lossy(&out.stdout)

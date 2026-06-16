@@ -21,14 +21,25 @@ use fs_provider::{ChunkConfig, LocalChunkStore, Provider, SqliteProvider, ROOT_I
 use sync_client::ServerClient;
 use sync_engine::{ChunkIO, SharedDirIO, SyncEngine};
 
-const TINY: ChunkConfig = ChunkConfig { min: 64, avg: 256, max: 1024 };
+const TINY: ChunkConfig = ChunkConfig {
+    min: 64,
+    avg: 256,
+    max: 1024,
+};
 
 fn uniq() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(), n)
+    format!(
+        "{:x}-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        n
+    )
 }
 
 fn dev() -> SqliteProvider {
@@ -38,7 +49,11 @@ fn dev() -> SqliteProvider {
 
 fn read_all(p: &SqliteProvider, ino: u64) -> Vec<u8> {
     let size = p.getattr(ino).unwrap().size;
-    if size == 0 { Vec::new() } else { p.read(ino, 0, size as u32).unwrap() }
+    if size == 0 {
+        Vec::new()
+    } else {
+        p.read(ino, 0, size as u32).unwrap()
+    }
 }
 
 /// Distinct incompressible bytes so FastCDC yields MANY chunks per file.
@@ -98,10 +113,13 @@ fn fresh_device_with_subtree() -> (SqliteProvider, SharedDirIO, Layout) {
     src.write(af.ino, 0, &archive_body).unwrap();
     src.flush(af.ino).unwrap();
 
-    let cloud = SharedDirIO::new(std::env::temp_dir().join(format!("oa-cloud-{}", uniq()))).unwrap();
+    let cloud =
+        SharedDirIO::new(std::env::temp_dir().join(format!("oa-cloud-{}", uniq()))).unwrap();
     for n in src.export_tree().unwrap() {
         for h in src.node_manifest_hashes(&n.node_id).unwrap() {
-            cloud.put(&h, &HashMap::new(), src.chunk_get(&h).unwrap()).unwrap();
+            cloud
+                .put(&h, &HashMap::new(), src.chunk_get(&h).unwrap())
+                .unwrap();
         }
     }
 
@@ -126,7 +144,11 @@ fn fresh_device_with_subtree() -> (SqliteProvider, SharedDirIO, Layout) {
     }
     let d_archive = dst.lookup(ROOT_INO, "Archive").unwrap();
     let d_af = dst.lookup(d_archive.ino, "old.stl").unwrap();
-    let archive_file = (dst.node_id_for(d_af.ino).unwrap().unwrap(), d_af.ino, archive_body);
+    let archive_file = (
+        dst.node_id_for(d_af.ino).unwrap().unwrap(),
+        d_af.ino,
+        archive_body,
+    );
 
     let layout = Layout {
         jobs_dir: dst.node_id_for(d_jobs.ino).unwrap().unwrap(),
@@ -150,9 +172,20 @@ fn offline_readiness_reports_partial_before_and_full_after() {
     assert!(before.total_chunks > 3, "multi-chunk files");
     assert_eq!(before.present_chunks, 0, "no chunks cached yet");
     assert!(!before.is_ready(), "subtree is NOT ready for offline");
-    let mut missing: Vec<String> = before.missing_files.iter().map(|f| f.path.clone()).collect();
+    let mut missing: Vec<String> = before
+        .missing_files
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
     missing.sort();
-    assert_eq!(missing, vec!["Jobs/ClientX/part.step", "Jobs/ClientX/sub/deep.lbrn2", "Jobs/a.stl"]);
+    assert_eq!(
+        missing,
+        vec![
+            "Jobs/ClientX/part.step",
+            "Jobs/ClientX/sub/deep.lbrn2",
+            "Jobs/a.stl"
+        ]
+    );
 
     // Hydrate just ONE file (part.step) directly. Now readiness is PARTIAL: 1/3 ready,
     // some chunks present, that one file no longer in the missing list.
@@ -161,7 +194,10 @@ fn offline_readiness_reports_partial_before_and_full_after() {
     SyncEngine::hydrate(&b, &client, &cloud, part_id).unwrap();
     let partial = SyncEngine::offline_readiness(&b, &layout.jobs_dir).unwrap();
     assert_eq!(partial.ready_files, 1, "one file fully local now");
-    assert!(partial.present_chunks > 0 && partial.present_chunks < partial.total_chunks, "partial chunk coverage");
+    assert!(
+        partial.present_chunks > 0 && partial.present_chunks < partial.total_chunks,
+        "partial chunk coverage"
+    );
     assert!(!partial.is_ready(), "still not fully ready");
     assert!(
         !partial.missing_files.iter().any(|f| &f.node_id == part_id),
@@ -198,28 +234,48 @@ fn ensure_available_offline_hydrates_a_whole_subtree() {
     let client = offline_client();
 
     // Pre-condition: nothing under Jobs is local.
-    assert_eq!(SyncEngine::offline_readiness(&b, &layout.jobs_dir).unwrap().present_chunks, 0);
+    assert_eq!(
+        SyncEngine::offline_readiness(&b, &layout.jobs_dir)
+            .unwrap()
+            .present_chunks,
+        0
+    );
 
-    let summary = SyncEngine::ensure_available_offline(&b, &client, &cloud, &layout.jobs_dir, 4).unwrap();
+    let summary =
+        SyncEngine::ensure_available_offline(&b, &client, &cloud, &layout.jobs_dir, 4).unwrap();
 
     // Every Jobs file hydrated; the summary counts files + bytes and has no failures.
     assert_eq!(summary.files_hydrated, 3, "all three Jobs files hydrated");
     assert!(summary.failures.is_empty(), "no failures");
-    let expected_bytes: u64 =
-        ["top", "part", "deep"].iter().map(|l| layout.files[l].2.len() as u64).sum();
-    assert_eq!(summary.bytes_hydrated, expected_bytes, "bytes accounted across the subtree");
+    let expected_bytes: u64 = ["top", "part", "deep"]
+        .iter()
+        .map(|l| layout.files[l].2.len() as u64)
+        .sum();
+    assert_eq!(
+        summary.bytes_hydrated, expected_bytes,
+        "bytes accounted across the subtree"
+    );
 
     // Verified: readiness is now 100% and every file reads back byte-for-byte offline.
-    assert!(SyncEngine::offline_readiness(&b, &layout.jobs_dir).unwrap().is_ready());
+    assert!(SyncEngine::offline_readiness(&b, &layout.jobs_dir)
+        .unwrap()
+        .is_ready());
     for label in ["top", "part", "deep"] {
         let (_, ino, body) = &layout.files[label];
-        assert_eq!(&read_all(&b, *ino), body, "{label} reads back byte-for-byte from local cache");
+        assert_eq!(
+            &read_all(&b, *ino),
+            body,
+            "{label} reads back byte-for-byte from local cache"
+        );
     }
 
     // Scope discipline: the Archive file OUTSIDE Jobs was NOT hydrated.
     let (arch_id, _, _) = &layout.archive_file;
     assert!(
-        b.node_manifest_hashes(arch_id).unwrap().iter().any(|h| !b.has_chunk(h)),
+        b.node_manifest_hashes(arch_id)
+            .unwrap()
+            .iter()
+            .any(|h| !b.has_chunk(h)),
         "out-of-subtree Archive file stays a placeholder"
     );
 }
@@ -231,14 +287,18 @@ fn ensure_available_offline_is_idempotent() {
     let (b, cloud, layout) = fresh_device_with_subtree();
     let client = offline_client();
 
-    let first = SyncEngine::ensure_available_offline(&b, &client, &cloud, &layout.jobs_dir, 4).unwrap();
+    let first =
+        SyncEngine::ensure_available_offline(&b, &client, &cloud, &layout.jobs_dir, 4).unwrap();
     assert_eq!(first.files_hydrated, 3);
 
-    let second = SyncEngine::ensure_available_offline(&b, &client, &cloud, &layout.jobs_dir, 4).unwrap();
+    let second =
+        SyncEngine::ensure_available_offline(&b, &client, &cloud, &layout.jobs_dir, 4).unwrap();
     assert_eq!(second.files_hydrated, 0, "nothing left to hydrate");
     assert_eq!(second.bytes_hydrated, 0);
     assert!(second.failures.is_empty());
-    assert!(SyncEngine::offline_readiness(&b, &layout.jobs_dir).unwrap().is_ready());
+    assert!(SyncEngine::offline_readiness(&b, &layout.jobs_dir)
+        .unwrap()
+        .is_ready());
 }
 
 /// Works on a single FILE too (not only a folder).
@@ -250,6 +310,8 @@ fn ensure_available_offline_on_a_single_file() {
 
     let summary = SyncEngine::ensure_available_offline(&b, &client, &cloud, deep_id, 4).unwrap();
     assert_eq!(summary.files_hydrated, 1);
-    assert!(SyncEngine::offline_readiness(&b, deep_id).unwrap().is_ready());
+    assert!(SyncEngine::offline_readiness(&b, deep_id)
+        .unwrap()
+        .is_ready());
     assert_eq!(&read_all(&b, *deep_ino), deep_body);
 }

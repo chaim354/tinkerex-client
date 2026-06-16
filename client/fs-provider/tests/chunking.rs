@@ -70,19 +70,27 @@ proptest! {
 #[test]
 fn identical_content_yields_identical_manifest_and_chunks() {
     let p = provider();
-    let body: Vec<u8> = (0..4000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let body: Vec<u8> = (0..4000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
     write_file(&p, ROOT, "a.bin", &body);
     write_file(&p, ROOT, "b.bin", &body);
 
     let a = node_named(&p, "a.bin");
     let b = node_named(&p, "b.bin");
-    assert_eq!(a.manifest_id, b.manifest_id, "identical content → identical manifest_id");
+    assert_eq!(
+        a.manifest_id, b.manifest_id,
+        "identical content → identical manifest_id"
+    );
     assert_eq!(
         a.chunks.iter().map(|c| &c.hash).collect::<Vec<_>>(),
         b.chunks.iter().map(|c| &c.hash).collect::<Vec<_>>(),
         "identical content → identical ordered chunk list",
     );
-    assert!(a.chunks.len() > 1, "tiny chunk config should split 4 KB into many chunks");
+    assert!(
+        a.chunks.len() > 1,
+        "tiny chunk config should split 4 KB into many chunks"
+    );
 }
 
 #[test]
@@ -92,7 +100,10 @@ fn different_content_differs_in_at_least_one_chunk() {
     write_file(&p, ROOT, "a.bin", &body);
     body[2000] ^= 0xff; // flip one byte in the middle
     write_file(&p, ROOT, "b.bin", &body);
-    assert_ne!(node_named(&p, "a.bin").manifest_id, node_named(&p, "b.bin").manifest_id);
+    assert_ne!(
+        node_named(&p, "a.bin").manifest_id,
+        node_named(&p, "b.bin").manifest_id
+    );
 }
 
 // ---- block-delta: boundary stability under edits -----------------------------------
@@ -104,7 +115,9 @@ fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
     let mut s = seed.wrapping_add(0x9e3779b97f4a7c15);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as u8
         })
         .collect()
@@ -171,7 +184,10 @@ fn single_byte_middle_edit_perturbs_few_chunks() {
         changed <= orig_n / 4 + 2,
         "one-byte edit changed {changed} of {orig_n} chunks — CDC should localize it",
     );
-    assert!(changed >= 1, "the edit must change at least the chunk it lands in");
+    assert!(
+        changed >= 1,
+        "the edit must change at least the chunk it lands in"
+    );
 }
 
 // ---- manifest layout invariants ----------------------------------------------------
@@ -200,17 +216,34 @@ proptest! {
 fn chunk_sizes_respect_configured_bounds() {
     // FastCDC guarantees min ≤ size ≤ max for every chunk except the last (which may be
     // shorter). This pins that our ChunkConfig is actually plumbed into the chunker.
-    let cfg = ChunkConfig { min: 512, avg: 2048, max: 8192 };
+    let cfg = ChunkConfig {
+        min: 512,
+        avg: 2048,
+        max: 8192,
+    };
     let p = provider_with(cfg);
     let body = pseudo_random(200_000, 7);
     write_file(&p, ROOT, "f.bin", &body);
     let chunks = chunks_of(&p, "f.bin");
-    assert!(chunks.len() > 10, "200 KB should be many chunks at avg 2 KB");
+    assert!(
+        chunks.len() > 10,
+        "200 KB should be many chunks at avg 2 KB"
+    );
 
     for (i, c) in chunks.iter().enumerate() {
-        assert!(c.length <= cfg.max as u64, "chunk {i} len {} exceeds max {}", c.length, cfg.max);
+        assert!(
+            c.length <= cfg.max as u64,
+            "chunk {i} len {} exceeds max {}",
+            c.length,
+            cfg.max
+        );
         if i + 1 < chunks.len() {
-            assert!(c.length >= cfg.min as u64, "non-final chunk {i} len {} below min {}", c.length, cfg.min);
+            assert!(
+                c.length >= cfg.min as u64,
+                "non-final chunk {i} len {} below min {}",
+                c.length,
+                cfg.min
+            );
         }
     }
 }
@@ -239,7 +272,12 @@ fn all_zeros_roundtrips_and_dedups_hard() {
 #[test]
 fn highly_repetitive_and_random_both_roundtrip() {
     let p = provider();
-    let repetitive: Vec<u8> = b"makerserver".iter().cycle().take(40_000).copied().collect();
+    let repetitive: Vec<u8> = b"makerserver"
+        .iter()
+        .cycle()
+        .take(40_000)
+        .copied()
+        .collect();
     let random = pseudo_random(40_000, 42);
     let r1 = write_file(&p, ROOT, "rep.bin", &repetitive);
     let r2 = write_file(&p, ROOT, "rnd.bin", &random);
@@ -253,5 +291,8 @@ fn empty_file_has_no_chunks_and_reads_empty() {
     let ino = write_file(&p, ROOT, "empty.bin", b"");
     assert_eq!(p.getattr(ino).unwrap().size, 0);
     assert!(read_all(&p, ino).is_empty());
-    assert!(chunks_of(&p, "empty.bin").is_empty(), "an empty file carries no chunks");
+    assert!(
+        chunks_of(&p, "empty.bin").is_empty(),
+        "an empty file carries no chunks"
+    );
 }
