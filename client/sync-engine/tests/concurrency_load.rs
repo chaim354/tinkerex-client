@@ -84,7 +84,7 @@ fn prng(seed: u64, n: usize) -> Vec<u8> {
 /// token per device. Each device gets its own `ServerClient` + provider in its thread.
 fn library_with_devices(url: &str, n: usize) -> (ServerClient, Vec<String>) {
     let mut admin = ServerClient::new(url);
-    admin.register(&format!("load-{}@example.com", uniq()), "device-0").expect("register");
+    admin.enroll(&format!("load-{}@example.com", uniq()), "correct horse battery staple", "device-0").expect("register");
     let mut tokens = vec![admin.token().unwrap().to_string()];
     for i in 1..n {
         let d = admin.create_device(&format!("device-{i}")).expect("create_device");

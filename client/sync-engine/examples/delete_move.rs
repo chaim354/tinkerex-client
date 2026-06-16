@@ -42,7 +42,7 @@ fn main() {
     write_file(&a, inbox.ino, "trash.txt", b"delete me");
 
     let mut client_a = ServerClient::new(&server);
-    client_a.register(&format!("dm-{}@example.com", uniq()), "device-A").expect("register A");
+    client_a.enroll(&format!("dm-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     SyncEngine::push_outbox(&a, &client_a, &io).expect("A initial push");
     println!("✓ A pushed Inbox/{{note.txt, trash.txt}} + Archive/");
 

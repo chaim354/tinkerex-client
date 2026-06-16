@@ -209,7 +209,7 @@ fn main() {
 
     let mut client = ServerClient::new(&server);
     let reg = client
-        .register(&format!("bench-{}@example.com", uniq()), "bench-device")
+        .enroll(&format!("bench-{}@example.com", uniq()), "correct horse battery staple", "bench-device")
         .expect("register (is the server up at SERVER_URL?)");
     println!("registered user_id={} (fresh library)", reg.user_id);
 

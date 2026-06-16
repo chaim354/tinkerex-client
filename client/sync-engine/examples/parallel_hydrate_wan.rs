@@ -48,7 +48,7 @@ fn main() {
     a.flush(f.ino).unwrap();
 
     let mut client_a = ServerClient::new(&server);
-    client_a.register(&format!("phw-{}@example.com", uniq()), "A").expect("register A");
+    client_a.enroll(&format!("phw-{}@example.com", uniq()), "correct horse battery staple", "A").expect("register A");
     let io_a = PresignedIO::new(&client_a);
     SyncEngine::push_outbox(&a, &client_a, &io_a).expect("A push"); // upload chunks to storage
 

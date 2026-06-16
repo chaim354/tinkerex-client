@@ -37,7 +37,7 @@ fn main() {
             let tag = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
             let email = std::env::var("EMAIL").unwrap_or_else(|_| format!("maker-{tag}@example.com"));
             client = ServerClient::new(&server);
-            client.register(&email, "mac-host").expect("register failed (email may already exist — omit EMAIL or pass TOKEN=)");
+            client.enroll(&email, "correct horse battery staple", "mac-host").expect("register failed (email may already exist — omit EMAIL or pass TOKEN=)");
             println!("✓ registered new library: {email}");
         }
     }

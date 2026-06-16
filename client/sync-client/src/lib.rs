@@ -120,12 +120,6 @@ pub struct DeviceResponse {
     pub device_token: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct PairingResponse {
-    /// The human-enterable code to type on the new device (shown once).
-    pub code: String,
-    pub expires_at: String,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct NodeVersion {
@@ -359,16 +353,56 @@ impl ServerClient {
         }
     }
 
-    /// Bootstrap: register a user/device. Stores the returned token on the client.
-    pub fn register(&mut self, email: &str, device_name: &str) -> Result<RegisterResponse> {
+    /// Enroll this device by logging in (the Dropbox model): POST /v1/devices/login with the
+    /// user's email + password. The server authenticates via Devise (confirmed + unlocked
+    /// account required) and returns a device token, which we store on the client. The
+    /// password is sent ONCE over TLS and never persisted — only the token is kept.
+    pub fn device_login(
+        &mut self,
+        email: &str,
+        password: &str,
+        device_name: &str,
+    ) -> Result<RegisterResponse> {
         let resp = self
             .http
-            .post(self.url("/v1/auth/register"))
-            .json(&serde_json::json!({ "email": email, "device_name": device_name }))
+            .post(self.url("/v1/devices/login"))
+            .json(&serde_json::json!({
+                "email": email, "password": password, "device_name": device_name
+            }))
             .send()?;
         let reg: RegisterResponse = Self::json(resp)?;
         self.token = Some(reg.device_token.clone());
         Ok(reg)
+    }
+
+    /// TEST/DEV-ONLY: create a CONFIRMED password account via the server's signup seam
+    /// (POST /v1/test/users, gated by ENABLE_TEST_SIGNUP on the server). Production accounts
+    /// are created via the web UI (Devise) instead; this exists so the Rust integration
+    /// tests/examples can stand up an account before enrolling devices with `device_login`.
+    pub fn create_test_user(&self, email: &str, password: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/v1/test/users"))
+            .json(&serde_json::json!({ "email": email, "password": password }))
+            .send()?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+        }
+    }
+
+    /// TEST/DEV convenience: create a confirmed account (via the signup seam) then enroll
+    /// this device via `device_login`. A near drop-in for the old `register` bootstrap.
+    pub fn enroll(
+        &mut self,
+        email: &str,
+        password: &str,
+        device_name: &str,
+    ) -> Result<RegisterResponse> {
+        self.create_test_user(email, password)?;
+        self.device_login(email, password, device_name)
     }
 
     /// Register another device for the current user (returns a new device token).
@@ -378,27 +412,6 @@ impl ServerClient {
             .json(&serde_json::json!({ "name": name }))
             .send()?;
         Self::json(resp)
-    }
-
-    /// Issue a short-lived pairing code (this device must be authenticated). A *new*
-    /// device redeems it via [`pair`](Self::pair) to join this library — without ever
-    /// seeing this device's token.
-    pub fn create_pairing(&self) -> Result<PairingResponse> {
-        let resp = self.authed(self.http.post(self.url("/v1/devices/pairing")))?.send()?;
-        Self::json(resp)
-    }
-
-    /// Redeem a pairing code on a new device to join an existing library. Stores the
-    /// returned token on the client (like `register`).
-    pub fn pair(&mut self, email: &str, code: &str, device_name: &str) -> Result<RegisterResponse> {
-        let resp = self
-            .http
-            .post(self.url("/v1/auth/pair"))
-            .json(&serde_json::json!({ "email": email, "code": code, "device_name": device_name }))
-            .send()?;
-        let reg: RegisterResponse = Self::json(resp)?;
-        self.token = Some(reg.device_token.clone());
-        Ok(reg)
     }
 
     pub fn commit_begin(&self, req: &CommitBegin) -> Result<CommitBeginResponse> {

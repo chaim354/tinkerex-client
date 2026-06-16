@@ -47,7 +47,7 @@ fn main() {
 
     // --- Device A: one sync_tick drains the outbox to the server + cloud --------
     let mut client_a = ServerClient::new(&server);
-    client_a.register(&format!("loop-{}@example.com", uniq()), "device-A").expect("register A");
+    client_a.enroll(&format!("loop-{}@example.com", uniq()), "correct horse battery staple", "device-A").expect("register A");
     let cursor_a = SyncEngine::sync_tick(&a, &client_a, &io, a.cursor().unwrap()).expect("A sync_tick");
     a.set_cursor(cursor_a).unwrap();
     assert!(a.outbox_list().unwrap().is_empty(), "outbox drained after push");

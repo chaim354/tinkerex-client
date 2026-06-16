@@ -21,7 +21,7 @@ fn main() {
 
     let mut client = ServerClient::new(&server);
     let email = format!("webdav-{tag}@example.com");
-    let reg = client.register(&email, "webdav-test").expect("register");
+    let reg = client.enroll(&email, "correct horse battery staple", "webdav-test").expect("register");
     println!("✓ registered {email}");
 
     let _ = std::fs::remove_file("/tmp/maker-webdav-live.db");

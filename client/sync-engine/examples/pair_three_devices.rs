@@ -44,34 +44,28 @@ fn main() {
         .or_else(|| std::env::var("EMAIL").ok())
         .unwrap_or_else(|| format!("crossos-{test_tag}@example.com"));
 
-    // Device "windows" registers — creates the account/library (the app's first-run path).
+    // Device "windows" creates the (confirmed) account + enrolls (the app's first-run path).
+    let password = "correct horse battery staple";
     let mut c_win = ServerClient::new(&server);
-    let reg_win = match c_win.register(&email, "windows") {
+    let reg_win = match c_win.enroll(&email, password, "windows") {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
-                "register failed (is the SHARED server up at {server}? email free?): {e}\n\
+                "enroll failed (is the SHARED server up at {server}? ENABLE_TEST_SIGNUP set? email free?): {e}\n\
                  SEED_UNREACHABLE"
             );
             std::process::exit(3); // distinct code so the workflow can map it to BLOCKED
         }
     };
 
-    // Each brand-new device redeems its OWN single-use pairing code (codes are single-use, so we
-    // mint a fresh one per joiner) — the secure multi-device join (Syncthing/Plex model).
+    // Each brand-new device enrolls by logging in with the SAME account credentials (the
+    // Dropbox model — each device authenticates independently; no pairing codes).
     let join = |name: &str| -> String {
-        let code = match c_win.create_pairing() {
-            Ok(p) => p.code,
-            Err(e) => {
-                eprintln!("create_pairing for {name} failed: {e}");
-                std::process::exit(1);
-            }
-        };
         let mut c = ServerClient::new(&server);
-        match c.pair(&email, &code, name) {
+        match c.device_login(&email, password, name) {
             Ok(r) => r.device_token,
             Err(e) => {
-                eprintln!("pair {name} failed (code consumed/expired?): {e}");
+                eprintln!("device_login {name} failed (bad credentials/unconfirmed/locked?): {e}");
                 std::process::exit(1);
             }
         }
