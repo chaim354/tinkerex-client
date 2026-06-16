@@ -18,6 +18,9 @@ use sha2::{Digest, Sha256};
 mod tree;
 pub use tree::{LocalNode, LocalTree};
 
+mod maker;
+pub use maker::*;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("http: {0}")]
@@ -305,6 +308,19 @@ impl ServerClient {
         let status = resp.status();
         if status.is_success() {
             Ok(resp.json()?)
+        } else {
+            Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
+        }
+    }
+
+    /// For endpoints that return `204 No Content` (or any empty 2xx body) on success — e.g.
+    /// the maker library's deletes/removes. Surfaces a non-2xx as `Error::Server` (so a
+    /// cross-user 404 or a validation 422 isn't silently swallowed) without trying to parse
+    /// a body.
+    fn ok_no_content(resp: reqwest::blocking::Response) -> Result<()> {
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
         } else {
             Err(Error::Server { status: status.as_u16(), body: resp.text().unwrap_or_default() })
         }
