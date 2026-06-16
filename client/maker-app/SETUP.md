@@ -177,3 +177,27 @@ cargo build --manifest-path ..\sync-engine\Cargo.toml --bin maker-cfsyncd
 # TWO real CfAPI sync roots, A<->B byte-for-byte through the mounts (needs the deployed S3 server):
 ..\..\client\test-conformance\two-device-cfapi.ps1 -Server http://192.168.1.95
 ```
+
+## Library (catalog over the synced files)
+
+The **Library** tab is a findable catalog: items (with type, tags, instructions),
+collections, and tasks, all stored server-side and reached over `/v1/maker/*`. Files are
+linked by the synced tree's `node_id` (the file picker reuses the file browser). Switch
+to it with the **Sync | Library** nav at the top; it loads once the connection form has a
+server URL + account email (the same creds the Sync tab uses).
+
+What you can do in v1:
+- **Catalog:** browse the grid, search (debounced), filter by type and by tag chip,
+  toggle ★ favorite.
+- **Item detail:** view instructions (markdown-lite), attachments grouped by role, and
+  tags. Create/edit an item, add/remove tags (tag removal uses the per-item tagging id),
+  attach a synced file (the picker lists the file browser's files and guesses a role from
+  the extension) and detach it, or delete the item.
+- **Collections:** create, open to see members, add/remove items.
+- **Tasks:** a standalone todo/doing/done board — add a task, advance it (`→`), reopen a
+  done task (`↺`), or delete it.
+
+**Previews seam:** item cards render a type-icon placeholder today. When the *Previews*
+pillar lands (server-rendered thumbnails per `(node_id, version_id)`), the grid card and
+the detail header set `background-image` from a `preview_url` on the item/attachment JSON —
+no other UI change. The placeholder div (`.lib-thumb`) is the single insertion point.
