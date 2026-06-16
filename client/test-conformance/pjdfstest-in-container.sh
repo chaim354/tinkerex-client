@@ -32,6 +32,11 @@ BIN="/build/client/fs-fuse/target/debug/maker-mount"
 [ -x "$BIN" ] || { echo "FAIL: maker-mount didn't build"; exit 1; }
 
 echo "==> mounting at $MNT"
+# In a bare-root container the fuser-0.17 AutoUnmount path requires a non-Owner allow ACL
+# (allow_other/allow_root) and errors otherwise ("auto_unmount requires acl != Owner").
+# maker-mount honours MAKER_MOUNT_NO_AUTOUNMOUNT to drop AutoUnmount+DefaultPermissions so a
+# plain container mount comes up; cleanup() unmounts explicitly anyway.
+export MAKER_MOUNT_NO_AUTOUNMOUNT=1
 "$BIN" "$MNT" "$WORK/db" "$WORK/chunks" >"$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
 for _ in $(seq 1 50); do mountpoint -q "$MNT" && break; sleep 0.2; done

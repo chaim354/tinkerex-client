@@ -7,6 +7,12 @@ at our real mount surfaces. They validate the *filesystem layer*; distributed-sy
 convergence stays the job of the model-based harness in `fs-provider/tests/convergence.rs`
 (there is no off-the-shelf suite for that — every sync project rolls its own).
 
+> **Where we stand:** `docs/conformance-status.md` is the current verdict — data plane
+> byte-perfect (fsx + rclone, zero mismatches), POSIX gaps deliberate (ownership/perms/
+> special-files/hardlinks). As of 2026-06-16 the FUSE suites also run **from a macOS dev
+> box via the Docker harnesses** (`*-docker.sh`), since Docker here can mount FUSE with
+> `--cap-add SYS_ADMIN --device /dev/fuse`.
+
 | Script | Tool | Surface | Gating? | What it proves |
 |---|---|---|---|---|
 | `webdav-rclone.sh` | **rclone** | `fs-webdav` (macOS path) | ✅ gating | Copy a tree in, `check --download` every file byte-for-byte, then modify/append/delete + `sync` + re-check. Exercises read+write through chunking + the content store with an independent client. Cross-platform. |
@@ -45,9 +51,9 @@ client/test-conformance/two-device-webdav-macos.sh     # macOS, two real WebDAV 
 
 ## CI
 
-The `mount-conformance` job in `.github/workflows/rust-client.yml` runs the three FUSE/WebDAV
-suites on an Ubuntu runner: `webdav-rclone` and `fsx-fuse` gate the build; `pjdfstest-fuse` runs
-`continue-on-error` (informational map).
+The `mount-conformance` job in `.github/workflows/nightly.yml` runs the three FUSE/WebDAV
+suites on a self-hosted Linux runner: `webdav-rclone` and `fsx-fuse` gate the build;
+`pjdfstest-fuse` runs `continue-on-error` (informational map).
 
 The CfAPI suites run on the self-hosted Windows runner — `nightly.yml` (`windows-smoke` +
 `cfapi-conformance`), and on-demand from `rust-client.yml` (`gh workflow run rust-client.yml -f
