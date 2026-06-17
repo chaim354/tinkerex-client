@@ -289,3 +289,57 @@ fn truncate_of_a_directory_is_eisdir() {
     // The directory is intact.
     assert_eq!(p.getattr(d.ino).unwrap().kind, Kind::Dir);
 }
+
+// ---- symlink: the same name/parent errno rules as create/mkdir -------------------------
+//
+// `symlink(2)` shares create()'s prefix rules: a 256-byte name is ENAMETOOLONG
+// (pjdfstest symlink/02), a missing destination parent is ENOENT, and a parent that is a
+// regular file is ENOTDIR. `create`/`mkdir`/`rename` already enforce NAME_MAX via
+// `check_name_len`, but `symlink` skipped it — so an over-long link name slipped through
+// to the SQLite layer (a generic Db error) instead of failing cleanly with the kernel's
+// errno. These pin the symlink prefix to match the other node-creating ops.
+
+#[test]
+fn symlink_with_256_byte_name_is_enametoolong() {
+    let p = provider();
+    let long = "z".repeat(256);
+    assert!(matches!(
+        p.symlink(ROOT, &long, b"target"),
+        Err(FsError::NameTooLong)
+    ));
+    // The boundary (255) is allowed.
+    let ok = "z".repeat(255);
+    p.symlink(ROOT, &ok, b"target")
+        .expect("255-byte symlink name is allowed");
+}
+
+#[test]
+fn symlink_name_length_limit_counts_bytes_not_chars() {
+    // NAME_MAX is a byte limit (matches the kernel): 128 × 'é' = 256 bytes > 255.
+    let p = provider();
+    let multibyte = "é".repeat(128);
+    assert_eq!(multibyte.len(), 256);
+    assert!(matches!(
+        p.symlink(ROOT, &multibyte, b"t"),
+        Err(FsError::NameTooLong)
+    ));
+}
+
+#[test]
+fn symlink_into_missing_parent_is_enoent() {
+    let p = provider();
+    assert!(matches!(
+        p.symlink(999_999, "link", b"t"),
+        Err(FsError::NotFound)
+    ));
+}
+
+#[test]
+fn symlink_under_a_file_is_enotdir() {
+    let p = provider();
+    let f = write_file(&p, ROOT, "afile", b"x");
+    assert!(matches!(
+        p.symlink(f, "link", b"t"),
+        Err(FsError::NotADirectory)
+    ));
+}

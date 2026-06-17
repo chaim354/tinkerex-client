@@ -2124,6 +2124,10 @@ impl Provider for SqliteProvider {
     /// working-tree link materialized via `symlink(2)`. Sync-ready on creation (no manifest
     /// — the target *is* the content), so it's enqueued to the outbox immediately like a dir.
     fn symlink(&self, parent: u64, name: &str, target: &[u8]) -> Result<Attr> {
+        // Same NAME_MAX (ENAMETOOLONG) rule as create/mkdir/rename — symlink(2) is a
+        // node-creating op and the kernel enforces NAME_MAX on its component too. Without
+        // this the over-long name fell through to SQLite as a generic Db error.
+        check_name_len(name)?;
         let conn = self.conn.lock().unwrap();
         let pkind: String = conn
             .query_row(
