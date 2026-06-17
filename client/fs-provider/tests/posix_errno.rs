@@ -444,3 +444,31 @@ fn readdir_of_an_empty_directory_is_ok_and_empty() {
     let d = p.mkdir(ROOT, "d").unwrap();
     assert_eq!(p.readdir(d.ino).unwrap().len(), 0);
 }
+
+// ---- ingest_bytes (CfAPI local-edit capture) rejects the wrong kind too ----------------
+//
+// `ingest_bytes` is the CfAPI/Windows write-capture entry point (read the OS-owned bytes,
+// re-commit them). It must enforce the same kind guard as write/truncate — re-ingesting
+// onto a directory or symlink would stamp a file manifest onto it and corrupt the tree.
+
+#[test]
+fn ingest_bytes_on_a_directory_is_eisdir() {
+    let p = provider();
+    let d = p.mkdir(ROOT, "d").unwrap();
+    assert!(matches!(
+        p.ingest_bytes(d.ino, b"x"),
+        Err(FsError::IsADirectory)
+    ));
+    assert_eq!(p.getattr(d.ino).unwrap().kind, Kind::Dir);
+}
+
+#[test]
+fn ingest_bytes_on_a_symlink_is_einval_and_preserves_the_target() {
+    let p = provider();
+    let l = p.symlink(ROOT, "l", b"the/target").unwrap();
+    assert!(matches!(
+        p.ingest_bytes(l.ino, b"x"),
+        Err(FsError::InvalidArgument)
+    ));
+    assert_eq!(p.readlink(l.ino).unwrap(), b"the/target");
+}

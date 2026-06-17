@@ -1742,9 +1742,15 @@ impl SqliteProvider {
     /// counterpart to a FUSE `write`+`flush`, which CfAPI never routes through us. Stamps a
     /// fresh real mtime and enqueues the outbox, so the normal push path uploads it.
     pub fn ingest_bytes(&self, ino: u64, data: &[u8]) -> Result<()> {
-        // Validate the inode exists first — `flush` is a no-op on a missing stage entry, so
-        // a bad ino would otherwise silently do nothing.
-        self.getattr(ino)?;
+        // Validate the inode exists AND is a file first — `flush` is a no-op on a missing
+        // stage entry (a bad ino would silently do nothing), and ingesting bytes onto a
+        // directory or symlink would stamp a file manifest onto it, corrupting the tree
+        // (same hazard the write/truncate kind-guards close). dir -> EISDIR, symlink -> EINVAL.
+        match self.kind_of(ino)? {
+            Kind::File => {}
+            Kind::Dir => return Err(FsError::IsADirectory),
+            Kind::Symlink => return Err(FsError::InvalidArgument),
+        }
         self.staging.lock().unwrap().insert(ino, data.to_vec());
         self.flush(ino)
     }
