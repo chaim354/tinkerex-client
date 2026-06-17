@@ -350,9 +350,25 @@ struct Prefs {
     /// Opt-in progressive (range) hydration for large files.
     #[serde(default)]
     progressive_hydration: bool,
+    /// Selected visual theme (one of `THEMES`; unknown → "default"). The frontend's
+    /// localStorage is the fast no-FOUC path; this is the durable mirror.
+    #[serde(default)]
+    theme: String,
 }
 
+/// The built-in theme names. Keep in sync with `theme.js`'s allow-list.
+const THEMES: [&str; 4] = ["default", "hacker", "woodworker", "craftmom"];
+
 impl Prefs {
+    /// The selected theme, normalized to a known name. Unknown/empty → "default".
+    fn normalized_theme(&self) -> &str {
+        if THEMES.contains(&self.theme.as_str()) {
+            &self.theme
+        } else {
+            "default"
+        }
+    }
+
     /// A MB/s cap as bytes/sec for `DaemonConfig::with_bandwidth`. `0` → `None` (unlimited).
     fn cap_bps(mbps: u64) -> Option<u64> {
         if mbps == 0 {
@@ -1383,6 +1399,7 @@ mod tests {
             down_mbps: 10,
             up_mbps: 0,
             progressive_hydration: true,
+            ..Default::default()
         };
         assert_eq!(p.down_bps(), Some(10_000_000));
         assert_eq!(p.up_bps(), None); // 0 = unlimited
@@ -1395,6 +1412,7 @@ mod tests {
             down_mbps: 8,
             up_mbps: 2,
             progressive_hydration: true,
+            ..Default::default()
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: Prefs = serde_json::from_str(&json).unwrap();
@@ -1510,5 +1528,64 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(), "b");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- theme -----------------------------------------------------------------
+
+    #[test]
+    fn default_theme_is_default() {
+        // An account with no saved preference falls back to the "default" theme.
+        let p = Prefs::default();
+        assert_eq!(p.normalized_theme(), "default");
+    }
+
+    #[test]
+    fn known_themes_pass_through() {
+        for name in ["default", "hacker", "woodworker", "craftmom"] {
+            let p = Prefs {
+                theme: name.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(p.normalized_theme(), name);
+        }
+    }
+
+    #[test]
+    fn unknown_theme_normalizes_to_default() {
+        // A garbage / tampered / future-removed theme name must not leak through —
+        // it falls back to "default" (mirrors theme.js's allow-list).
+        for bad in ["", "neon", "DEFAULT", "Hacker", "../etc/passwd"] {
+            let p = Prefs {
+                theme: bad.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                p.normalized_theme(),
+                "default",
+                "unknown theme {bad:?} should normalize to default"
+            );
+        }
+    }
+
+    #[test]
+    fn prefs_round_trip_carries_theme() {
+        let p = Prefs {
+            down_mbps: 8,
+            up_mbps: 2,
+            progressive_hydration: true,
+            theme: "hacker".to_string(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Prefs = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+        assert_eq!(back.theme, "hacker");
+    }
+
+    #[test]
+    fn prefs_without_theme_key_defaults_to_default() {
+        // An older prefs blob written before themes existed must still parse, with
+        // the theme defaulting to "default".
+        let p: Prefs = serde_json::from_str(r#"{"down_mbps":4}"#).unwrap();
+        assert_eq!(p.normalized_theme(), "default");
     }
 }
