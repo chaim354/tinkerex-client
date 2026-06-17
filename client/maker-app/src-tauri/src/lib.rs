@@ -656,6 +656,347 @@ fn maker_delete_task(server_url: String, email: String, id: i64) -> Result<(), S
         .map_err(|e| format!("delete task failed: {e}"))
 }
 
+// -- projects --
+
+#[tauri::command]
+fn maker_list_projects(
+    server_url: String,
+    email: String,
+    status: Option<String>,
+) -> Result<Vec<sync_client::Project>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_projects(status.as_deref())
+        .map_err(|e| format!("list projects failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_get_project(
+    server_url: String,
+    email: String,
+    id: i64,
+) -> Result<sync_client::Project, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.get_project(id)
+        .map_err(|e| format!("open project failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_project(
+    server_url: String,
+    email: String,
+    input: sync_client::ProjectInput,
+) -> Result<sync_client::Project, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_project(&input)
+        .map_err(|e| format!("create project failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_update_project(
+    server_url: String,
+    email: String,
+    id: i64,
+    input: sync_client::ProjectInput,
+) -> Result<sync_client::Project, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.update_project(id, &input)
+        .map_err(|e| format!("update project failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_project(server_url: String, email: String, id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_project(id)
+        .map_err(|e| format!("delete project failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_add_build_log(
+    server_url: String,
+    email: String,
+    project_id: i64,
+    input: sync_client::BuildLogEntryInput,
+) -> Result<sync_client::BuildLogEntry, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.add_build_log(project_id, &input)
+        .map_err(|e| format!("add build-log failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_build_log(server_url: String, email: String, entry_id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_build_log(entry_id)
+        .map_err(|e| format!("delete build-log failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_attach_file_to_project(
+    server_url: String,
+    email: String,
+    project_id: i64,
+    input: sync_client::FileAttachmentInput,
+) -> Result<sync_client::FileAttachment, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.attach_file_to_project(project_id, &input)
+        .map_err(|e| format!("attach failed: {e}"))
+}
+
+// -- inventory --
+
+#[tauri::command]
+fn maker_list_inventory(
+    server_url: String,
+    email: String,
+    category: Option<String>,
+    location_id: Option<i64>,
+) -> Result<Vec<sync_client::InventoryItem>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_inventory(category.as_deref(), location_id)
+        .map_err(|e| format!("list inventory failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_low_stock(
+    server_url: String,
+    email: String,
+) -> Result<Vec<sync_client::InventoryItem>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_low_stock()
+        .map_err(|e| format!("low-stock failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_get_inventory_item(
+    server_url: String,
+    email: String,
+    id: i64,
+) -> Result<sync_client::InventoryItem, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.get_inventory_item(id)
+        .map_err(|e| format!("open item failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_inventory_item(
+    server_url: String,
+    email: String,
+    input: sync_client::InventoryItemInput,
+) -> Result<sync_client::InventoryItem, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_inventory_item(&input)
+        .map_err(|e| format!("create item failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_update_inventory_item(
+    server_url: String,
+    email: String,
+    id: i64,
+    input: sync_client::InventoryItemInput,
+) -> Result<sync_client::InventoryItem, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.update_inventory_item(id, &input)
+        .map_err(|e| format!("update item failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_inventory_item(server_url: String, email: String, id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_inventory_item(id)
+        .map_err(|e| format!("delete item failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_adjust_inventory(
+    server_url: String,
+    email: String,
+    id: i64,
+    delta: i64,
+    reason: Option<String>,
+    note: Option<String>,
+) -> Result<sync_client::InventoryItem, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.adjust_inventory(id, delta, reason.as_deref(), note.as_deref())
+        .map_err(|e| format!("adjust failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_inventory_transactions(
+    server_url: String,
+    email: String,
+    id: i64,
+) -> Result<Vec<sync_client::InventoryTransaction>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.inventory_transactions(id)
+        .map_err(|e| format!("transactions failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_list_locations(
+    server_url: String,
+    email: String,
+) -> Result<Vec<sync_client::Location>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_locations()
+        .map_err(|e| format!("list locations failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_location(
+    server_url: String,
+    email: String,
+    name: String,
+    description: Option<String>,
+    parent_id: Option<i64>,
+) -> Result<sync_client::Location, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_location(&name, description.as_deref(), parent_id)
+        .map_err(|e| format!("create location failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_location(server_url: String, email: String, id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_location(id)
+        .map_err(|e| format!("delete location failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_list_suppliers(
+    server_url: String,
+    email: String,
+) -> Result<Vec<sync_client::Supplier>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_suppliers()
+        .map_err(|e| format!("list suppliers failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_supplier(
+    server_url: String,
+    email: String,
+    name: String,
+    url: Option<String>,
+    notes: Option<String>,
+) -> Result<sync_client::Supplier, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_supplier(&name, url.as_deref(), notes.as_deref())
+        .map_err(|e| format!("create supplier failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_supplier(server_url: String, email: String, id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_supplier(id)
+        .map_err(|e| format!("delete supplier failed: {e}"))
+}
+
+// -- BOM --
+
+#[tauri::command]
+fn maker_list_boms(
+    server_url: String,
+    email: String,
+    project_id: i64,
+) -> Result<Vec<sync_client::Bom>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_boms(project_id)
+        .map_err(|e| format!("list boms failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_bom(
+    server_url: String,
+    email: String,
+    project_id: i64,
+    input: sync_client::BomInput,
+) -> Result<sync_client::Bom, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_bom(project_id, &input)
+        .map_err(|e| format!("create bom failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_bom(server_url: String, email: String, id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_bom(id).map_err(|e| format!("delete bom failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_bom_rollup(
+    server_url: String,
+    email: String,
+    id: i64,
+) -> Result<sync_client::BomRollup, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.bom_rollup(id).map_err(|e| format!("rollup failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_create_bom_line(
+    server_url: String,
+    email: String,
+    bom_id: i64,
+    input: sync_client::BomLineInput,
+) -> Result<sync_client::BomLine, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.create_bom_line(bom_id, &input)
+        .map_err(|e| format!("add line failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_update_bom_line(
+    server_url: String,
+    email: String,
+    line_id: i64,
+    input: sync_client::BomLineInput,
+) -> Result<sync_client::BomLine, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.update_bom_line(line_id, &input)
+        .map_err(|e| format!("update line failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_delete_bom_line(server_url: String, email: String, line_id: i64) -> Result<(), String> {
+    let c = maker_client(&server_url, &email)?;
+    c.delete_bom_line(line_id)
+        .map_err(|e| format!("delete line failed: {e}"))
+}
+
+// -- previews --
+
+#[tauri::command]
+fn maker_list_previews(
+    server_url: String,
+    email: String,
+    node_id: Option<String>,
+    version_id: Option<String>,
+    kind: Option<String>,
+) -> Result<Vec<sync_client::Preview>, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.list_previews(node_id.as_deref(), version_id.as_deref(), kind.as_deref())
+        .map_err(|e| format!("list previews failed: {e}"))
+}
+
+#[tauri::command]
+fn maker_enqueue_preview(
+    server_url: String,
+    email: String,
+    node_id: String,
+    version_id: Option<String>,
+    kind: Option<String>,
+    filename: Option<String>,
+) -> Result<sync_client::Preview, String> {
+    let c = maker_client(&server_url, &email)?;
+    c.enqueue_preview(
+        &node_id,
+        version_id.as_deref(),
+        kind.as_deref(),
+        filename.as_deref(),
+    )
+    .map_err(|e| format!("enqueue preview failed: {e}"))
+}
+
 #[tauri::command]
 fn sync_stop(state: State<AppState>) -> Result<String, String> {
     let mut guard = state.0.lock().unwrap();
@@ -725,7 +1066,38 @@ pub fn run() {
             maker_list_tasks,
             maker_create_task,
             maker_update_task,
-            maker_delete_task
+            maker_delete_task,
+            maker_list_projects,
+            maker_get_project,
+            maker_create_project,
+            maker_update_project,
+            maker_delete_project,
+            maker_add_build_log,
+            maker_delete_build_log,
+            maker_attach_file_to_project,
+            maker_list_inventory,
+            maker_low_stock,
+            maker_get_inventory_item,
+            maker_create_inventory_item,
+            maker_update_inventory_item,
+            maker_delete_inventory_item,
+            maker_adjust_inventory,
+            maker_inventory_transactions,
+            maker_list_locations,
+            maker_create_location,
+            maker_delete_location,
+            maker_list_suppliers,
+            maker_create_supplier,
+            maker_delete_supplier,
+            maker_list_boms,
+            maker_create_bom,
+            maker_delete_bom,
+            maker_bom_rollup,
+            maker_create_bom_line,
+            maker_update_bom_line,
+            maker_delete_bom_line,
+            maker_list_previews,
+            maker_enqueue_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
