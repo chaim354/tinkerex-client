@@ -1779,6 +1779,16 @@ impl Provider for SqliteProvider {
     }
 
     fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>> {
+        // opendir(2)/readdir on a non-directory is ENOTDIR; on a missing inode, ENOENT.
+        // Without this the bare `parent_ino = ?` query returned an empty Vec for a file,
+        // a symlink, or a non-existent ino alike — masking the kind/existence error as an
+        // empty directory. (ROOT_INO is always a directory and is allowed.)
+        if ino != ROOT_INO {
+            match self.kind_of(ino)? {
+                Kind::Dir => {}
+                _ => return Err(FsError::NotADirectory),
+            }
+        }
         let conn = self.conn.lock().unwrap();
         let mut stmt =
             conn.prepare("SELECT ino, name, kind FROM nodes WHERE parent_ino = ?1 ORDER BY name")?;

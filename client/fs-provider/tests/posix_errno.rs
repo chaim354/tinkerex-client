@@ -409,3 +409,38 @@ fn read_on_a_symlink_is_einval() {
     let l = p.symlink(ROOT, "l", b"the/target").unwrap();
     assert!(matches!(p.read(l.ino, 0, 16), Err(FsError::InvalidArgument)));
 }
+
+// ---- readdir target-kind errnos --------------------------------------------------------
+//
+// `readdir`/`opendir(2)` on a non-directory → ENOTDIR; on a missing inode → ENOENT.
+// readdir was a bare `WHERE parent_ino = ?` query that returned an empty Vec for a file,
+// a symlink, OR a non-existent ino alike — so a misrouted call looked like an empty dir
+// instead of failing with the kernel's errno. pjdfstest's opendir checks rely on ENOTDIR.
+
+#[test]
+fn readdir_of_a_file_is_enotdir() {
+    let p = provider();
+    let f = write_file(&p, ROOT, "f", b"x");
+    assert!(matches!(p.readdir(f), Err(FsError::NotADirectory)));
+}
+
+#[test]
+fn readdir_of_a_symlink_is_enotdir() {
+    let p = provider();
+    let l = p.symlink(ROOT, "l", b"t").unwrap();
+    assert!(matches!(p.readdir(l.ino), Err(FsError::NotADirectory)));
+}
+
+#[test]
+fn readdir_of_a_missing_inode_is_enoent() {
+    let p = provider();
+    assert!(matches!(p.readdir(999_999), Err(FsError::NotFound)));
+}
+
+#[test]
+fn readdir_of_an_empty_directory_is_ok_and_empty() {
+    // The valid case must still work: an existing, empty directory lists nothing (no error).
+    let p = provider();
+    let d = p.mkdir(ROOT, "d").unwrap();
+    assert_eq!(p.readdir(d.ino).unwrap().len(), 0);
+}
