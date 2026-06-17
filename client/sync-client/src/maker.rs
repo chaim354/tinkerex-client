@@ -14,6 +14,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, ServerClient};
 
+/// Deserialize a Rails `decimal` column into `f64`. Rails serializes `BigDecimal` as a
+/// JSON **string** (e.g. `"50.0"`) in these controllers, but a plain number (`50.0`) is
+/// also accepted so the types are robust to either rendering. Used for inventory
+/// quantities and BOM line quantities.
+fn de_decimal<'de, D>(d: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrNum {
+        Str(String),
+        Num(f64),
+    }
+    match StrOrNum::deserialize(d)? {
+        StrOrNum::Num(n) => Ok(n),
+        StrOrNum::Str(s) => s.parse::<f64>().map_err(serde::de::Error::custom),
+    }
+}
+
 // ---- items ---------------------------------------------------------------------
 
 /// An item as it appears in the list (`GET /v1/maker/items`) — the "short" shape the
@@ -277,6 +297,365 @@ impl TaskInput {
     }
 }
 
+// ---- projects ------------------------------------------------------------------
+
+/// A build-log entry on a project (`build_log_entries: [...]` in the full project view,
+/// or returned by `POST .../build_log_entries`). `entry_type` is a free string the
+/// controller permits (e.g. `note`, `milestone`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BuildLogEntry {
+    pub id: i64,
+    pub body: String,
+    #[serde(default)]
+    pub entry_type: Option<String>,
+    #[serde(default)]
+    pub logged_at: Option<String>,
+}
+
+/// A project. The short shape (index) carries id/name/slug/status/timestamps; the full
+/// shape (show/create/update) additionally carries description + build_log_entries +
+/// file_attachments. `serde(default)` makes the full-only fields tolerant of the short body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Project {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub slug: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub archived_at: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub build_log_entries: Vec<BuildLogEntry>,
+    #[serde(default)]
+    pub file_attachments: Vec<FileAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectsResponse {
+    pub projects: Vec<Project>,
+}
+
+/// Mutable project fields (`{ project: { … } }` body). Partial-friendly: `None` fields omitted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+}
+
+impl ProjectInput {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+}
+
+/// The body for adding a build-log entry (`{ build_log_entry: { … } }`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildLogEntryInput {
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logged_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BuildLogEntriesResponse {
+    pub build_log_entries: Vec<BuildLogEntry>,
+}
+
+// ---- inventory -----------------------------------------------------------------
+
+/// An inventory item. Short fields always present; `unit_cost`/`notes`/`created_at` only on
+/// the full view (show/create/update/adjust). `unit_cost` is a decimal serialized as a string
+/// by Rails — kept as `Option<String>` to avoid float rounding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InventoryItem {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub part_number: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    pub unit: String,
+    /// Rails decimals (precision 12, scale 3) → JSON **strings** like `"50.0"` (may be
+    /// fractional); [`de_decimal`] also tolerates a plain number.
+    #[serde(deserialize_with = "de_decimal")]
+    pub quantity_cached: f64,
+    #[serde(deserialize_with = "de_decimal")]
+    pub min_quantity: f64,
+    #[serde(default)]
+    pub location_id: Option<i64>,
+    #[serde(default)]
+    pub supplier_id: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub unit_cost: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InventoryItemsResponse {
+    pub inventory_items: Vec<InventoryItem>,
+}
+
+/// Mutable inventory fields (`{ inventory_item: { … } }`). Partial-friendly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InventoryItemInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_quantity: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_cost: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplier_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// One row of an item's stock ledger (`GET .../transactions`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InventoryTransaction {
+    pub id: i64,
+    /// Rails decimal → JSON string like `"120.0"`; [`de_decimal`] parses it.
+    #[serde(deserialize_with = "de_decimal")]
+    pub delta: f64,
+    pub reason: String,
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InventoryTransactionsResponse {
+    pub transactions: Vec<InventoryTransaction>,
+}
+
+/// A storage location (optionally nested via `parent_id`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Location {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocationsResponse {
+    pub locations: Vec<Location>,
+}
+
+/// A supplier (vendor) record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Supplier {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SuppliersResponse {
+    pub suppliers: Vec<Supplier>,
+}
+
+// ---- BOM -----------------------------------------------------------------------
+
+/// A bill-of-materials (one revision) belonging to a project. `line_count` only on the
+/// full view (`show`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Bom {
+    pub id: i64,
+    pub project_id: i64,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub revision: i64,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub line_count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BomsResponse {
+    pub boms: Vec<Bom>,
+}
+
+/// The body to create/update a BOM (`{ bom: { name?, revision? } }`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BomInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+}
+
+/// A BOM line (the response from create/update/list). `quantity` is a Rails decimal
+/// serialized as a string; `target_kind` is one of `inventory_item`/`design_file`/
+/// `free_text` (or null if unresolved). Exactly one of inventory_item_id/node_id/part_name
+/// is set (server-enforced).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BomLine {
+    pub id: i64,
+    pub bom_id: i64,
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// Rails decimal → JSON string like `"4.0"` (may be fractional).
+    #[serde(deserialize_with = "de_decimal")]
+    pub quantity: f64,
+    pub unit: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    pub position: i64,
+    #[serde(default)]
+    pub inventory_item_id: Option<i64>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub part_name: Option<String>,
+    #[serde(default)]
+    pub supplier_id: Option<i64>,
+    #[serde(default)]
+    pub target_kind: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BomLinesResponse {
+    pub bom_lines: Vec<BomLine>,
+}
+
+/// The body to create/update a BOM line. Set exactly one target
+/// (`inventory_item_id` | `node_id` | `part_name`) — the server validates it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BomLineInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_item_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplier_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<i64>,
+}
+
+/// One roll-up line: the line fields plus its `target` resolved to a free-form JSON object
+/// (shape depends on `target_kind` — see [`BomLine`]/the controller's `resolved_target`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RollupLine {
+    pub id: i64,
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// Rails decimal → JSON string like `"4.0"` (may be fractional).
+    #[serde(deserialize_with = "de_decimal")]
+    pub quantity: f64,
+    pub unit: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    pub position: i64,
+    #[serde(default)]
+    pub target_kind: Option<String>,
+    /// The resolved target, rendered per-kind by the UI (kept as opaque JSON).
+    pub target: serde_json::Value,
+}
+
+/// `GET /v1/maker/boms/:id/rollup` — the BOM header plus every line with its resolved target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BomRollup {
+    pub bom: Bom,
+    pub lines: Vec<RollupLine>,
+}
+
+// ---- previews ------------------------------------------------------------------
+
+/// A preview (thumbnail / model_glb / render) for a node+version. `url` is the blob URL
+/// (bytes off Rails); it's `null` until `status == "ready"`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Preview {
+    pub id: i64,
+    pub node_id: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub width: Option<i64>,
+    #[serde(default)]
+    pub height: Option<i64>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PreviewsResponse {
+    pub previews: Vec<Preview>,
+}
+
 // ---- the API methods ------------------------------------------------------------
 
 impl ServerClient {
@@ -498,6 +877,437 @@ impl ServerClient {
             .authed(self.http.delete(self.url(&format!("/v1/maker/tasks/{id}"))))?
             .send()?;
         Self::ok_no_content(resp)
+    }
+
+    // -- projects --
+
+    /// List projects (newest-updated first). `status` filters via `?status=`.
+    pub fn list_projects(&self, status: Option<&str>) -> Result<Vec<Project>> {
+        let mut rb = self.authed(self.http.get(self.url("/v1/maker/projects")))?;
+        if let Some(s) = status {
+            rb = rb.query(&[("status", s)]);
+        }
+        let r: ProjectsResponse = Self::json(rb.send()?)?;
+        Ok(r.projects)
+    }
+
+    /// One project's full view (description + build log + attachments).
+    pub fn get_project(&self, id: i64) -> Result<Project> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!("/v1/maker/projects/{id}"))))?
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Create a project. Returns the full view.
+    pub fn create_project(&self, input: &ProjectInput) -> Result<Project> {
+        let resp = self
+            .authed(self.http.post(self.url("/v1/maker/projects")))?
+            .json(&serde_json::json!({ "project": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Patch a project.
+    pub fn update_project(&self, id: i64, input: &ProjectInput) -> Result<Project> {
+        let resp = self
+            .authed(
+                self.http
+                    .patch(self.url(&format!("/v1/maker/projects/{id}"))),
+            )?
+            .json(&serde_json::json!({ "project": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Delete a project.
+    pub fn delete_project(&self, id: i64) -> Result<()> {
+        let resp = self
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/v1/maker/projects/{id}"))),
+            )?
+            .send()?;
+        Self::ok_no_content(resp)
+    }
+
+    // -- build-log entries --
+
+    /// All build-log entries for a project.
+    pub fn list_build_log(&self, project_id: i64) -> Result<Vec<BuildLogEntry>> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!(
+                "/v1/maker/projects/{project_id}/build_log_entries"
+            ))))?
+            .send()?;
+        let r: BuildLogEntriesResponse = Self::json(resp)?;
+        Ok(r.build_log_entries)
+    }
+
+    /// Add a build-log entry to a project.
+    pub fn add_build_log(
+        &self,
+        project_id: i64,
+        input: &BuildLogEntryInput,
+    ) -> Result<BuildLogEntry> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!(
+                "/v1/maker/projects/{project_id}/build_log_entries"
+            ))))?
+            .json(&serde_json::json!({ "build_log_entry": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Delete a build-log entry (shallow route — keyed by the entry id).
+    pub fn delete_build_log(&self, entry_id: i64) -> Result<()> {
+        let resp = self
+            .authed(self.http.delete(self.url(&format!(
+                "/v1/maker/build_log_entries/{entry_id}"
+            ))))?
+            .send()?;
+        Self::ok_no_content(resp)
+    }
+
+    /// Attach a synced file (by `node_id`) to a project.
+    pub fn attach_file_to_project(
+        &self,
+        project_id: i64,
+        input: &FileAttachmentInput,
+    ) -> Result<FileAttachment> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!(
+                "/v1/maker/projects/{project_id}/file_attachments"
+            ))))?
+            .json(&serde_json::json!({ "file_attachment": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    // -- inventory --
+
+    /// List inventory items (alpha). Optional `category`/`location_id` filters.
+    pub fn list_inventory(
+        &self,
+        category: Option<&str>,
+        location_id: Option<i64>,
+    ) -> Result<Vec<InventoryItem>> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(c) = category {
+            query.push(("category", c.to_string()));
+        }
+        if let Some(l) = location_id {
+            query.push(("location_id", l.to_string()));
+        }
+        let resp = self
+            .authed(self.http.get(self.url("/v1/maker/inventory_items")))?
+            .query(&query)
+            .send()?;
+        let r: InventoryItemsResponse = Self::json(resp)?;
+        Ok(r.inventory_items)
+    }
+
+    /// Items at or below their `min_quantity`.
+    pub fn list_low_stock(&self) -> Result<Vec<InventoryItem>> {
+        let resp = self
+            .authed(
+                self.http
+                    .get(self.url("/v1/maker/inventory_items/low_stock")),
+            )?
+            .send()?;
+        let r: InventoryItemsResponse = Self::json(resp)?;
+        Ok(r.inventory_items)
+    }
+
+    /// One inventory item's full view.
+    pub fn get_inventory_item(&self, id: i64) -> Result<InventoryItem> {
+        let resp = self
+            .authed(
+                self.http
+                    .get(self.url(&format!("/v1/maker/inventory_items/{id}"))),
+            )?
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Create an inventory item.
+    pub fn create_inventory_item(&self, input: &InventoryItemInput) -> Result<InventoryItem> {
+        let resp = self
+            .authed(self.http.post(self.url("/v1/maker/inventory_items")))?
+            .json(&serde_json::json!({ "inventory_item": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Patch an inventory item.
+    pub fn update_inventory_item(
+        &self,
+        id: i64,
+        input: &InventoryItemInput,
+    ) -> Result<InventoryItem> {
+        let resp = self
+            .authed(
+                self.http
+                    .patch(self.url(&format!("/v1/maker/inventory_items/{id}"))),
+            )?
+            .json(&serde_json::json!({ "inventory_item": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Delete an inventory item.
+    pub fn delete_inventory_item(&self, id: i64) -> Result<()> {
+        let resp = self
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/v1/maker/inventory_items/{id}"))),
+            )?
+            .send()?;
+        Self::ok_no_content(resp)
+    }
+
+    /// Adjust stock by `delta` (+/-). Returns the item with its new `quantity_cached`.
+    pub fn adjust_inventory(
+        &self,
+        id: i64,
+        delta: i64,
+        reason: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<InventoryItem> {
+        let mut body = serde_json::json!({ "delta": delta });
+        if let Some(r) = reason {
+            body["reason"] = serde_json::json!(r);
+        }
+        if let Some(n) = note {
+            body["note"] = serde_json::json!(n);
+        }
+        let resp = self
+            .authed(self.http.post(self.url(&format!(
+                "/v1/maker/inventory_items/{id}/adjust"
+            ))))?
+            .json(&body)
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// An item's stock ledger (newest first).
+    pub fn inventory_transactions(&self, id: i64) -> Result<Vec<InventoryTransaction>> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!(
+                "/v1/maker/inventory_items/{id}/transactions"
+            ))))?
+            .send()?;
+        let r: InventoryTransactionsResponse = Self::json(resp)?;
+        Ok(r.transactions)
+    }
+
+    // -- locations & suppliers --
+
+    pub fn list_locations(&self) -> Result<Vec<Location>> {
+        let resp = self
+            .authed(self.http.get(self.url("/v1/maker/locations")))?
+            .send()?;
+        let r: LocationsResponse = Self::json(resp)?;
+        Ok(r.locations)
+    }
+
+    pub fn create_location(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        parent_id: Option<i64>,
+    ) -> Result<Location> {
+        let resp = self
+            .authed(self.http.post(self.url("/v1/maker/locations")))?
+            .json(&serde_json::json!({ "location": {
+                "name": name, "description": description, "parent_id": parent_id
+            }}))
+            .send()?;
+        Self::json(resp)
+    }
+
+    pub fn delete_location(&self, id: i64) -> Result<()> {
+        let resp = self
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/v1/maker/locations/{id}"))),
+            )?
+            .send()?;
+        Self::ok_no_content(resp)
+    }
+
+    pub fn list_suppliers(&self) -> Result<Vec<Supplier>> {
+        let resp = self
+            .authed(self.http.get(self.url("/v1/maker/suppliers")))?
+            .send()?;
+        let r: SuppliersResponse = Self::json(resp)?;
+        Ok(r.suppliers)
+    }
+
+    pub fn create_supplier(
+        &self,
+        name: &str,
+        url: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<Supplier> {
+        let resp = self
+            .authed(self.http.post(self.url("/v1/maker/suppliers")))?
+            .json(&serde_json::json!({ "supplier": {
+                "name": name, "url": url, "notes": notes
+            }}))
+            .send()?;
+        Self::json(resp)
+    }
+
+    pub fn delete_supplier(&self, id: i64) -> Result<()> {
+        let resp = self
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/v1/maker/suppliers/{id}"))),
+            )?
+            .send()?;
+        Self::ok_no_content(resp)
+    }
+
+    // -- BOM --
+
+    /// All BOMs (revisions) for a project, in revision order.
+    pub fn list_boms(&self, project_id: i64) -> Result<Vec<Bom>> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!(
+                "/v1/maker/projects/{project_id}/boms"
+            ))))?
+            .send()?;
+        let r: BomsResponse = Self::json(resp)?;
+        Ok(r.boms)
+    }
+
+    /// Create a BOM (revision) under a project.
+    pub fn create_bom(&self, project_id: i64, input: &BomInput) -> Result<Bom> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!(
+                "/v1/maker/projects/{project_id}/boms"
+            ))))?
+            .json(&serde_json::json!({ "bom": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// One BOM's full view (includes `line_count`).
+    pub fn get_bom(&self, id: i64) -> Result<Bom> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!("/v1/maker/boms/{id}"))))?
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Delete a BOM.
+    pub fn delete_bom(&self, id: i64) -> Result<()> {
+        let resp = self
+            .authed(self.http.delete(self.url(&format!("/v1/maker/boms/{id}"))))?
+            .send()?;
+        Self::ok_no_content(resp)
+    }
+
+    /// The roll-up: every line with its resolved target.
+    pub fn bom_rollup(&self, id: i64) -> Result<BomRollup> {
+        let resp = self
+            .authed(
+                self.http
+                    .get(self.url(&format!("/v1/maker/boms/{id}/rollup"))),
+            )?
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// All lines of a BOM.
+    pub fn list_bom_lines(&self, bom_id: i64) -> Result<Vec<BomLine>> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!(
+                "/v1/maker/boms/{bom_id}/bom_lines"
+            ))))?
+            .send()?;
+        let r: BomLinesResponse = Self::json(resp)?;
+        Ok(r.bom_lines)
+    }
+
+    /// Add a line to a BOM (set exactly one target in `input`).
+    pub fn create_bom_line(&self, bom_id: i64, input: &BomLineInput) -> Result<BomLine> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!(
+                "/v1/maker/boms/{bom_id}/bom_lines"
+            ))))?
+            .json(&serde_json::json!({ "bom_line": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Patch a BOM line (shallow route — keyed by the line id).
+    pub fn update_bom_line(&self, line_id: i64, input: &BomLineInput) -> Result<BomLine> {
+        let resp = self
+            .authed(
+                self.http
+                    .patch(self.url(&format!("/v1/maker/bom_lines/{line_id}"))),
+            )?
+            .json(&serde_json::json!({ "bom_line": input }))
+            .send()?;
+        Self::json(resp)
+    }
+
+    /// Remove a BOM line.
+    pub fn delete_bom_line(&self, line_id: i64) -> Result<()> {
+        let resp = self
+            .authed(
+                self.http
+                    .delete(self.url(&format!("/v1/maker/bom_lines/{line_id}"))),
+            )?
+            .send()?;
+        Self::ok_no_content(resp)
+    }
+
+    // -- previews --
+
+    /// List previews, optionally filtered by node/version/kind.
+    pub fn list_previews(
+        &self,
+        node_id: Option<&str>,
+        version_id: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<Vec<Preview>> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(n) = node_id {
+            query.push(("node_id", n.to_string()));
+        }
+        if let Some(v) = version_id {
+            query.push(("version_id", v.to_string()));
+        }
+        if let Some(k) = kind {
+            query.push(("kind", k.to_string()));
+        }
+        let resp = self
+            .authed(self.http.get(self.url("/v1/maker/previews")))?
+            .query(&query)
+            .send()?;
+        let r: PreviewsResponse = Self::json(resp)?;
+        Ok(r.previews)
+    }
+
+    /// Enqueue (or fetch the existing) preview for a node/version/kind. Idempotent.
+    pub fn enqueue_preview(
+        &self,
+        node_id: &str,
+        version_id: Option<&str>,
+        kind: Option<&str>,
+        filename: Option<&str>,
+    ) -> Result<Preview> {
+        let resp = self
+            .authed(self.http.post(self.url("/v1/maker/previews")))?
+            .json(&serde_json::json!({ "preview": {
+                "node_id": node_id, "version_id": version_id,
+                "kind": kind, "filename": filename
+            }}))
+            .send()?;
+        Self::json(resp)
     }
 }
 
@@ -727,5 +1537,255 @@ mod tests {
             serde_json::to_value(&patch).unwrap(),
             serde_json::json!({ "status": "doing" })
         );
+    }
+
+    // ---- projects ----------------------------------------------------------------
+
+    #[test]
+    fn project_short_and_full_shapes_deserialize() {
+        // index (short) shape from ProjectsController#project_json (full: false).
+        let short: Project = serde_json::from_str(
+            r#"{"id":4,"name":"CNC table","slug":"cnc-table","status":"active",
+                "archived_at":null,"created_at":"x","updated_at":"y"}"#,
+        )
+        .unwrap();
+        assert_eq!(short.id, 4);
+        assert_eq!(short.status, "active");
+        assert!(short.description.is_none());
+        assert!(short.build_log_entries.is_empty());
+
+        // show (full) shape: + description, build_log_entries, file_attachments.
+        let full: Project = serde_json::from_str(
+            r#"{"id":4,"name":"CNC table","slug":"cnc-table","status":"active",
+                "archived_at":null,"created_at":"x","updated_at":"y",
+                "description":"a big build",
+                "build_log_entries":[
+                  {"id":1,"body":"started","entry_type":"note","logged_at":"t"}
+                ],
+                "file_attachments":[
+                  {"id":2,"node_id":"n-7","version_id":null,"role":"reference","label":null,"position":0}
+                ]}"#,
+        )
+        .unwrap();
+        assert_eq!(full.description.as_deref(), Some("a big build"));
+        assert_eq!(full.build_log_entries.len(), 1);
+        assert_eq!(full.build_log_entries[0].body, "started");
+        assert_eq!(full.file_attachments.len(), 1);
+        assert_eq!(full.file_attachments[0].node_id, "n-7");
+    }
+
+    #[test]
+    fn project_input_omits_none_and_wraps() {
+        let input = ProjectInput {
+            name: Some("Lamp".into()),
+            status: Some("planning".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&input).unwrap(),
+            serde_json::json!({ "name": "Lamp", "status": "planning" })
+        );
+        assert_eq!(
+            serde_json::to_value(ProjectInput::new("Lamp")).unwrap(),
+            serde_json::json!({ "name": "Lamp" })
+        );
+    }
+
+    // ---- inventory ---------------------------------------------------------------
+
+    #[test]
+    fn inventory_item_shapes_deserialize() {
+        // quantity_cached / min_quantity are Rails BigDecimals → JSON **strings** (the real
+        // wire shape from the controller, verified by live curl). de_decimal parses them.
+        let short: InventoryItem = serde_json::from_str(
+            r#"{"id":9,"name":"M3 bolt","part_number":"M3x10","category":"fasteners",
+                "unit":"each","quantity_cached":"120.0","min_quantity":"50.0",
+                "location_id":2,"supplier_id":3,"updated_at":"y"}"#,
+        )
+        .unwrap();
+        assert_eq!(short.name, "M3 bolt");
+        assert_eq!(short.quantity_cached, 120.0);
+        assert_eq!(short.min_quantity, 50.0);
+        assert_eq!(short.location_id, Some(2));
+        // full-only fields default when absent
+        assert!(short.notes.is_none());
+
+        // de_decimal also tolerates a plain JSON number (robustness).
+        let full: InventoryItem = serde_json::from_str(
+            r#"{"id":9,"name":"M3 bolt","part_number":null,"category":null,"unit":"each",
+                "quantity_cached":10.5,"min_quantity":0.0,"location_id":null,"supplier_id":null,
+                "updated_at":"y","unit_cost":"0.05","notes":"hex head","created_at":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(full.quantity_cached, 10.5);
+        assert_eq!(full.notes.as_deref(), Some("hex head"));
+        assert_eq!(full.unit_cost.as_deref(), Some("0.05"));
+    }
+
+    #[test]
+    fn inventory_item_input_omits_none() {
+        let input = InventoryItemInput {
+            name: Some("Resin".into()),
+            unit: Some("l".into()),
+            min_quantity: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&input).unwrap(),
+            serde_json::json!({ "name": "Resin", "unit": "l", "min_quantity": 1.0 })
+        );
+    }
+
+    #[test]
+    fn inventory_transaction_shape_deserializes() {
+        // delta is a Rails decimal → JSON string (real wire shape).
+        let r: InventoryTransactionsResponse = serde_json::from_str(
+            r#"{"transactions":[
+              {"id":1,"delta":"-5.0","reason":"consumed","project_id":2,"note":"prototype","created_at":"t"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.transactions.len(), 1);
+        assert_eq!(r.transactions[0].delta, -5.0);
+        assert_eq!(r.transactions[0].project_id, Some(2));
+    }
+
+    #[test]
+    fn location_and_supplier_shapes_deserialize() {
+        let loc: Location = serde_json::from_str(
+            r#"{"id":1,"name":"Shelf A","description":"by the door","parent_id":null,
+                "created_at":"x","updated_at":"y"}"#,
+        )
+        .unwrap();
+        assert_eq!(loc.name, "Shelf A");
+
+        let sup: Supplier = serde_json::from_str(
+            r#"{"id":3,"name":"McMaster","url":"https://mcmaster.com","notes":null,
+                "created_at":"x","updated_at":"y"}"#,
+        )
+        .unwrap();
+        assert_eq!(sup.name, "McMaster");
+        assert_eq!(sup.url.as_deref(), Some("https://mcmaster.com"));
+    }
+
+    // ---- BOM ---------------------------------------------------------------------
+
+    #[test]
+    fn bom_shapes_deserialize() {
+        let r: BomsResponse = serde_json::from_str(
+            r#"{"boms":[{"id":1,"project_id":4,"name":"Main","revision":1,
+                "created_at":"x","updated_at":"y"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.boms[0].revision, 1);
+        assert_eq!(r.boms[0].project_id, 4);
+
+        let full: Bom = serde_json::from_str(
+            r#"{"id":1,"project_id":4,"name":"Main","revision":2,
+                "created_at":"x","updated_at":"y","line_count":3}"#,
+        )
+        .unwrap();
+        assert_eq!(full.line_count, Some(3));
+    }
+
+    #[test]
+    fn bom_rollup_three_target_kinds_deserialize() {
+        // Mirrors BomsController#rollup → resolved_target's three shapes.
+        let r: BomRollup = serde_json::from_str(
+            r#"{
+              "bom":{"id":1,"project_id":4,"name":"Main","revision":1,
+                     "created_at":"x","updated_at":"y"},
+              "lines":[
+                {"id":10,"reference":"R1","quantity":"4.0","unit":"each","notes":null,
+                 "position":0,"target_kind":"inventory_item",
+                 "target":{"kind":"inventory_item","inventory_item":{"id":9,"name":"M3 bolt",
+                   "part_number":"M3x10","unit":"each","quantity_cached":"120.0"}}},
+                {"id":11,"reference":"R2","quantity":"1.0","unit":"each","notes":"printed body",
+                 "position":1,"target_kind":"design_file",
+                 "target":{"kind":"design_file","node_id":"node-abc"}},
+                {"id":12,"reference":"R3","quantity":"2.0","unit":"m","notes":null,
+                 "position":2,"target_kind":"free_text",
+                 "target":{"kind":"free_text","part_name":"wire","supplier_id":3,
+                   "supplier_name":"McMaster"}}
+              ]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.bom.revision, 1);
+        assert_eq!(r.lines.len(), 3);
+        assert_eq!(r.lines[0].quantity, 4.0);
+        assert_eq!(r.lines[0].target_kind.as_deref(), Some("inventory_item"));
+        // target is free-form JSON the UI renders per kind.
+        assert_eq!(r.lines[0].target["kind"], "inventory_item");
+        assert_eq!(r.lines[0].target["inventory_item"]["name"], "M3 bolt");
+        assert_eq!(r.lines[1].target["node_id"], "node-abc");
+        assert_eq!(r.lines[2].target["part_name"], "wire");
+        assert_eq!(r.lines[2].target["supplier_name"], "McMaster");
+    }
+
+    #[test]
+    fn bom_line_input_links_exactly_one_target() {
+        // design-file line
+        let df = BomLineInput {
+            quantity: Some(1.0),
+            unit: Some("each".into()),
+            node_id: Some("node-abc".into()),
+            reference: Some("R2".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&df).unwrap(),
+            serde_json::json!({ "quantity": 1.0, "unit": "each",
+                "node_id": "node-abc", "reference": "R2" })
+        );
+
+        // inventory line
+        let inv = BomLineInput {
+            quantity: Some(4.0),
+            unit: Some("each".into()),
+            inventory_item_id: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&inv).unwrap(),
+            serde_json::json!({ "quantity": 4.0, "unit": "each", "inventory_item_id": 9 })
+        );
+    }
+
+    #[test]
+    fn bom_line_response_deserializes() {
+        let line: BomLine = serde_json::from_str(
+            r#"{"id":10,"bom_id":1,"reference":"R1","quantity":"4.0","unit":"each",
+                "notes":null,"position":0,"inventory_item_id":9,"node_id":null,
+                "part_name":null,"supplier_id":null,"target_kind":"inventory_item",
+                "created_at":"x","updated_at":"y"}"#,
+        )
+        .unwrap();
+        assert_eq!(line.id, 10);
+        assert_eq!(line.quantity, 4.0);
+        assert_eq!(line.inventory_item_id, Some(9));
+        assert_eq!(line.target_kind.as_deref(), Some("inventory_item"));
+    }
+
+    // ---- previews ----------------------------------------------------------------
+
+    #[test]
+    fn preview_shape_deserializes() {
+        let r: PreviewsResponse = serde_json::from_str(
+            r#"{"previews":[
+              {"id":1,"node_id":"n-1","version_id":"v-1","kind":"thumbnail","status":"ready",
+               "error":null,"width":512,"height":512,"url":"https://blob/x.png",
+               "created_at":"x","updated_at":"y"},
+              {"id":2,"node_id":"n-2","version_id":null,"kind":"thumbnail","status":"pending",
+               "error":null,"width":null,"height":null,"url":null,
+               "created_at":"x","updated_at":"y"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.previews.len(), 2);
+        assert_eq!(r.previews[0].status, "ready");
+        assert_eq!(r.previews[0].url.as_deref(), Some("https://blob/x.png"));
+        assert_eq!(r.previews[0].width, Some(512));
+        assert_eq!(r.previews[1].status, "pending");
+        assert!(r.previews[1].url.is_none());
     }
 }

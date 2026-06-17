@@ -403,7 +403,7 @@ button.danger { color: var(--err); border-color: var(--err); }
    ============================================================================ */
 
 /* ---- view nav ---- */
-.viewnav { display: flex; gap: var(--s2); margin: var(--s1) 0 var(--s4); }
+.viewnav { display: flex; gap: var(--s2); margin: var(--s1) 0 var(--s4); flex-wrap: wrap; }
 .viewnav button { flex: 0 0 auto; }
 .viewnav button.active { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
 
@@ -470,3 +470,108 @@ button.danger { color: var(--err); border-color: var(--err); }
 }
 .instructions { margin: var(--s2) 0; line-height: 1.5; }
 .instructions code { background: var(--hover); padding: 0 0.25rem; border-radius: 4px; }
+
+/* ============================================================================
+ * Maker product surfaces — projects / inventory / BOM / preview / settings
+ * ========================================================================== */
+
+/* shared form grid used in the project + inventory detail modals */
+.form-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); margin: var(--s3) 0;
+}
+.form-grid label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.82rem; color: var(--muted); }
+.form-grid label.full { grid-column: 1 / -1; }
+.form-grid input, .form-grid select, .form-grid textarea {
+  font: inherit; padding: 0.4rem 0.5rem; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--card); color: var(--ink);
+}
+textarea { font: inherit; padding: 0.4rem 0.5rem; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--card); color: var(--ink); resize: vertical; }
+.modal h4 { margin: var(--s4) 0 var(--s2); font-size: 0.9rem; }
+
+/* a switch-style checkbox label */
+.switch { display: flex; align-items: center; gap: var(--s2); cursor: pointer; }
+.switch input { width: 1rem; height: 1rem; }
+
+/* ---- projects list ---- */
+.proj-row {
+  display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3);
+  border: 1px solid var(--line); border-radius: var(--r-sm); margin-bottom: var(--s2);
+  cursor: pointer; background: var(--card);
+}
+.proj-row:hover { border-color: var(--accent); }
+.proj-name { flex: 1; font-weight: 600; }
+.proj-meta { font-size: 0.8rem; }
+.badge.status-active { background: var(--ok-bg); color: var(--ok); }
+.badge.status-done { background: var(--hover); color: var(--muted); }
+.badge.status-paused, .badge.status-archived { background: var(--hover); color: var(--off); }
+
+/* ---- build log ---- */
+.log-list { margin-top: var(--s2); }
+.log-entry {
+  display: flex; align-items: center; gap: var(--s2); padding: var(--s1) 0;
+  border-bottom: 1px solid var(--line); font-size: 0.86rem;
+}
+.log-body { flex: 1; }
+.log-when { white-space: nowrap; }
+
+/* ---- chips (locations / suppliers / attachments) ---- */
+.chip-list { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s2); }
+.chip-list .chip { display: inline-flex; align-items: center; gap: 0.3rem; cursor: default; }
+.chip-x { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0 0.1rem; font-size: 0.9rem; }
+.chip-x:hover { color: var(--err); }
+
+/* ---- inventory ---- */
+.inv-list { margin-top: var(--s3); }
+.inv-row {
+  display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3);
+  border: 1px solid var(--line); border-radius: var(--r-sm); margin-bottom: var(--s1);
+  background: var(--card);
+}
+.inv-row.low { border-color: var(--warn); }
+.inv-name { flex: 1; font-weight: 600; cursor: pointer; }
+.inv-name:hover { color: var(--accent); }
+.inv-cat { font-size: 0.8rem; }
+.inv-qty { font-variant-numeric: tabular-nums; font-weight: 600; }
+.inv-qty.low { color: var(--warn); }
+.inv-min { font-size: 0.78rem; }
+button.adj { width: 1.9rem; padding: 0.1rem 0; font-size: 1.1rem; line-height: 1; }
+button.active { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+/* ---- BOM table ---- */
+.bom-wrap { margin-top: var(--s2); }
+.bom-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.bom-table th, .bom-table td { text-align: left; padding: var(--s1) var(--s2); border-bottom: 1px solid var(--line); }
+.bom-table th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; }
+.bom-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.bom-add { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin-top: var(--s3); }
+.bom-add input, .bom-add select { font: inherit; padding: 0.35rem 0.45rem; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--card); color: var(--ink); }
+.bl-ref { width: 5rem; }
+.bl-qty { width: 5rem; }
+.bl-text { width: 9rem; }
+
+/* ---- preview gallery ---- */
+.prev-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: var(--s3); margin-top: var(--s3);
+}
+.prev-card {
+  border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--s2);
+  background: var(--card); cursor: pointer;
+}
+.prev-card:hover { border-color: var(--accent); }
+.prev-thumb {
+  aspect-ratio: 1 / 1; border-radius: var(--r-sm); background: var(--hover) center/cover no-repeat;
+  display: flex; align-items: center; justify-content: center; font-size: 1.6rem; color: var(--muted);
+}
+.prev-thumb.empty { font-size: 1.6rem; }
+.prev-cap { font-size: 0.82rem; margin-top: var(--s1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prev-meta { display: flex; align-items: center; gap: var(--s2); margin-top: 0.15rem; }
+.prev-status { font-size: 0.72rem; padding: 0.05rem 0.4rem; border-radius: 6px; background: var(--hover); color: var(--muted); }
+.prev-status.ok { background: var(--ok-bg); color: var(--ok); }
+.prev-status.busy { background: var(--hover); color: var(--warn); }
+.prev-status.err { background: var(--err-bg); color: var(--err); }
+.prev-error { font-size: 0.75rem; margin-top: 0.2rem; }
+
+/* picker rows used by the shared maker file picker */
+.picker-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-meta { color: var(--muted); font-size: 0.8rem; }
