@@ -369,6 +369,13 @@ impl Prefs {
         }
     }
 
+    /// Self with `theme` rewritten to a concrete known name — so a tampered/stale
+    /// theme on disk never reaches the UI.
+    fn with_normalized_theme(mut self) -> Self {
+        self.theme = self.normalized_theme().to_string();
+        self
+    }
+
     /// A MB/s cap as bytes/sec for `DaemonConfig::with_bandwidth`. `0` → `None` (unlimited).
     fn cap_bps(mbps: u64) -> Option<u64> {
         if mbps == 0 {
@@ -424,7 +431,7 @@ fn save_prefs(server: &str, email: &str, prefs: &Prefs) {
 /// Read this account's saved file-layer prefs (for the Settings UI).
 #[tauri::command]
 fn get_prefs(server_url: String, email: String) -> Prefs {
-    load_prefs(&server_url, &email)
+    load_prefs(&server_url, &email).with_normalized_theme()
 }
 
 /// Persist this account's file-layer prefs. Bandwidth + hydration apply on the next
@@ -1587,5 +1594,24 @@ mod tests {
         // the theme defaulting to "default".
         let p: Prefs = serde_json::from_str(r#"{"down_mbps":4}"#).unwrap();
         assert_eq!(p.normalized_theme(), "default");
+    }
+
+    #[test]
+    fn with_normalized_theme_rewrites_bad_theme_inplace() {
+        // get_prefs returns this to the UI; a tampered/stale theme on disk must come
+        // back as a concrete known name (not leak the bad value to the frontend).
+        let p = Prefs {
+            theme: "neon".to_string(),
+            ..Default::default()
+        }
+        .with_normalized_theme();
+        assert_eq!(p.theme, "default");
+
+        let good = Prefs {
+            theme: "woodworker".to_string(),
+            ..Default::default()
+        }
+        .with_normalized_theme();
+        assert_eq!(good.theme, "woodworker");
     }
 }
