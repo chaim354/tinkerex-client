@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MakerFS.entitlements — STUB / TODO(dev-account).
+
+  Entitlements the FSKit .appex needs. These require a paid Apple Developer account: the
+  FSKit entitlement is privileged and must be authorized on your provisioning profile.
+  Greyed-toggle risk (see docs/plan-macos-fskit-migration.md §7.1): the FUSE-T FSKit build
+  couldn't mount on macOS 26 — likely an entitlement/signing/provisioning mismatch. De-risk
+  with a hello-world extension that mounts an empty volume BEFORE wiring the bridge.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Sandbox is mandatory for app extensions. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- TODO(dev-account): the FSKit entitlement. Confirm the exact key against the FSKit
+         docs/SDK and ensure your provisioning profile authorizes it. -->
+    <key>com.apple.developer.fskit.fsmodule</key>
+    <true/>
+
+    <!-- The extension needs to reach the local sync daemon / host app (XPC) to receive the
+         bridge handle + invalidation signals. TODO(dev-account): scope to your real app group. -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.example.makerserver</string>
+    </array>
+</dict>
+</plist>
