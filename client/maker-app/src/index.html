@@ -16,8 +16,12 @@
       </header>
 
       <nav class="viewnav" role="tablist" aria-label="Sections">
-        <button id="navSync" role="tab" aria-selected="true" class="active">Sync</button>
-        <button id="navLibrary" role="tab" aria-selected="false">Library</button>
+        <button id="navSync" role="tab" aria-selected="true" class="active" data-view="sync">Sync</button>
+        <button id="navLibrary" role="tab" aria-selected="false" data-view="library">Library</button>
+        <button id="navProjects" role="tab" aria-selected="false" data-view="projects">Projects</button>
+        <button id="navInventory" role="tab" aria-selected="false" data-view="inventory">Inventory</button>
+        <button id="navPreview" role="tab" aria-selected="false" data-view="preview">Preview</button>
+        <button id="navSettings" role="tab" aria-selected="false" data-view="settings">Settings</button>
       </nav>
 
       <div id="viewSync">
@@ -102,6 +106,104 @@
           <div id="taskBoard" class="lib-board"></div>
         </section>
       </div><!-- viewLibrary -->
+
+      <!-- ===== Projects ===== -->
+      <div id="viewProjects" class="hidden">
+        <section class="card">
+          <div class="lib-toolbar">
+            <select id="projStatus" aria-label="Filter by status">
+              <option value="">All statuses</option>
+              <option value="planning">Planning</option>
+              <option value="active">Active</option>
+              <option value="paused">Paused</option>
+              <option value="done">Done</option>
+              <option value="archived">Archived</option>
+            </select>
+            <button id="projNew" class="primary">New project</button>
+          </div>
+          <div id="projList" class="lib-coll-list" aria-live="polite"></div>
+          <div id="projEmpty" class="muted hidden">No projects yet. Click “New project” to start one.</div>
+        </section>
+      </div><!-- viewProjects -->
+
+      <!-- ===== Inventory ===== -->
+      <div id="viewInventory" class="hidden">
+        <section class="card">
+          <div class="lib-toolbar">
+            <input id="invSearch" class="lib-search" placeholder="Filter by name…" autocomplete="off" />
+            <button id="invLowStock" aria-pressed="false">Low stock</button>
+            <button id="invNew" class="primary">New item</button>
+          </div>
+          <div id="invList" class="inv-list" aria-live="polite"></div>
+          <div id="invEmpty" class="muted hidden">No inventory yet. Click “New item” to add one.</div>
+        </section>
+
+        <section class="card">
+          <h2>Locations</h2>
+          <div class="row" style="margin-top:0">
+            <input id="locName" placeholder="New location name" autocomplete="off" />
+            <button id="locCreate">Add</button>
+          </div>
+          <div id="locList" class="chip-list"></div>
+        </section>
+
+        <section class="card">
+          <h2>Suppliers</h2>
+          <div class="row" style="margin-top:0">
+            <input id="supName" placeholder="New supplier name" autocomplete="off" />
+            <input id="supUrl" placeholder="URL (optional)" autocomplete="off" />
+            <button id="supCreate">Add</button>
+          </div>
+          <div id="supList" class="chip-list"></div>
+        </section>
+      </div><!-- viewInventory -->
+
+      <!-- ===== Preview ===== -->
+      <div id="viewPreview" class="hidden">
+        <section class="card">
+          <div class="row" style="margin-top:0">
+            <button id="prevRefresh" class="primary">Load previews</button>
+            <span id="prevHint" class="muted" style="align-self:center"></span>
+          </div>
+          <p class="muted">Thumbnails are generated for design files in your library. Pick a file to
+            enqueue a fresh render; ready thumbnails show below.</p>
+          <div class="row" style="margin-top:0">
+            <button id="prevEnqueue">Enqueue for a file…</button>
+          </div>
+          <div id="prevGrid" class="prev-grid" aria-live="polite"></div>
+          <div id="prevEmpty" class="muted hidden">No previews yet. Enqueue one for a design file.</div>
+        </section>
+      </div><!-- viewPreview -->
+
+      <!-- ===== Settings (file-layer controls) ===== -->
+      <div id="viewSettings" class="hidden">
+        <section class="card">
+          <h2>Bandwidth &amp; hydration</h2>
+          <p class="muted">These tune the sync daemon. They're saved per account and take effect
+            the next time you sign in (they're set when the drive mounts).</p>
+
+          <label for="bwDown">Download limit (MB/s, 0 = unlimited)</label>
+          <input id="bwDown" type="number" min="0" step="1" value="0" />
+          <label for="bwUp">Upload limit (MB/s, 0 = unlimited)</label>
+          <input id="bwUp" type="number" min="0" step="1" value="0" />
+
+          <label class="switch" style="margin-top:1rem">
+            <input type="checkbox" id="progHydrate" />
+            <span>Progressive (range) hydration for large files</span>
+          </label>
+
+          <div class="row"><button id="prefsSave" class="primary">Save settings</button></div>
+          <div id="settingsToast" class="toast hidden" role="alert"></div>
+        </section>
+
+        <section class="card">
+          <h2>Selective sync</h2>
+          <p class="muted">Choosing which folders stay resident on this device is implemented in the
+            sync engine (subscribe / unsubscribe a subtree), but a live in-app control needs the
+            mount to expose its local tree at runtime — planned. See
+            <code>docs/plan-selective-sync-ui.md</code>.</p>
+        </section>
+      </div><!-- viewSettings -->
     </div>
 
     <!-- Conflict resolution -->
@@ -150,7 +252,49 @@
       </div>
     </div>
 
+    <!-- Project detail (build log + BOM + attachments) -->
+    <div id="projOverlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="projTitle">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <h3 id="projTitle">Project</h3>
+          <button id="projClose" class="modal-close" aria-label="Close">&times;</button>
+        </div>
+        <div id="projBody"></div>
+        <div id="projErr" class="modal-err"></div>
+      </div>
+    </div>
+
+    <!-- Inventory item detail / edit -->
+    <div id="invOverlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="invTitle">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <h3 id="invTitle">Item</h3>
+          <button id="invClose" class="modal-close" aria-label="Close">&times;</button>
+        </div>
+        <div id="invBody"></div>
+        <div id="invErr" class="modal-err"></div>
+      </div>
+    </div>
+
+    <!-- Shared file picker for projects/inventory/BOM/preview (reuses `browse`) -->
+    <div id="mkPickerOverlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="mkPickerTitle">
+      <div class="modal">
+        <div class="modal-head">
+          <h3 id="mkPickerTitle">Choose a file</h3>
+          <button id="mkPickerClose" class="modal-close" aria-label="Close">&times;</button>
+        </div>
+        <input id="mkPickerFilter" placeholder="Filter files…" autocomplete="off" />
+        <div id="mkPickerList" class="picker-list" role="listbox"></div>
+        <div id="mkPickerErr" class="modal-err"></div>
+      </div>
+    </div>
+
     <script type="module" src="/main.js"></script>
     <script type="module" src="/library.js"></script>
+    <script type="module" src="/maker-shared.js"></script>
+    <script type="module" src="/projects.js"></script>
+    <script type="module" src="/inventory.js"></script>
+    <script type="module" src="/preview.js"></script>
+    <script type="module" src="/settings.js"></script>
   </body>
 </html>

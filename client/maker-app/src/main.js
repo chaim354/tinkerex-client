@@ -119,20 +119,34 @@ const refreshStatus = async () => {
   }
 };
 
-// ---- top-level view nav (Sync | Library) -------------------------------------
+// ---- top-level view nav (data-driven) ----------------------------------------
+//
+// Each nav button carries data-view; the matching container is `view<Capitalized>`.
+// Switching a view dispatches `view:show` (detail = the view name) so each surface's
+// module can lazily (re)load. The legacy `library:show` event is still fired for
+// library.js back-compat.
+
+const VIEWS = ["sync", "library", "projects", "inventory", "preview", "settings"];
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 const showView = (which) => {
-  const lib = which === "library";
-  $("viewSync").classList.toggle("hidden", lib);
-  $("viewLibrary").classList.toggle("hidden", !lib);
-  $("navSync").classList.toggle("active", !lib);
-  $("navLibrary").classList.toggle("active", lib);
-  $("navSync").setAttribute("aria-selected", String(!lib));
-  $("navLibrary").setAttribute("aria-selected", String(lib));
-  if (lib) window.dispatchEvent(new CustomEvent("library:show"));
+  for (const v of VIEWS) {
+    const isActive = v === which;
+    const container = $("view" + cap(v));
+    const nav = $("nav" + cap(v));
+    if (container) container.classList.toggle("hidden", !isActive);
+    if (nav) {
+      nav.classList.toggle("active", isActive);
+      nav.setAttribute("aria-selected", String(isActive));
+    }
+  }
+  if (which === "library") window.dispatchEvent(new CustomEvent("library:show"));
+  window.dispatchEvent(new CustomEvent("view:show", { detail: which }));
 };
-$("navSync").onclick = () => showView("sync");
-$("navLibrary").onclick = () => showView("library");
+
+document.querySelectorAll(".viewnav button[data-view]").forEach((btn) => {
+  btn.onclick = () => showView(btn.dataset.view);
+});
 
 // ---- validation --------------------------------------------------------------
 
