@@ -50,13 +50,14 @@ fn errno(e: &FsError) -> fuser::Errno {
         FsError::InvalidArgument => fuser::Errno::EINVAL,
         // A path component longer than NAME_MAX (255 bytes) → ENAMETOOLONG (pjdfstest <op>/02).
         FsError::NameTooLong => fuser::Errno::ENAMETOOLONG,
+        // A truncate/write past the maximum file size → EFBIG (pjdfstest truncate/12). The
+        // provider rejects it before allocating, so the mount returns this instead of
+        // aborting on an out-of-memory allocation.
+        FsError::FileTooLarge => fuser::Errno::EFBIG,
         // Special files (symlink/FIFO/socket/device) are a deliberate non-goal — reject
         // the attempt cleanly with EPERM rather than ENOSYS/EIO so callers (cp -a, tar,
         // git) get a deterministic "operation not permitted" instead of a confusing crash.
         FsError::NotSupported => fuser::Errno::EPERM,
-        // A write/truncate past MAX_FILE_SIZE (or an overflowing offset) → EFBIG, the POSIX
-        // errno for "file too large", rather than a generic EIO.
-        FsError::FileTooLarge => fuser::Errno::EFBIG,
         _ => fuser::Errno::EIO,
     }
 }

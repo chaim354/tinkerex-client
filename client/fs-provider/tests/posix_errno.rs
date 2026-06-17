@@ -478,3 +478,34 @@ fn ingest_bytes_on_a_symlink_is_einval_and_preserves_the_target() {
     ));
     assert_eq!(p.readlink(l.ino).unwrap(), b"the/target");
 }
+
+#[test]
+fn truncate_to_an_absurd_size_is_efbig_not_an_abort() {
+    // POSIX: truncate past the maximum file size → EFBIG (or EINVAL). pjdfstest truncate/12
+    // truncates to ~888 TiB. The whole file is staged in memory (`Vec<u8>`), so before this
+    // fix `content.resize(size, 0)` tried to allocate that and `handle_alloc_error` ABORTED
+    // the process (SIGABRT) — crashing the mount. It must now return a clean errno instead.
+    // (If unfixed, this test process itself aborts rather than failing — that IS the bug.)
+    let p = provider();
+    write_file(&p, ROOT, "f", b"hello");
+    let ino = p.lookup(ROOT, "f").unwrap().ino;
+    assert!(matches!(
+        p.truncate(ino, 999_999_999_999_999),
+        Err(FsError::FileTooLarge)
+    ));
+    // The file is untouched — rejection happens before any mutation.
+    assert_eq!(read_all(&p, ino), b"hello");
+}
+
+#[test]
+fn write_at_an_absurd_offset_is_efbig_not_an_abort() {
+    // The same unbounded-allocation hazard on the write path: a write at a colossal offset
+    // would `buf.resize(offset + len, 0)` and abort. Reject with EFBIG before allocating.
+    let p = provider();
+    write_file(&p, ROOT, "f", b"hi");
+    let ino = p.lookup(ROOT, "f").unwrap().ino;
+    assert!(matches!(
+        p.write(ino, 999_999_999_999_999, b"x"),
+        Err(FsError::FileTooLarge)
+    ));
+}

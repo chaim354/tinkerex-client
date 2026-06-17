@@ -19,9 +19,17 @@ MOUNT_PID=""
 SUBSET=(rename unlink mkdir rmdir truncate open chmod)
 
 unmount() { fusermount3 -u "$MNT" 2>/dev/null || fusermount -u "$MNT" 2>/dev/null || true; }
+# Dump the mount's stderr/stdout (panic backtrace lives here) — the mount must never crash
+# on a client op, so any output past the "mounted OK" banner is a real defect to surface.
+dump_mount_log() {
+  echo
+  echo "==> mount.log (mount process output — panic/backtrace if it crashed):"
+  sed 's/^/    /' "$WORK/mount.log" 2>/dev/null || echo "    (no mount.log)"
+}
 cleanup() {
   unmount
   [ -n "$MOUNT_PID" ] && { kill "$MOUNT_PID" 2>/dev/null || true; wait "$MOUNT_PID" 2>/dev/null || true; }
+  dump_mount_log
   rm -rf "$MNT" "$WORK"
 }
 trap cleanup EXIT
@@ -37,6 +45,7 @@ echo "==> mounting at $MNT"
 # maker-mount honours MAKER_MOUNT_NO_AUTOUNMOUNT to drop AutoUnmount+DefaultPermissions so a
 # plain container mount comes up; cleanup() unmounts explicitly anyway.
 export MAKER_MOUNT_NO_AUTOUNMOUNT=1
+export RUST_BACKTRACE=1
 "$BIN" "$MNT" "$WORK/db" "$WORK/chunks" >"$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
 for _ in $(seq 1 50); do mountpoint -q "$MNT" && break; sleep 0.2; done
@@ -72,6 +81,15 @@ for op in "${SUBSET[@]}"; do
   # we support apart from an expected perms/owner gap).
   printf '%s\n' "$out" | grep -E "/${op}/[0-9]+\.t .*Failed: [1-9]" | sed -E 's/^/        /' || true
   printf '%s\n' "$out" | grep -E "^not ok" | head -6 | sed -E "s#^#        ${op}: #" || true
+  # The mount must survive every client op. If it died (SIGABRT = Rust panic), pinpoint the
+  # op that killed it and surface the backtrace immediately rather than letting the rest of
+  # the run thrash against a dead mountpoint.
+  if [ -n "$MOUNT_PID" ] && ! kill -0 "$MOUNT_PID" 2>/dev/null; then
+    echo
+    echo "!!! mount process DIED during op '$op' (the mount must never crash on a client op)"
+    dump_mount_log
+    exit 1
+  fi
 done
 echo
 echo "    ========  ============================================"
