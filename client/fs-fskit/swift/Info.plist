@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for the Maker FSKit extension (.appex) — STUB / TODO(dev-account).
+
+  This declares the FSKit extension point + the principal module class. Values marked
+  TODO(dev-account) need your real Team ID / bundle identifiers and must match the signing
+  identity + provisioning profile. The extension will not register without the FSKit SDK and
+  a Developer ID. See ../BUILD.md.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>MakerFS</string>
+
+    <!-- TODO(dev-account): your reverse-DNS bundle id under your registered Team. -->
+    <key>CFBundleIdentifier</key>
+    <string>com.example.makerserver.MakerFS</string>
+
+    <key>CFBundlePackageType</key>
+    <string>XPC!</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!-- The FSKit extension-point declaration. -->
+    <key>EXAppExtensionAttributes</key>
+    <dict>
+        <key>EXExtensionPointIdentifier</key>
+        <!-- TODO(dev-account): confirm the exact FSKit extension-point id against the SDK
+             (e.g. com.apple.fskit.fsmodule). -->
+        <string>com.apple.fskit.fsmodule</string>
+
+        <!-- The principal class: the FSUnaryFileSystem subclass in MakerFSExtension.swift. -->
+        <key>FSModuleClass</key>
+        <string>$(PRODUCT_MODULE_NAME).MakerFSModule</string>
+
+        <!-- TODO(dev-account): declare the volume/format names this module handles, per the
+             FSKit packaging docs. -->
+        <key>FSSupportedFormats</key>
+        <array>
+            <string>MakerSync</string>
+        </array>
+    </dict>
+</dict>
+</plist>

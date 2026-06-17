@@ -40,6 +40,9 @@ use fs_provider::Kind;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
+pub mod mount;
+pub use mount::{FsKitConfig, FsKitMount, MountError};
+
 /// An FSKit **item identifier** — the 64-bit handle the kernel/Swift side uses to refer to
 /// a filesystem item across callbacks. We map it **directly to our `ino`** (stable
 /// per-device), exactly as `fs-fuse` uses the FUSE inode and `fs-cfapi` packs the `node_id`
