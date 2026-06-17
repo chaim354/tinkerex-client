@@ -1,0 +1,23 @@
+[package]
+name = "fs-fskit"
+version = "0.1.0"
+edition = "2021"
+description = "macOS FSKit adapter for fs-provider — the native, kext-free macOS mount (the FUSE-successor framework). The full-FS model over the same Provider (hydrate-on-read), peer of fs-fuse/fs-cfapi. SKELETON: the Swift .appex + signing need a paid Apple Developer account (see BUILD.md); the Rust-side FFI bridge + pure logic compile + test on any OS."
+license = "Apache-2.0"
+
+[dependencies]
+fs-provider = { path = "../fs-provider" }
+
+# macOS-only deps would go here when the Swift bridge is wired (e.g. a `swift-bridge`
+# build dep, or hand-written `extern "C"` shims — see `src/ffi.rs`). For now the bridge is
+# pure Rust `#[no_mangle] extern "C"` functions that compile everywhere; nothing macOS-only
+# is linked yet, so the crate (and its tests) build on Linux/Windows CI too — exactly like
+# fs-cfapi's pure logic compiles off-Windows.
+[target.'cfg(target_os = "macos")'.dependencies]
+
+# The C ABI surface Swift calls into. Default-OFF so the cross-platform pure-logic tests
+# (path<->identifier mapping, change translation) run in the normal matrix without pulling
+# in any macOS scaffolding. Turn it on once the Swift/.appex side exists (BUILD.md).
+[features]
+default = []
+ffi = []
