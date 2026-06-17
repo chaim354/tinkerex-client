@@ -343,3 +343,69 @@ fn symlink_under_a_file_is_enotdir() {
         Err(FsError::NotADirectory)
     ));
 }
+
+// ---- byte-I/O ops must reject the wrong node KIND (no silent tree corruption) ----------
+//
+// `read`/`write`/`truncate` operate on file content. Routed at a directory or a symlink ino
+// they used to silently succeed: a `write`+`flush` would stamp a *file* manifest onto a
+// directory or symlink row (corrupting the tree — a dir would become a file, a symlink
+// would lose its target), and `read` on a directory returned an empty buffer instead of the
+// kernel's EISDIR. The kernel resolves symlinks before these calls and rejects directories
+// at the syscall boundary, but the Provider seam is also reachable from the sync engine +
+// WebDAV/CfAPI adapters, so it must be defensive. POSIX errnos: read/write on a directory →
+// EISDIR; truncate on a directory → EISDIR (already pinned above). A symlink reaching these
+// content ops is a structural misuse → InvalidArgument (EINVAL), the closest POSIX shape.
+
+#[test]
+fn read_on_a_directory_is_eisdir() {
+    let p = provider();
+    let d = p.mkdir(ROOT, "d").unwrap();
+    assert!(matches!(p.read(d.ino, 0, 16), Err(FsError::IsADirectory)));
+}
+
+#[test]
+fn write_on_a_directory_is_eisdir_and_leaves_it_a_directory() {
+    let p = provider();
+    let d = p.mkdir(ROOT, "d").unwrap();
+    assert!(matches!(p.write(d.ino, 0, b"x"), Err(FsError::IsADirectory)));
+    // A failed write must not have staged content that a later flush turns into a manifest.
+    p.flush(d.ino).unwrap();
+    assert_eq!(p.getattr(d.ino).unwrap().kind, Kind::Dir);
+}
+
+#[test]
+fn write_on_a_symlink_is_einval_and_preserves_the_target() {
+    // Before the guard, write+flush replaced the symlink's target with a file manifest,
+    // turning the link into a (corrupt) file. The link's target must survive intact.
+    let p = provider();
+    let l = p.symlink(ROOT, "l", b"the/target").unwrap();
+    assert!(matches!(
+        p.write(l.ino, 0, b"x"),
+        Err(FsError::InvalidArgument)
+    ));
+    assert_eq!(p.getattr(l.ino).unwrap().kind, Kind::Symlink);
+    assert_eq!(p.readlink(l.ino).unwrap(), b"the/target");
+}
+
+#[test]
+fn truncate_on_a_symlink_is_einval_and_preserves_the_target() {
+    // truncate(symlink, 0) used to commit an empty file manifest onto the symlink row,
+    // silently destroying the link target. It must be rejected and leave the link intact.
+    let p = provider();
+    let l = p.symlink(ROOT, "l", b"the/target").unwrap();
+    assert!(matches!(
+        p.truncate(l.ino, 0),
+        Err(FsError::InvalidArgument)
+    ));
+    assert_eq!(p.getattr(l.ino).unwrap().kind, Kind::Symlink);
+    assert_eq!(p.readlink(l.ino).unwrap(), b"the/target");
+}
+
+#[test]
+fn read_on_a_symlink_is_einval() {
+    // POSIX: you readlink() a symlink, you don't read() its contents. At the Provider seam
+    // a read() on a symlink ino is a structural misuse → EINVAL (not the target bytes).
+    let p = provider();
+    let l = p.symlink(ROOT, "l", b"the/target").unwrap();
+    assert!(matches!(p.read(l.ino, 0, 16), Err(FsError::InvalidArgument)));
+}

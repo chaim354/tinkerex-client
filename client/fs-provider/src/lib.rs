@@ -624,6 +624,23 @@ impl SqliteProvider {
 
     /// Current content of `ino`: in-progress staging buffer if open for write, else
     /// the committed content assembled from chunks, else empty.
+    /// The [`Kind`] of an inode, or `NotFound` if it's gone. The shared guard for the
+    /// content ops (`read`/`write`/`truncate`): they operate on file bytes, so a directory
+    /// or symlink ino reaching them is a misuse that must fail with the kernel's errno
+    /// rather than silently corrupt the tree (stamping a file manifest onto a dir/symlink
+    /// row, or returning an empty buffer for a directory).
+    fn kind_of(&self, ino: u64) -> Result<Kind> {
+        let conn = self.conn.lock().unwrap();
+        let k: Option<String> = conn
+            .query_row(
+                "SELECT kind FROM nodes WHERE ino = ?1",
+                params![ino as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        k.map(|s| Kind::from_str(&s)).ok_or(FsError::NotFound)
+    }
+
     fn current_content(&self, ino: u64) -> Result<Vec<u8>> {
         if let Some(buf) = self.staging.lock().unwrap().get(&ino) {
             return Ok(buf.clone());
@@ -1776,6 +1793,15 @@ impl Provider for SqliteProvider {
     }
 
     fn read(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+        // Guard the node kind: read() is for file bytes. A directory → EISDIR (POSIX
+        // read(2) on a directory fd); a symlink → EINVAL (you readlink() a symlink, not
+        // read() it). Without this a directory read returned an empty buffer (wrong errno)
+        // and a symlink read returned its target bytes (a structural misuse).
+        match self.kind_of(ino)? {
+            Kind::File => {}
+            Kind::Dir => return Err(FsError::IsADirectory),
+            Kind::Symlink => return Err(FsError::InvalidArgument),
+        }
         // Open for write → serve from the in-memory staging buffer (the live, uncommitted
         // content). Slice the requested range out of it.
         if let Some(buf) = self.staging.lock().unwrap().get(&ino) {
@@ -1814,6 +1840,14 @@ impl Provider for SqliteProvider {
     }
 
     fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32> {
+        // Guard the node kind: write() is for file bytes. A directory → EISDIR; a symlink →
+        // EINVAL. Without this a write+flush stamped a file manifest onto the dir/symlink
+        // row, corrupting the tree (a symlink lost its target; a dir became a file).
+        match self.kind_of(ino)? {
+            Kind::File => {}
+            Kind::Dir => return Err(FsError::IsADirectory),
+            Kind::Symlink => return Err(FsError::InvalidArgument),
+        }
         let mut staging = self.staging.lock().unwrap();
         if !staging.contains_key(&ino) {
             drop(staging);
@@ -1905,10 +1939,13 @@ impl Provider for SqliteProvider {
                     |r| r.get(0),
                 )
                 .optional()?;
-            match kind {
+            match kind.map(|k| Kind::from_str(&k)) {
                 None => return Err(FsError::NotFound),
-                Some(k) if Kind::from_str(&k) == Kind::Dir => return Err(FsError::IsADirectory),
-                Some(_) => {}
+                Some(Kind::Dir) => return Err(FsError::IsADirectory),
+                // A symlink reaching truncate is a structural misuse — committing a file
+                // manifest here would silently destroy the link target. EINVAL.
+                Some(Kind::Symlink) => return Err(FsError::InvalidArgument),
+                Some(Kind::File) => {}
             }
         }
         // If the file is already open for write, resize the live staging buffer in
