@@ -192,6 +192,19 @@
       <!-- ===== Settings (file-layer controls) ===== -->
       <div id="viewSettings" class="hidden">
         <section class="card">
+          <h2>Theme</h2>
+          <p class="muted">Pick a look for the app. Applies instantly and is remembered on
+            this device. Only the Default theme follows your system light/dark setting.</p>
+          <div id="themeGrid" class="theme-grid" role="radiogroup" aria-label="App theme"></div>
+          <div class="theme-sample" aria-hidden="true">
+            <span class="theme-sample-aa">Aa</span>
+            <span class="pill on"><span class="dot"></span>sample</span>
+            <button class="primary" type="button" tabindex="-1">Primary</button>
+            <span class="badge">badge</span>
+          </div>
+        </section>
+
+        <section class="card">
           <h2>Bandwidth &amp; hydration</h2>
           <p class="muted">These tune the sync daemon. They're saved per account and take effect
             the next time you sign in (they're set when the drive mounts).</p>
