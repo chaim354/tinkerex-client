@@ -186,6 +186,96 @@ fn save_token(server: &str, email: &str, token: &str) {
     }
 }
 
+// ---- file-layer preferences (bandwidth + progressive hydration) --------------------
+//
+// These map onto `DaemonConfig` *start-time* options (`with_bandwidth`,
+// `with_hydrate_concurrency`), so they're persisted here and applied on the next
+// sign-in/mount. Selective-sync (per-folder include/exclude) is NOT here: the engine
+// has the API (`SyncEngine::subscribe`/`unsubscribe`) but the mount types don't yet
+// expose their `Arc<SqliteProvider>` for a live command — see
+// `docs/plan-selective-sync-ui.md`.
+
+/// User preferences that tune the sync daemon. Serialized to `prefs.json` keyed by
+/// `(server,email)`. All zero/false = the unchanged defaults.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Prefs {
+    /// Download cap in **MB/s** (0 = unlimited).
+    #[serde(default)]
+    down_mbps: u64,
+    /// Upload cap in **MB/s** (0 = unlimited).
+    #[serde(default)]
+    up_mbps: u64,
+    /// Opt-in progressive (range) hydration for large files.
+    #[serde(default)]
+    progressive_hydration: bool,
+}
+
+impl Prefs {
+    /// A MB/s cap as bytes/sec for `DaemonConfig::with_bandwidth`. `0` → `None` (unlimited).
+    fn cap_bps(mbps: u64) -> Option<u64> {
+        if mbps == 0 {
+            None
+        } else {
+            Some(mbps.saturating_mul(1_000_000))
+        }
+    }
+
+    fn down_bps(&self) -> Option<u64> {
+        Self::cap_bps(self.down_mbps)
+    }
+
+    fn up_bps(&self) -> Option<u64> {
+        Self::cap_bps(self.up_mbps)
+    }
+}
+
+fn prefs_path() -> PathBuf {
+    app_base().join("prefs.json")
+}
+
+fn load_prefs(server: &str, email: &str) -> Prefs {
+    let data = match std::fs::read_to_string(prefs_path()) {
+        Ok(d) => d,
+        Err(_) => return Prefs::default(),
+    };
+    let map: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(_) => return Prefs::default(),
+    };
+    map.get(creds_key(server, email))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn save_prefs(server: &str, email: &str, prefs: &Prefs) {
+    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(prefs_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.insert(
+        creds_key(server, email),
+        serde_json::to_value(prefs).unwrap_or(serde_json::Value::Null),
+    );
+    let _ = std::fs::create_dir_all(app_base());
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(prefs_path(), json);
+    }
+}
+
+/// Read this account's saved file-layer prefs (for the Settings UI).
+#[tauri::command]
+fn get_prefs(server_url: String, email: String) -> Prefs {
+    load_prefs(&server_url, &email)
+}
+
+/// Persist this account's file-layer prefs. Bandwidth + hydration apply on the next
+/// sign-in/mount (they're daemon start-time options). Returns a human note.
+#[tauri::command]
+fn set_prefs(server_url: String, email: String, prefs: Prefs) -> Result<String, String> {
+    save_prefs(&server_url, &email, &prefs);
+    Ok("Saved — applies the next time you sign in.".into())
+}
+
 // ---- mounting ----------------------------------------------------------------------
 
 /// Mount + start the sync loop with an already-obtained device `token`. Shared by
@@ -218,7 +308,11 @@ fn mount_with_token(
     #[cfg(not(target_os = "windows"))]
     std::fs::create_dir_all(&mountpoint).map_err(|e| format!("mountpoint: {e}"))?;
 
-    let cfg = DaemonConfig::new(&mountpoint, db, chunks, server_url, token);
+    // Apply the account's saved file-layer prefs (bandwidth caps) at mount time — these
+    // are DaemonConfig start-time options, so they take effect on this sign-in.
+    let prefs = load_prefs(server_url, email);
+    let cfg = DaemonConfig::new(&mountpoint, db, chunks, server_url, token)
+        .with_bandwidth(prefs.up_bps(), prefs.down_bps());
     let mount = Mount::start(cfg).map_err(|e| format!("mount failed: {e}"))?;
     let mp = mount.mountpoint().display().to_string();
     *guard = Some(mount);
@@ -1097,8 +1191,74 @@ pub fn run() {
             maker_update_bom_line,
             maker_delete_bom_line,
             maker_list_previews,
-            maker_enqueue_preview
+            maker_enqueue_preview,
+            get_prefs,
+            set_prefs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_bps_zero_is_unlimited() {
+        assert_eq!(Prefs::cap_bps(0), None);
+    }
+
+    #[test]
+    fn cap_bps_converts_mbps_to_bytes_per_sec() {
+        // 5 MB/s = 5_000_000 bytes/sec (DaemonConfig::with_bandwidth wants bytes/sec).
+        assert_eq!(Prefs::cap_bps(5), Some(5_000_000));
+        assert_eq!(Prefs::cap_bps(1), Some(1_000_000));
+    }
+
+    #[test]
+    fn cap_bps_saturates_instead_of_overflowing() {
+        // A pathological MB/s value must not panic — saturate to u64::MAX.
+        assert_eq!(Prefs::cap_bps(u64::MAX), Some(u64::MAX));
+    }
+
+    #[test]
+    fn prefs_down_and_up_use_their_own_caps() {
+        let p = Prefs {
+            down_mbps: 10,
+            up_mbps: 0,
+            progressive_hydration: true,
+        };
+        assert_eq!(p.down_bps(), Some(10_000_000));
+        assert_eq!(p.up_bps(), None); // 0 = unlimited
+    }
+
+    #[test]
+    fn prefs_round_trip_through_json() {
+        // The shape the Settings UI sends as a Tauri arg, and we persist verbatim.
+        let p = Prefs {
+            down_mbps: 8,
+            up_mbps: 2,
+            progressive_hydration: true,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Prefs = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn prefs_tolerates_absent_keys() {
+        // An older/partial prefs blob must still parse to defaults for missing fields.
+        let p: Prefs = serde_json::from_str(r#"{"down_mbps":4}"#).unwrap();
+        assert_eq!(p.down_mbps, 4);
+        assert_eq!(p.up_mbps, 0);
+        assert!(!p.progressive_hydration);
+    }
+
+    #[test]
+    fn default_prefs_are_all_unlimited_off() {
+        let p = Prefs::default();
+        assert_eq!(p.down_bps(), None);
+        assert_eq!(p.up_bps(), None);
+        assert!(!p.progressive_hydration);
+    }
 }
