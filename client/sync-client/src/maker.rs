@@ -14,6 +14,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, ServerClient};
 
+/// Deserialize a Rails `decimal` column into `f64`. Rails serializes `BigDecimal` as a
+/// JSON **string** (e.g. `"50.0"`) in these controllers, but a plain number (`50.0`) is
+/// also accepted so the types are robust to either rendering. Used for inventory
+/// quantities and BOM line quantities.
+fn de_decimal<'de, D>(d: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrNum {
+        Str(String),
+        Num(f64),
+    }
+    match StrOrNum::deserialize(d)? {
+        StrOrNum::Num(n) => Ok(n),
+        StrOrNum::Str(s) => s.parse::<f64>().map_err(serde::de::Error::custom),
+    }
+}
+
 // ---- items ---------------------------------------------------------------------
 
 /// An item as it appears in the list (`GET /v1/maker/items`) — the "short" shape the
@@ -374,8 +394,12 @@ pub struct InventoryItem {
     #[serde(default)]
     pub category: Option<String>,
     pub unit: String,
-    pub quantity_cached: i64,
-    pub min_quantity: i64,
+    /// Rails decimals (precision 12, scale 3) → JSON **strings** like `"50.0"` (may be
+    /// fractional); [`de_decimal`] also tolerates a plain number.
+    #[serde(deserialize_with = "de_decimal")]
+    pub quantity_cached: f64,
+    #[serde(deserialize_with = "de_decimal")]
+    pub min_quantity: f64,
     #[serde(default)]
     pub location_id: Option<i64>,
     #[serde(default)]
@@ -407,7 +431,7 @@ pub struct InventoryItemInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_quantity: Option<i64>,
+    pub min_quantity: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit_cost: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -422,7 +446,9 @@ pub struct InventoryItemInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InventoryTransaction {
     pub id: i64,
-    pub delta: i64,
+    /// Rails decimal → JSON string like `"120.0"`; [`de_decimal`] parses it.
+    #[serde(deserialize_with = "de_decimal")]
+    pub delta: f64,
     pub reason: String,
     #[serde(default)]
     pub project_id: Option<i64>,
@@ -520,7 +546,9 @@ pub struct BomLine {
     pub bom_id: i64,
     #[serde(default)]
     pub reference: Option<String>,
-    pub quantity: String,
+    /// Rails decimal → JSON string like `"4.0"` (may be fractional).
+    #[serde(deserialize_with = "de_decimal")]
+    pub quantity: f64,
     pub unit: String,
     #[serde(default)]
     pub notes: Option<String>,
@@ -577,7 +605,9 @@ pub struct RollupLine {
     pub id: i64,
     #[serde(default)]
     pub reference: Option<String>,
-    pub quantity: String,
+    /// Rails decimal → JSON string like `"4.0"` (may be fractional).
+    #[serde(deserialize_with = "de_decimal")]
+    pub quantity: f64,
     pub unit: String,
     #[serde(default)]
     pub notes: Option<String>,
@@ -1565,25 +1595,29 @@ mod tests {
 
     #[test]
     fn inventory_item_shapes_deserialize() {
+        // quantity_cached / min_quantity are Rails BigDecimals → JSON **strings** (the real
+        // wire shape from the controller, verified by live curl). de_decimal parses them.
         let short: InventoryItem = serde_json::from_str(
             r#"{"id":9,"name":"M3 bolt","part_number":"M3x10","category":"fasteners",
-                "unit":"each","quantity_cached":120,"min_quantity":50,
+                "unit":"each","quantity_cached":"120.0","min_quantity":"50.0",
                 "location_id":2,"supplier_id":3,"updated_at":"y"}"#,
         )
         .unwrap();
         assert_eq!(short.name, "M3 bolt");
-        assert_eq!(short.quantity_cached, 120);
-        assert_eq!(short.min_quantity, 50);
+        assert_eq!(short.quantity_cached, 120.0);
+        assert_eq!(short.min_quantity, 50.0);
         assert_eq!(short.location_id, Some(2));
         // full-only fields default when absent
         assert!(short.notes.is_none());
 
+        // de_decimal also tolerates a plain JSON number (robustness).
         let full: InventoryItem = serde_json::from_str(
             r#"{"id":9,"name":"M3 bolt","part_number":null,"category":null,"unit":"each",
-                "quantity_cached":10,"min_quantity":0,"location_id":null,"supplier_id":null,
+                "quantity_cached":10.5,"min_quantity":0.0,"location_id":null,"supplier_id":null,
                 "updated_at":"y","unit_cost":"0.05","notes":"hex head","created_at":"x"}"#,
         )
         .unwrap();
+        assert_eq!(full.quantity_cached, 10.5);
         assert_eq!(full.notes.as_deref(), Some("hex head"));
         assert_eq!(full.unit_cost.as_deref(), Some("0.05"));
     }
@@ -1593,25 +1627,26 @@ mod tests {
         let input = InventoryItemInput {
             name: Some("Resin".into()),
             unit: Some("l".into()),
-            min_quantity: Some(1),
+            min_quantity: Some(1.0),
             ..Default::default()
         };
         assert_eq!(
             serde_json::to_value(&input).unwrap(),
-            serde_json::json!({ "name": "Resin", "unit": "l", "min_quantity": 1 })
+            serde_json::json!({ "name": "Resin", "unit": "l", "min_quantity": 1.0 })
         );
     }
 
     #[test]
     fn inventory_transaction_shape_deserializes() {
+        // delta is a Rails decimal → JSON string (real wire shape).
         let r: InventoryTransactionsResponse = serde_json::from_str(
             r#"{"transactions":[
-              {"id":1,"delta":-5,"reason":"used","project_id":2,"note":"prototype","created_at":"t"}
+              {"id":1,"delta":"-5.0","reason":"consumed","project_id":2,"note":"prototype","created_at":"t"}
             ]}"#,
         )
         .unwrap();
         assert_eq!(r.transactions.len(), 1);
-        assert_eq!(r.transactions[0].delta, -5);
+        assert_eq!(r.transactions[0].delta, -5.0);
         assert_eq!(r.transactions[0].project_id, Some(2));
     }
 
@@ -1664,7 +1699,7 @@ mod tests {
                 {"id":10,"reference":"R1","quantity":"4.0","unit":"each","notes":null,
                  "position":0,"target_kind":"inventory_item",
                  "target":{"kind":"inventory_item","inventory_item":{"id":9,"name":"M3 bolt",
-                   "part_number":"M3x10","unit":"each","quantity_cached":120}}},
+                   "part_number":"M3x10","unit":"each","quantity_cached":"120.0"}}},
                 {"id":11,"reference":"R2","quantity":"1.0","unit":"each","notes":"printed body",
                  "position":1,"target_kind":"design_file",
                  "target":{"kind":"design_file","node_id":"node-abc"}},
@@ -1677,6 +1712,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.bom.revision, 1);
         assert_eq!(r.lines.len(), 3);
+        assert_eq!(r.lines[0].quantity, 4.0);
         assert_eq!(r.lines[0].target_kind.as_deref(), Some("inventory_item"));
         // target is free-form JSON the UI renders per kind.
         assert_eq!(r.lines[0].target["kind"], "inventory_item");
@@ -1725,6 +1761,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(line.id, 10);
+        assert_eq!(line.quantity, 4.0);
         assert_eq!(line.inventory_item_id, Some(9));
         assert_eq!(line.target_kind.as_deref(), Some("inventory_item"));
     }
