@@ -19,6 +19,14 @@
   --ok-bg: #e7f6ec;
   --hover: #f4f6fb;
   --focus: #2563eb;
+  --fav: #f5b301;          /* favorite star (was hard-coded in .fav.on) */
+
+  /* typography (themes may swap the typeface) */
+  --font-ui: system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, monospace;
+
+  /* card depth (themes may add a soft shadow, e.g. craftmom) */
+  --shadow: none;
 
   /* spacing scale */
   --s1: 0.25rem;
@@ -51,7 +59,7 @@
 * { box-sizing: border-box; }
 
 body {
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family: var(--font-ui);
   margin: 0;
   background: var(--bg);
   color: var(--ink);
@@ -84,6 +92,7 @@ h2 {
   border-radius: 12px;
   padding: 1.1rem 1.2rem;
   margin-bottom: var(--s4);
+  box-shadow: var(--shadow);
 }
 
 label {
@@ -193,7 +202,7 @@ button.danger { color: var(--err); border-color: var(--err); }
 
 .muted { color: var(--muted); font-size: 0.85rem; }
 .err { color: var(--err); }
-.code { font-family: ui-monospace, monospace; }
+.code { font-family: var(--font-mono); }
 .hidden { display: none !important; }
 
 /* ---- tabs ---- */
@@ -282,7 +291,7 @@ button.danger { color: var(--err); border-color: var(--err); }
 .codebox-wrap { margin-top: 0.6rem; display: flex; gap: var(--s2); align-items: stretch; }
 .codebox {
   flex: 1;
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 1.5rem;
   letter-spacing: 0.15em;
   padding: 0.6rem 0.9rem;
@@ -438,7 +447,7 @@ button.danger { color: var(--err); border-color: var(--err); }
   background: var(--hover); color: var(--muted); margin-top: var(--s1);
 }
 .fav { position: absolute; top: var(--s1); right: var(--s2); cursor: pointer; font-size: 1rem; color: var(--off); }
-.fav.on { color: #f5b301; }
+.fav.on { color: var(--fav); }
 
 /* ---- collections + tasks board ---- */
 .lib-coll-list { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s3); }
