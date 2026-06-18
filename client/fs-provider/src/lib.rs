@@ -2097,7 +2097,12 @@ impl Provider for SqliteProvider {
     }
 
     fn flush(&self, ino: u64) -> Result<()> {
-        let buf = match self.staged.take(ino) {
+        // SNAPSHOT the staged buffer; do NOT take it yet. If anything below fails (a chunk
+        // `put` to a full or unreachable store, the DB transaction), the staged edit must
+        // survive so it can be retried -- otherwise a failed flush silently DROPS the
+        // user's write while the node keeps its old content, and apps rarely retry a failed
+        // flush. It is released only after `tx.commit()` is durable, and only if unchanged.
+        let buf = match self.staged.snapshot(ino) {
             Some(b) => b,
             None => return Ok(()), // nothing staged
         };
@@ -2153,6 +2158,10 @@ impl Provider for SqliteProvider {
             Self::enqueue(&tx, &node_id, "upsert")?;
         }
         tx.commit()?;
+        // Commit is durable, so the staged buffer can now be released -- but only if it is
+        // still the bytes we committed. A writer that landed after the snapshot above left a
+        // NEWER buffer, and dropping that would lose an unflushed write.
+        self.staged.release_if_unchanged(ino, &buf);
         Ok(())
     }
 
