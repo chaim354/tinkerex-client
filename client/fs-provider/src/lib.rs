@@ -81,6 +81,19 @@ fn escape_like(s: &str) -> String {
 /// mtime bump. Nanos resolution matches what build tools and the future CfAPI/File-Provider
 /// metadata want; stored as i64 (a `bigint` on the wire/server — unix-nanos in 2026
 /// overflow a 32-bit int).
+/// Map a chunk-store read error to the right `FsError`: `InvalidData` (the verifying read's
+/// hash-mismatch) is *corruption* (→ `ChunkCorrupt`, EIO), anything else (typically
+/// `NotFound`) means the chunk isn't local yet (→ `ChunkMissing`, which the mount read-path
+/// hydrates + retries). Conflating the two would either mask corruption as a hydratable miss
+/// (silently re-fetching forever / serving wrong bytes) or treat a real miss as fatal.
+fn map_chunk_err(e: std::io::Error, hash: &str) -> FsError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        FsError::ChunkCorrupt(hash.to_string())
+    } else {
+        FsError::ChunkMissing(hash.to_string())
+    }
+}
+
 fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -307,6 +320,11 @@ pub enum FsError {
     NameTooLong,
     #[error("chunk missing: {0}")]
     ChunkMissing(String),
+    /// A chunk's stored bytes no longer hash to its content-address key — bitrot, a torn
+    /// write, or a wrong download. Surfaced (not silently assembled) so a corrupt read fails
+    /// loudly instead of returning wrong file content. The mount adapters map this to `EIO`.
+    #[error("chunk corrupt: {0}")]
+    ChunkCorrupt(String),
     #[error("locked (would block)")]
     WouldBlock,
     /// The operation targets a node kind the sync engine deliberately does not model —
@@ -594,10 +612,13 @@ impl SqliteProvider {
         let mut out = Vec::new();
         for row in rows {
             let (hash, len) = row?;
+            // Verifying read: a chunk whose bytes no longer hash to its key is *corruption*
+            // (EIO), distinct from a chunk that isn't present yet (ChunkMissing → hydrate).
+            // Returning the bytes unchecked would reconstruct a corrupt file silently.
             let bytes = self
                 .store
-                .get(&hash)
-                .map_err(|_| FsError::ChunkMissing(hash))?;
+                .get_verified(&hash)
+                .map_err(|e| map_chunk_err(e, &hash))?;
             // Trust the manifest length; chunk store returns the whole chunk.
             out.extend_from_slice(&bytes[..len.min(bytes.len())]);
         }
@@ -645,8 +666,8 @@ impl SqliteProvider {
             }
             let bytes = self
                 .store
-                .get(&hash)
-                .map_err(|_| FsError::ChunkMissing(hash))?;
+                .get_verified(&hash)
+                .map_err(|e| map_chunk_err(e, &hash))?;
             let bytes = &bytes[..c_len.min(bytes.len())];
             // Overlap of [c_off, c_end) with [offset, req_end), copied into the output buffer.
             let copy_start = c_off.max(offset);
