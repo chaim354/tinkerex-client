@@ -68,7 +68,7 @@ fi
 echo "==> booting STORAGE_BACKEND=local Rails on $SERVER"
 (fuser -k "$PORT/tcp" 2>/dev/null || pkill -f 'puma' 2>/dev/null) || true
 sleep 1
-STORAGE_BACKEND=local CHUNK_LOCAL_DIR="$WORK/chunk-store" bin/rails server -p "$PORT" >"$WORK/server.log" 2>&1 &
+STORAGE_BACKEND=local ENABLE_TEST_SIGNUP=true CHUNK_LOCAL_DIR="$WORK/chunk-store" bin/rails server -p "$PORT" >"$WORK/server.log" 2>&1 &
 SRV_PID=$!
 for _ in $(seq 1 60); do curl -sf "$SERVER/up" >/dev/null && break; sleep 1; done
 curl -sf "$SERVER/up" >/dev/null || { echo "FAIL: server didn't start"; cat "$WORK/server.log"; exit 1; }
