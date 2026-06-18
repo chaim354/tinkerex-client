@@ -14,17 +14,19 @@ name = "stl-thumbnailer"
 path = "src/main.rs"
 
 [dependencies]
-# Pure-software CPU rasterizer (z-buffer, MSAA, programmable shaders in plain Rust).
-# crates.io 0.5.3 (2021) is stale; master is 0.6.0 and is what the teapot example targets.
-# Pinned to master: no GPU/GL deps (only `clipline`, optional `image`/`fxhash`).
-# License: Apache-2.0 AND MIT (permissive).
-euc = { git = "https://github.com/zesterer/euc", default-features = false, features = ["par"] }
-# Linear-algebra + the Rgba/Vec3/Vec4 types euc's interpolation (WeightedSum) needs.
-# MIT/Apache. "rgba" feature for the Rgba color type.
-vek = { version = "0.17", default-features = false, features = ["rgba", "std"] }
-# Parse binary AND ASCII STL -> indexed triangles with normals. MIT.
+# Pure-software CPU rasterizer (z-buffer + programmable shaders in plain Rust).
+# We use the crates.io 0.5.3 release: it is `#![no_std]`, pulls in ONLY `vek` (no GPU/
+# GL/wgpu/X11/Mesa), and renders correctly here. (The `master`/0.6.0 branch the research
+# pass suggested was tried and pinned, but its rasterizer produced empty frames on this
+# commit — see crate README/notes; 0.5.3 is verified working.) License: Apache-2.0 / MIT.
+euc = "0.5.3"
+# Linear algebra + the Vec3/Mat4/Rgba types. Pinned to 0.14 to MATCH euc 0.5.3's own vek,
+# so our `Vec3<f32>` satisfies euc's `Interpolate` bound (the VsOut normal we pass through).
+# License: MIT.
+vek = { version = "0.14", default-features = false, features = ["rgba", "std"] }
+# Parse binary AND ASCII STL -> indexed triangles with normals. License: MIT.
 stl_io = "0.8"
-# Encode RGBA buffer -> PNG. MIT-or-Apache.
+# Encode RGBA buffer -> PNG. License: MIT-or-Apache.
 image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
 

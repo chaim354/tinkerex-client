@@ -86,3 +86,37 @@ fn garbage_input_errors_not_panics() {
     let res = render_stl(b"not an stl file at all", 64, 64);
     assert!(res.is_err(), "garbage input should Err, not panic");
 }
+
+/// Build a tiny binary STL with ZERO face normals so the renderer must recompute
+/// them from geometry — exercises the "missing/zero normals" requirement.
+fn binary_stl_zero_normals(tris: &[[[f32; 3]; 3]]) -> Vec<u8> {
+    let mut out = vec![0u8; 80];
+    out.extend_from_slice(&(tris.len() as u32).to_le_bytes());
+    for tri in tris {
+        out.extend_from_slice(&[0u8; 12]); // zero normal
+        for v in tri {
+            for c in v {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&0u16.to_le_bytes()); // attribute byte count
+    }
+    out
+}
+
+#[test]
+fn zero_normals_are_recomputed_and_render() {
+    // A simple quad (two triangles) in the XY plane, normals all zero.
+    let tris = [
+        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 4.0, 0.0]],
+        [[0.0, 0.0, 0.0], [4.0, 4.0, 0.0], [0.0, 4.0, 0.0]],
+    ];
+    let stl = binary_stl_zero_normals(&tris);
+    let png = render_stl(&stl, 128, 128).expect("zero-normal STL should render");
+    let pixels = decode(&png, 128, 128);
+    let ratio = non_background_ratio(&pixels);
+    assert!(
+        ratio > 0.05,
+        "recomputed-normal mesh should be visible + shaded, got {ratio:.4}"
+    );
+}
