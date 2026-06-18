@@ -1,0 +1,32 @@
+[package]
+name = "stl-thumbnailer"
+version = "0.1.0"
+edition = "2021"
+description = "GL-free, pure-CPU STL -> PNG thumbnail renderer. Software rasterizer (euc); no GPU/OpenGL/wgpu/X11/Mesa. Baked into the Rails Docker image AND the Tauri desktop core."
+license = "Apache-2.0"
+
+[lib]
+name = "stl_thumbnailer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stl-thumbnailer"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-software CPU rasterizer (z-buffer, MSAA, programmable shaders in plain Rust).
+# crates.io 0.5.3 (2021) is stale; master is 0.6.0 and is what the teapot example targets.
+# Pinned to master: no GPU/GL deps (only `clipline`, optional `image`/`fxhash`).
+# License: Apache-2.0 AND MIT (permissive).
+euc = { git = "https://github.com/zesterer/euc", default-features = false, features = ["par"] }
+# Linear-algebra + the Rgba/Vec3/Vec4 types euc's interpolation (WeightedSum) needs.
+# MIT/Apache. "rgba" feature for the Rgba color type.
+vek = { version = "0.17", default-features = false, features = ["rgba", "std"] }
+# Parse binary AND ASCII STL -> indexed triangles with normals. MIT.
+stl_io = "0.8"
+# Encode RGBA buffer -> PNG. MIT-or-Apache.
+image = { version = "0.25", default-features = false, features = ["png"] }
+anyhow = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
