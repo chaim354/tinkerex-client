@@ -33,7 +33,11 @@ cargo build --manifest-path client/fs-fuse/Cargo.toml --bin maker-mount >/dev/nu
 BIN="client/fs-fuse/target/debug/maker-mount"
 
 echo "==> mounting at $MNT"
-"$BIN" "$MNT" "$WORK/db" "$WORK/chunks" >"$WORK/mount.log" 2>&1 &
+# Drop AutoUnmount on this headless CI mount: fuser 0.17 requires a non-Owner allow ACL
+# (allow_other/allow_root) when AutoUnmount is set, which isn't available on a bare runner
+# ("auto_unmount requires acl != Owner"). This script unmounts explicitly in its trap, so the
+# auto-cleanup isn't needed. (maker-mount honors this env; the real daemon never sets AutoUnmount.)
+MAKER_MOUNT_NO_AUTOUNMOUNT=1 "$BIN" "$MNT" "$WORK/db" "$WORK/chunks" >"$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
 for _ in $(seq 1 50); do mountpoint -q "$MNT" && break; sleep 0.2; done
 mountpoint -q "$MNT" || { echo "FAIL: mount didn't come up"; cat "$WORK/mount.log"; exit 1; }
