@@ -32,6 +32,14 @@ use staging::StagingArea;
 
 pub const ROOT_INO: u64 = 1;
 
+/// An upper bound on a single file's logical size (its highest written byte offset + 1).
+/// The staging buffer is materialized in memory, so an absurd write offset (a buggy/hostile
+/// client, or `offset + len` overflowing) would otherwise demand a petabyte allocation and
+/// **abort the whole process** (SIGABRT) — taking the mount daemon down. 16 TiB is far above
+/// any real maker file (multi-GB CAD/3D), so a write/truncate beyond it is a bug, rejected
+/// with `FileTooLarge` (EFBIG) instead of attempted.
+pub const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024; // 16 TiB
+
 /// POSIX `NAME_MAX`: the maximum length, **in bytes**, of a single path component. A
 /// longer name fails with `ENAMETOOLONG` (pjdfstest `<op>/02.t`). The kernel enforces this
 /// per component (bytes, not chars), so we mirror it on every node-creating/-renaming path.
@@ -318,6 +326,11 @@ pub enum FsError {
     /// Mapped to `ENAMETOOLONG` by the adapters.
     #[error("file name too long")]
     NameTooLong,
+    /// A write/truncate would push a file past [`MAX_FILE_SIZE`] (or `offset + len` overflows).
+    /// Rejected (EFBIG) rather than attempting a petabyte staging allocation that would abort
+    /// the process. Maps to `EFBIG` in the adapters (catch-all → EIO is also acceptable).
+    #[error("file too large")]
+    FileTooLarge,
     #[error("chunk missing: {0}")]
     ChunkMissing(String),
     /// A chunk's stored bytes no longer hash to its content-address key — bitrot, a torn
@@ -2056,6 +2069,17 @@ impl Provider for SqliteProvider {
             Kind::Dir => return Err(FsError::IsADirectory),
             Kind::Symlink => return Err(FsError::InvalidArgument),
         }
+        // Cap the resulting end offset with checked arithmetic BEFORE either staging
+        // path runs: both `write_at` and `seed_and_write_at` splice, which resizes the
+        // in-memory buffer, so an absurd or overflowing `offset + len` would attempt a
+        // petabyte allocation and SIGABRT the process, taking the mount down. Reject
+        // with EFBIG instead, and do it here so a rejected write leaves staging
+        // untouched. (Checked before the splice rather than around `buf` as originally
+        // written -- main moved the buffer mutation behind `Staging`.)
+        offset
+            .checked_add(data.len() as u64)
+            .filter(|&e| e <= MAX_FILE_SIZE)
+            .ok_or(FsError::FileTooLarge)?;
         // Already open for write → splice straight in, under one lock hold.
         if !self.staged.write_at(ino, offset, data) {
             // Not staged yet. Seed with the current committed content so partial writes to
@@ -2153,6 +2177,12 @@ impl Provider for SqliteProvider {
                 Some(Kind::Symlink) => return Err(FsError::InvalidArgument),
                 Some(Kind::File) => {}
             }
+        }
+        // Cap the target size: a grow-truncate to an absurd size materializes a zero-filled
+        // staging buffer of that length — the same petabyte-allocation SIGABRT as a wild
+        // write offset. Reject with EFBIG before allocating. (Shrink/zero is always fine.)
+        if size > MAX_FILE_SIZE {
+            return Err(FsError::FileTooLarge);
         }
         // If the file is already open for write, resize the live staging buffer in
         // place; the eventual `flush`/`release` commits the new length. Shrinking here

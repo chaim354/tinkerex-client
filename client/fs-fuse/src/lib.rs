@@ -54,6 +54,9 @@ fn errno(e: &FsError) -> fuser::Errno {
         // the attempt cleanly with EPERM rather than ENOSYS/EIO so callers (cp -a, tar,
         // git) get a deterministic "operation not permitted" instead of a confusing crash.
         FsError::NotSupported => fuser::Errno::EPERM,
+        // A write/truncate past MAX_FILE_SIZE (or an overflowing offset) → EFBIG, the POSIX
+        // errno for "file too large", rather than a generic EIO.
+        FsError::FileTooLarge => fuser::Errno::EFBIG,
         _ => fuser::Errno::EIO,
     }
 }
