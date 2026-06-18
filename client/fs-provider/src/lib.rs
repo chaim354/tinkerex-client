@@ -339,6 +339,14 @@ pub trait Provider: Send + Sync {
     fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32>;
     /// Finalize writeback: chunk the staged content, store + dedup, update the tree.
     fn flush(&self, ino: u64) -> Result<()>;
+    /// Discard the in-progress (staged, uncommitted) write for `ino` *without* committing,
+    /// leaving the last committed content intact. Used to abort a partial/failed write — e.g.
+    /// a WebDAV PUT whose body ended early (fewer bytes than its declared length) — so a
+    /// truncated body is never persisted as a version. Default no-op (a provider with no
+    /// staging has nothing to discard); `SqliteProvider` drops the staging buffer.
+    fn discard(&self, _ino: u64) -> Result<()> {
+        Ok(())
+    }
     /// Set permission bits (the kernel's `chmod`). Default no-op; `SqliteProvider`
     /// persists + syncs it so the executable bit survives and propagates.
     fn set_mode(&self, _ino: u64, _mode: u32) -> Result<()> {
@@ -1942,6 +1950,13 @@ impl Provider for SqliteProvider {
         Ok(())
     }
 
+    fn discard(&self, ino: u64) -> Result<()> {
+        // Drop the uncommitted staging buffer; the committed manifest (if any) is untouched,
+        // so the file reverts to its last durable content rather than a half-written one.
+        self.staging.lock().unwrap().remove(&ino);
+        Ok(())
+    }
+
     fn truncate(&self, ino: u64, size: u64) -> Result<()> {
         // POSIX: truncate() on a directory is EISDIR. Reject before touching staging/chunks
         // (a dir has no manifest; without this the size=0 path would commit an empty file
@@ -2354,6 +2369,9 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     }
     fn flush(&self, ino: u64) -> Result<()> {
         (**self).flush(ino)
+    }
+    fn discard(&self, ino: u64) -> Result<()> {
+        (**self).discard(ino)
     }
     fn truncate(&self, ino: u64, size: u64) -> Result<()> {
         (**self).truncate(ino, size)

@@ -91,12 +91,13 @@ impl<P: Provider + 'static> WebdavFs<P> {
         Ok((parent_ino, name))
     }
 
-    fn make_file(&self, ino: u64) -> Box<dyn DavFile> {
+    fn make_file(&self, ino: u64, expected_size: Option<u64>) -> Box<dyn DavFile> {
         Box::new(WebdavFile {
             provider: self.provider.clone(),
             hydrate: self.hydrate.clone(),
             ino,
             pos: 0,
+            expected_size,
         })
     }
 }
@@ -152,13 +153,19 @@ impl<P: Provider + 'static> DavFileSystem for WebdavFs<P> {
                 if options.truncate {
                     self.provider.truncate(ino, 0).map_err(map_err)?;
                 }
-                Ok(self.make_file(ino))
+                // For a full (truncating) PUT, dav-server passes the declared body length
+                // (`Content-Length` / macOS `X-Expected-Entity-Length`). Carry it so `flush`
+                // can refuse to commit a body that arrived short. Ranged/append opens
+                // (`truncate == false`) build on existing content, so their staged length is
+                // not the declared count — don't guard those.
+                let expected_size = options.size.filter(|_| options.truncate);
+                Ok(self.make_file(ino, expected_size))
             } else {
                 let (ino, attr) = self.resolve(path)?;
                 if attr.kind == Kind::Dir {
                     return Err(FsError::Forbidden);
                 }
-                Ok(self.make_file(ino))
+                Ok(self.make_file(ino, None))
             }
         })
     }
@@ -202,6 +209,10 @@ struct WebdavFile<P: Provider + 'static> {
     hydrate: Option<Hydrate>,
     ino: u64,
     pos: u64,
+    /// Declared body length for a full truncating PUT (`None` for reads/ranged/append).
+    /// `flush` refuses to commit if the staged content doesn't reach it — turning a
+    /// truncated/short transfer into a non-destructive, retry-able failure.
+    expected_size: Option<u64>,
 }
 
 impl<P: Provider + 'static> fmt::Debug for WebdavFile<P> {
@@ -270,7 +281,23 @@ impl<P: Provider + 'static> DavFile for WebdavFile<P> {
     }
 
     fn flush(&'_ mut self) -> FsFuture<'_, ()> {
-        Box::pin(async move { self.provider.flush(self.ino).map_err(map_err) })
+        Box::pin(async move {
+            // dav-server's PUT loop calls flush() to commit the body, then only *afterward*
+            // checks `total < count` for a premature EOF — so a short/truncated transfer
+            // would persist as a committed (truncated) version before that check fires. If a
+            // declared length is known and the staged content didn't reach it, discard the
+            // partial write (keeping the prior committed content intact) and fail, so the
+            // client retries with a complete body instead of silently losing data. This is
+            // the fix for the concurrent-copy "second file truncates to ~1 KB" bug.
+            if let Some(expected) = self.expected_size {
+                let staged = self.provider.getattr(self.ino).map_err(map_err)?.size;
+                if staged != expected {
+                    self.provider.discard(self.ino).map_err(map_err)?;
+                    return Err(FsError::GeneralFailure);
+                }
+            }
+            self.provider.flush(self.ino).map_err(map_err)
+        })
     }
 
     fn seek(&'_ mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
@@ -391,6 +418,101 @@ mod tests {
     use super::*;
     use fs_provider::{ChunkConfig, LocalChunkStore, SqliteProvider};
 
+    fn small_provider() -> Arc<SqliteProvider> {
+        let cfg = ChunkConfig {
+            min: 64,
+            avg: 256,
+            max: 1024,
+        };
+        Arc::new(
+            SqliteProvider::in_memory(Box::new(LocalChunkStore::temp().unwrap()), cfg).unwrap(),
+        )
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A full (truncating) PUT carries a declared length (Content-Length / macOS
+    /// `X-Expected-Entity-Length`), which dav-server passes as `OpenOptions.size`. The body
+    /// loop in dav-server commits via `DavFile::flush` and only checks `total < count`
+    /// (premature EOF) *afterward* — so a PUT whose body ends early (a flaky/early-closed
+    /// connection under concurrent copies — the reported "second of two files truncates to
+    /// ~1 KB" bug) would otherwise persist a truncated version in the layer that "cannot
+    /// fail". The adapter must refuse to commit a short body: discard the partial write
+    /// (leaving prior committed content intact) and fail so the client retries.
+    #[test]
+    fn short_put_does_not_commit_truncated_file() {
+        let p = small_provider();
+        let fs = WebdavFs::new(p.clone(), None);
+        let path = DavPath::new("/big.bin").unwrap();
+        let oo = OpenOptions {
+            read: false,
+            write: true,
+            append: false,
+            truncate: true,
+            create: true,
+            create_new: false,
+            size: Some(10_000), // declared 10 KB
+            checksum: None,
+        };
+
+        let res = rt().block_on(async {
+            let mut f = fs.open(&path, oo).await.unwrap();
+            // Only 1 KB of the declared 10 KB arrives, then the body ends (premature EOF).
+            f.write_bytes(Bytes::from(vec![9u8; 1024])).await.unwrap();
+            f.flush().await
+        });
+
+        assert!(
+            res.is_err(),
+            "a PUT delivering 1 KB of a declared 10 KB must fail, not silently commit truncated"
+        );
+        // And nothing truncated may have been committed: the file must read back empty, not 1 KB.
+        let ino = p.lookup(ROOT_INO, "big.bin").unwrap().ino;
+        let got = p.read(ino, 0, 1_000_000).unwrap();
+        assert_eq!(
+            got.len(),
+            0,
+            "the partial body must be discarded, not persisted as a 1 KB version"
+        );
+    }
+
+    /// The size guard must not get in the way of a complete PUT: a body that delivers exactly
+    /// the declared length commits in full.
+    #[test]
+    fn complete_put_commits_full_content() {
+        let p = small_provider();
+        let fs = WebdavFs::new(p.clone(), None);
+        let path = DavPath::new("/whole.bin").unwrap();
+        let body = vec![3u8; 4096];
+        let oo = OpenOptions {
+            read: false,
+            write: true,
+            append: false,
+            truncate: true,
+            create: true,
+            create_new: false,
+            size: Some(body.len() as u64),
+            checksum: None,
+        };
+
+        let body2 = body.clone();
+        rt().block_on(async {
+            let mut f = fs.open(&path, oo).await.unwrap();
+            f.write_bytes(Bytes::from(body2)).await.unwrap();
+            f.flush().await.expect("a complete PUT must commit");
+        });
+
+        let ino = p.lookup(ROOT_INO, "whole.bin").unwrap().ino;
+        let got = p.read(ino, 0, 1_000_000).unwrap();
+        assert_eq!(got, body, "a complete PUT keeps its full content");
+    }
+
     /// Regression for the macOS "Cannot drop a runtime in a context where blocking is not
     /// allowed" panic: a WebDAV read on a not-yet-hydrated file invokes the hydrate hook,
     /// which — like `reqwest::blocking` — creates and drops its own tokio runtime. If that
@@ -465,6 +587,7 @@ mod tests {
                     hydrate: Some(hydrate),
                     ino,
                     pos: 0,
+                    expected_size: None,
                 };
                 file.read_bytes(n).await
             })
