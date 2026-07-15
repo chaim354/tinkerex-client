@@ -6,7 +6,7 @@
 //!      box can reach the object store at CHUNK_ENDPOINT and download real bytes).
 //!
 //! If (1) fails → wrong URL / bad token / server down. If (2) fails → the chunk store
-//! (SeaweedFS `192.168.1.7:8333`) isn't reachable from this machine. If both pass but
+//! (SeaweedFS `192.168.1.8:8333`) isn't reachable from this machine. If both pass but
 //! Explorer still hangs → it's purely a CfAPI integration issue, not network/storage.
 //!
 //!   maker-doctor <server_url> <device_token>
@@ -84,10 +84,10 @@ fn main() {
     if let Err(e) = SyncEngine::hydrate(&provider, &client, &io, &file.node_id) {
         eprintln!("  ✗ FAILED hydrating {}: {e}", file.name);
         eprintln!(
-            "  → the chunk store (CHUNK_ENDPOINT, e.g. SeaweedFS 192.168.1.7:8333) is likely"
+            "  → the chunk store (CHUNK_ENDPOINT, e.g. SeaweedFS 192.168.1.8:8333) is likely"
         );
         eprintln!(
-            "    not reachable from this machine. Try: curl http://192.168.1.7:8333  from here."
+            "    not reachable from this machine. Try: curl http://192.168.1.8:8333  from here."
         );
         std::process::exit(2);
     }

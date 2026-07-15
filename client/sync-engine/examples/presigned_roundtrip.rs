@@ -3,7 +3,7 @@
 //! is the production data plane; run it with the server booted against `STORAGE_BACKEND=s3`.
 //!
 //!   # terminal 1 (server pointed at SeaweedFS):
-//!   STORAGE_BACKEND=s3 CHUNK_ENDPOINT=http://192.168.1.7:8333 CHUNK_BUCKET=my-bucket \
+//!   STORAGE_BACKEND=s3 CHUNK_ENDPOINT=http://192.168.1.8:8333 CHUNK_BUCKET=my-bucket \
 //!     CHUNK_REGION=us-east-1 CHUNK_ACCESS_KEY_ID=admin CHUNK_SECRET_ACCESS_KEY=secret \
 //!     bin/rails server -p 3001
 //!   # terminal 2:
