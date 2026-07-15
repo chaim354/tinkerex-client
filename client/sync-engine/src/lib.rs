@@ -273,6 +273,15 @@ impl SyncEngine {
         max_age_ms: i64,
     ) -> Result<()> {
         let entries = provider.outbox_ready_topo(window_ms, max_age_ms)?;
+        // Snapshot each entry's `enqueued_at` NOW, at drain time — before any WAN I/O. The
+        // clear after a successful push is gated on this captured value so a mount write that
+        // re-enqueues the same node mid-upload (bumping its `enqueued_at`) is NOT thrown away
+        // by the clear (see `SqliteProvider::outbox_clear_upto`).
+        let enqueued_at: std::collections::HashMap<String, i64> = provider
+            .outbox_list_timed()?
+            .into_iter()
+            .map(|(nid, _, enq, _)| (nid, enq))
+            .collect();
         if !entries.is_empty() {
             eprintln!(
                 "push_outbox: {} queued entr{}",
@@ -301,7 +310,14 @@ impl SyncEngine {
             match result {
                 Ok(()) => {
                     eprintln!("push_outbox: pushed node={node_id} op={op}");
-                    provider.outbox_clear(&node_id)?;
+                    // Clear only up to the timestamp we captured at drain time: a re-enqueue
+                    // during the WAN push (newer `enqueued_at`) survives for the next tick.
+                    match enqueued_at.get(&node_id) {
+                        Some(&enq) => provider.outbox_clear_upto(&node_id, enq)?,
+                        // No captured stamp (shouldn't happen — it came from the same snapshot);
+                        // fall back to the unconditional clear rather than leaking the row.
+                        None => provider.outbox_clear(&node_id)?,
+                    }
                 }
                 // Leave the entry queued so the next tick retries it; don't let it block
                 // the siblings still in this drain.
@@ -326,14 +342,28 @@ impl SyncEngine {
         Self::push_outbox_debounced(provider, client, io, 0, 0)
     }
 
-    /// Initial sync: apply the full-tree snapshot (paginated) to the local provider.
+    /// Initial sync / reconcile floor: apply the full-tree snapshot (paginated) to the local
+    /// provider, then **sweep** any local node the snapshot no longer holds live.
+    ///
+    /// The sweep is essential (BUG #4): `pull_snapshot` is also the reconcile backstop for a
+    /// device that full-resyncs (its cursor fell below the server's pruned `oldest_seq`, or a
+    /// racing pull dropped a node). Applying live nodes *only* — and jumping the cursor to head,
+    /// skipping the delete changelog entries — leaves every file that was deleted while this
+    /// device was away as a **ghost**: still present locally, absent from the server. Editing a
+    /// ghost pushes it back and re-creates it on every device (a resurrection). So after applying
+    /// the snapshot we remove every local node whose `node_id` isn't in the live set — mirroring
+    /// the fault harness's `reconcile_full` ("SWEEP FIRST"). We PRESERVE nodes that still carry a
+    /// pending outbox entry (never-pushed local creates/edits): those aren't ghosts, they're
+    /// local intent the server hasn't seen yet, and the queued push will surface them.
     pub fn pull_snapshot(provider: &SqliteProvider, client: &ServerClient) -> Result<i64> {
         let mut after = 0;
         let mut head;
+        let mut live_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             let tree = client.tree(after)?;
             head = tree.head_seq;
             for n in &tree.nodes {
+                live_ids.insert(n.node_id.clone());
                 provider.apply_remote(&tree_node_to_sync(n))?;
             }
             match tree.next_after_id {
@@ -341,7 +371,31 @@ impl SyncEngine {
                 _ => break,
             }
         }
+        Self::sweep_absent(provider, &live_ids)?;
         Ok(head)
+    }
+
+    /// Remove every local node whose `node_id` is NOT in `live_ids` (the server's live set from
+    /// a full snapshot), EXCEPT nodes that still carry a pending outbox entry (never-pushed local
+    /// creates/edits — local intent, not a ghost). The reconcile sweep behind
+    /// [`pull_snapshot`](Self::pull_snapshot); factored out so it's unit-testable without a
+    /// server. Deletes are recursive + idempotent (`apply_remote_delete`), and never touch the
+    /// outbox (inbound change).
+    pub fn sweep_absent(
+        provider: &SqliteProvider,
+        live_ids: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let pending: std::collections::HashSet<String> = provider
+            .outbox_list()?
+            .into_iter()
+            .map(|(nid, _)| nid)
+            .collect();
+        for n in provider.export_tree()? {
+            if !live_ids.contains(&n.node_id) && !pending.contains(&n.node_id) {
+                provider.apply_remote_delete(&n.node_id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Incremental: apply changelog entries since `cursor`. Returns the new cursor.
@@ -1332,6 +1386,17 @@ fn apply_upsert(
 ) -> Result<bool> {
     match provider.apply_remote(&sn) {
         Ok(outcome) => {
+            if outcome.dirty_local {
+                // BUG #1: the node carries an un-pushed local edit whose manifest differs from
+                // this incoming one. `apply_remote` deliberately left the local row untouched
+                // (it would otherwise clobber the local edit + its base version, and the later
+                // push would silently fast-forward). DEFER the remote upsert: apply nothing, fire
+                // no cache invalidation, and leave the local edit queued in the outbox so its push
+                // sends the local content against its stale base → the server records a real
+                // conflict (keep/split) instead of a silent loss. Not a reconcile signal (the
+                // local node is intact and still live).
+                return Ok(false);
+            }
             if let Some(inval) = inval {
                 if outcome.inserted {
                     // A brand-new node: create a fresh placeholder so it appears without the

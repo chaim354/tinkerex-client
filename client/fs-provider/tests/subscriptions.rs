@@ -252,6 +252,14 @@ fn dehydrate_subtree_reclaims_only_unshared_chunks() {
         assert!(p.has_chunk(h), "chunk should be cached before dehydration");
     }
 
+    // Simulate a completed push: drain the outbox so no file has un-synced local intent.
+    // Dehydrate only reclaims bytes that are safely uploaded — a pending (never-pushed) file's
+    // chunks are deliberately KEPT (see `pending_outbox_chunks_survive_dehydration`), so this
+    // precondition is required to observe the reclaim at all.
+    for (nid, _) in p.outbox_list().unwrap() {
+        p.outbox_clear(&nid).unwrap();
+    }
+
     // Unsubscribe + dehydrate the archive subtree.
     p.unsubscribe(&archive_id).unwrap();
     let dropped = p.dehydrate_subtree(&archive_id).unwrap();
@@ -457,6 +465,61 @@ fn pin_is_local_only_never_synced() {
         tree_before,
         "pinning does not change the synced tree"
     );
+}
+
+/// BUG #10: a dehydrate must NOT drop the only copy of never-uploaded bytes. A file inside the
+/// dehydrated subtree that still has a **pending outbox entry** (a local create not yet pushed)
+/// has its chunks ONLY in the local cache — dropping them would lose data and break the queued
+/// push. Its chunks must be kept even though it is in-subtree and its content is otherwise
+/// unshared.
+#[test]
+fn pending_outbox_chunks_survive_dehydration() {
+    let p = provider();
+
+    let archive = p.mkdir(ROOT, "archive").unwrap();
+    let archive_id = p.node_id_for(archive.ino).unwrap().unwrap();
+
+    // A file whose content is unique to the archive AND never pushed (pending outbox upsert).
+    let dirty_body = vec![123u8; 4096];
+    let dirty_ino = write_file(&p, archive.ino, "unsynced.bin", &dirty_body);
+    let dirty_hashes = node_manifest_hashes_of(&p, dirty_ino);
+    let dirty_id = p.node_id_for(dirty_ino).unwrap().unwrap();
+
+    // A second archive-only file that IS pushed (drain its outbox entry only).
+    let pushed_body = vec![200u8; 4096];
+    let pushed_ino = write_file(&p, archive.ino, "synced.bin", &pushed_body);
+    let pushed_hashes = node_manifest_hashes_of(&p, pushed_ino);
+    let pushed_id = p.node_id_for(pushed_ino).unwrap().unwrap();
+
+    // Simulate that only `synced.bin` (and the dir) completed its push. `unsynced.bin` keeps its
+    // pending outbox upsert.
+    p.outbox_clear(&pushed_id).unwrap();
+    p.outbox_clear(&archive_id).unwrap();
+    assert!(
+        p.outbox_list()
+            .unwrap()
+            .iter()
+            .any(|(n, op)| n == &dirty_id && op == "upsert"),
+        "the unsynced file still has a pending outbox entry"
+    );
+
+    p.unsubscribe(&archive_id).unwrap();
+    p.dehydrate_subtree(&archive_id).unwrap();
+
+    // The pushed file's chunks were reclaimed (safely on the server)…
+    for h in &pushed_hashes {
+        assert!(
+            !p.has_chunk(h),
+            "a pushed archive-only chunk {h} is reclaimable"
+        );
+    }
+    // …but the never-pushed file's chunks MUST survive (its only copy is local).
+    for h in &dirty_hashes {
+        assert!(
+            p.has_chunk(h),
+            "a pending (never-pushed) file's chunk {h} must NOT be dropped"
+        );
+    }
 }
 
 // ---- small local helpers (the suite's common mod has no node-id manifest helper) ----

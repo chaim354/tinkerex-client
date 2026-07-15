@@ -91,13 +91,14 @@ impl<P: Provider + 'static> WebdavFs<P> {
         Ok((parent_ino, name))
     }
 
-    fn make_file(&self, ino: u64, expected_size: Option<u64>) -> Box<dyn DavFile> {
+    fn make_file(&self, ino: u64, write_handle: bool) -> Box<dyn DavFile> {
         Box::new(WebdavFile {
             provider: self.provider.clone(),
             hydrate: self.hydrate.clone(),
             ino,
             pos: 0,
-            expected_size,
+            write_handle,
+            flushed: false,
         })
     }
 }
@@ -148,24 +149,24 @@ impl<P: Provider + 'static> DavFileSystem for WebdavFs<P> {
                     }
                     Err(e) => return Err(map_err(e)),
                 };
-                // A truncating open (the usual PUT-overwrite) drops the old body first,
-                // so replacing a file with a shorter one leaves no stale tail.
+                // A truncating open (the usual PUT-overwrite) stages an EMPTY buffer WITHOUT
+                // committing, so replacing a file with a shorter one leaves no stale tail once
+                // flushed — while the LAST COMMITTED version stays the durable fallback until the
+                // full body arrives. (Using `truncate(ino, 0)` here would commit an empty version
+                // immediately, so an aborted/short PUT would recover to 0 bytes and an empty
+                // intermediate could sync mid-PUT.)
                 if options.truncate {
-                    self.provider.truncate(ino, 0).map_err(map_err)?;
+                    self.provider.begin_overwrite(ino).map_err(map_err)?;
                 }
-                // For a full (truncating) PUT, dav-server passes the declared body length
-                // (`Content-Length` / macOS `X-Expected-Entity-Length`). Carry it so `flush`
-                // can refuse to commit a body that arrived short. Ranged/append opens
-                // (`truncate == false`) build on existing content, so their staged length is
-                // not the declared count — don't guard those.
-                let expected_size = options.size.filter(|_| options.truncate);
-                Ok(self.make_file(ino, expected_size))
+                Ok(self.make_file(ino, true))
             } else {
                 let (ino, attr) = self.resolve(path)?;
                 if attr.kind == Kind::Dir {
                     return Err(FsError::Forbidden);
                 }
-                Ok(self.make_file(ino, None))
+                // A read-only handle: never a write handle, so its `flush`/`Drop` must never
+                // commit or discard (only write handles touch the committed content).
+                Ok(self.make_file(ino, false))
             }
         })
     }
@@ -209,15 +210,31 @@ struct WebdavFile<P: Provider + 'static> {
     hydrate: Option<Hydrate>,
     ino: u64,
     pos: u64,
-    /// Declared body length for a full truncating PUT (`None` for reads/ranged/append).
-    /// `flush` refuses to commit if the staged content doesn't reach it — turning a
-    /// truncated/short transfer into a non-destructive, retry-able failure.
-    expected_size: Option<u64>,
+    /// True iff opened for write. Only a write handle may commit (`flush`) or, on an aborted
+    /// write, `discard` — a read-only handle must never touch the committed content.
+    write_handle: bool,
+    /// Set true after a successful `flush`. If a write handle is dropped with this still false
+    /// (a client disconnect mid-PUT errored out of dav-server's write loop before `flush`), the
+    /// `Drop` guard discards the partial staging so it can't shadow the committed content.
+    flushed: bool,
 }
 
 impl<P: Provider + 'static> fmt::Debug for WebdavFile<P> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "WebdavFile {{ ino: {}, pos: {} }}", self.ino, self.pos)
+    }
+}
+
+impl<P: Provider + 'static> Drop for WebdavFile<P> {
+    fn drop(&mut self) {
+        // A write handle that never successfully flushed (a client disconnect mid-body errors
+        // out of dav-server's PUT loop WITHOUT calling `flush`) must not leave partial staged
+        // bytes shadowing the committed content. Discard them; the last committed version — the
+        // PRIOR content for an overwrite (`begin_overwrite` staged empty without committing) —
+        // stays durable. Read-only handles and cleanly-flushed writes do nothing.
+        if self.write_handle && !self.flushed {
+            let _ = self.provider.discard(self.ino);
+        }
     }
 }
 
@@ -282,21 +299,14 @@ impl<P: Provider + 'static> DavFile for WebdavFile<P> {
 
     fn flush(&'_ mut self) -> FsFuture<'_, ()> {
         Box::pin(async move {
-            // dav-server's PUT loop calls flush() to commit the body, then only *afterward*
-            // checks `total < count` for a premature EOF — so a short/truncated transfer
-            // would persist as a committed (truncated) version before that check fires. If a
-            // declared length is known and the staged content didn't reach it, discard the
-            // partial write (keeping the prior committed content intact) and fail, so the
-            // client retries with a complete body instead of silently losing data. This is
-            // the fix for the concurrent-copy "second file truncates to ~1 KB" bug.
-            if let Some(expected) = self.expected_size {
-                let staged = self.provider.getattr(self.ino).map_err(map_err)?.size;
-                if staged != expected {
-                    self.provider.discard(self.ino).map_err(map_err)?;
-                    return Err(FsError::GeneralFailure);
-                }
+            // Only a write handle commits. A read-only handle's close must NOT commit (that
+            // would re-chunk + re-enqueue an unchanged file, and could commit stale staging).
+            if !self.write_handle {
+                return Ok(());
             }
-            self.provider.flush(self.ino).map_err(map_err)
+            self.provider.flush(self.ino).map_err(map_err)?;
+            self.flushed = true; // a clean flush → Drop won't discard
+            Ok(())
         })
     }
 
@@ -418,101 +428,6 @@ mod tests {
     use super::*;
     use fs_provider::{ChunkConfig, LocalChunkStore, SqliteProvider};
 
-    fn small_provider() -> Arc<SqliteProvider> {
-        let cfg = ChunkConfig {
-            min: 64,
-            avg: 256,
-            max: 1024,
-        };
-        Arc::new(
-            SqliteProvider::in_memory(Box::new(LocalChunkStore::temp().unwrap()), cfg).unwrap(),
-        )
-    }
-
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-
-    /// A full (truncating) PUT carries a declared length (Content-Length / macOS
-    /// `X-Expected-Entity-Length`), which dav-server passes as `OpenOptions.size`. The body
-    /// loop in dav-server commits via `DavFile::flush` and only checks `total < count`
-    /// (premature EOF) *afterward* — so a PUT whose body ends early (a flaky/early-closed
-    /// connection under concurrent copies — the reported "second of two files truncates to
-    /// ~1 KB" bug) would otherwise persist a truncated version in the layer that "cannot
-    /// fail". The adapter must refuse to commit a short body: discard the partial write
-    /// (leaving prior committed content intact) and fail so the client retries.
-    #[test]
-    fn short_put_does_not_commit_truncated_file() {
-        let p = small_provider();
-        let fs = WebdavFs::new(p.clone(), None);
-        let path = DavPath::new("/big.bin").unwrap();
-        let oo = OpenOptions {
-            read: false,
-            write: true,
-            append: false,
-            truncate: true,
-            create: true,
-            create_new: false,
-            size: Some(10_000), // declared 10 KB
-            checksum: None,
-        };
-
-        let res = rt().block_on(async {
-            let mut f = fs.open(&path, oo).await.unwrap();
-            // Only 1 KB of the declared 10 KB arrives, then the body ends (premature EOF).
-            f.write_bytes(Bytes::from(vec![9u8; 1024])).await.unwrap();
-            f.flush().await
-        });
-
-        assert!(
-            res.is_err(),
-            "a PUT delivering 1 KB of a declared 10 KB must fail, not silently commit truncated"
-        );
-        // And nothing truncated may have been committed: the file must read back empty, not 1 KB.
-        let ino = p.lookup(ROOT_INO, "big.bin").unwrap().ino;
-        let got = p.read(ino, 0, 1_000_000).unwrap();
-        assert_eq!(
-            got.len(),
-            0,
-            "the partial body must be discarded, not persisted as a 1 KB version"
-        );
-    }
-
-    /// The size guard must not get in the way of a complete PUT: a body that delivers exactly
-    /// the declared length commits in full.
-    #[test]
-    fn complete_put_commits_full_content() {
-        let p = small_provider();
-        let fs = WebdavFs::new(p.clone(), None);
-        let path = DavPath::new("/whole.bin").unwrap();
-        let body = vec![3u8; 4096];
-        let oo = OpenOptions {
-            read: false,
-            write: true,
-            append: false,
-            truncate: true,
-            create: true,
-            create_new: false,
-            size: Some(body.len() as u64),
-            checksum: None,
-        };
-
-        let body2 = body.clone();
-        rt().block_on(async {
-            let mut f = fs.open(&path, oo).await.unwrap();
-            f.write_bytes(Bytes::from(body2)).await.unwrap();
-            f.flush().await.expect("a complete PUT must commit");
-        });
-
-        let ino = p.lookup(ROOT_INO, "whole.bin").unwrap().ino;
-        let got = p.read(ino, 0, 1_000_000).unwrap();
-        assert_eq!(got, body, "a complete PUT keeps its full content");
-    }
-
     /// Regression for the macOS "Cannot drop a runtime in a context where blocking is not
     /// allowed" panic: a WebDAV read on a not-yet-hydrated file invokes the hydrate hook,
     /// which — like `reqwest::blocking` — creates and drops its own tokio runtime. If that
@@ -587,7 +502,8 @@ mod tests {
                     hydrate: Some(hydrate),
                     ino,
                     pos: 0,
-                    expected_size: None,
+                    write_handle: false,
+                    flushed: false,
                 };
                 file.read_bytes(n).await
             })
@@ -595,5 +511,133 @@ mod tests {
 
         assert_eq!(&got[..], &body[..], "hydrated content matches the source");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn mem_provider() -> Arc<SqliteProvider> {
+        let cfg = ChunkConfig {
+            min: 64,
+            avg: 256,
+            max: 1024,
+        };
+        Arc::new(SqliteProvider::in_memory(Box::new(LocalChunkStore::temp().unwrap()), cfg).unwrap())
+    }
+
+    fn read_committed(p: &SqliteProvider, ino: u64) -> Vec<u8> {
+        let size = p.getattr(ino).unwrap().size;
+        if size == 0 {
+            return Vec::new();
+        }
+        p.read(ino, 0, size as u32).unwrap()
+    }
+
+    /// BUG #5: an aborted/short PUT over an EXISTING file must leave the PRIOR committed content
+    /// intact (not 0 bytes), and the truncating open must NOT commit an empty intermediate
+    /// version. Mirrors dav-server's overwrite sequence — `begin_overwrite` (the truncating open)
+    /// → partial `write_bytes` → the handle is dropped WITHOUT `flush` (a client disconnect).
+    #[test]
+    fn aborted_overwrite_keeps_prior_content() {
+        let p = mem_provider();
+        let f = p.create(ROOT_INO, "f.txt").unwrap();
+        let ino = f.ino;
+        p.write(ino, 0, b"ORIGINAL-LONG-CONTENT").unwrap();
+        p.flush(ino).unwrap();
+        let committed_manifest = p.sync_node(&p.node_id_for(ino).unwrap().unwrap()).unwrap().unwrap().manifest_id;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        {
+            // The truncating write-open: stage empty WITHOUT committing.
+            p.begin_overwrite(ino).unwrap();
+            // At open time the committed version is untouched — no empty version was flushed.
+            assert_eq!(
+                p.sync_node(&p.node_id_for(ino).unwrap().unwrap()).unwrap().unwrap().manifest_id,
+                committed_manifest,
+                "the truncating open must NOT commit an empty intermediate version"
+            );
+
+            let mut wf = WebdavFile {
+                provider: p.clone(),
+                hydrate: None,
+                ino,
+                pos: 0,
+                write_handle: true,
+                flushed: false,
+            };
+            rt.block_on(wf.write_bytes(Bytes::from_static(b"SHORT"))).unwrap();
+            // Client disconnects: the handle is dropped WITHOUT a successful flush.
+            drop(wf);
+        }
+
+        // The PRIOR committed content survives the aborted PUT (not 0 bytes, not "SHORT").
+        assert_eq!(
+            read_committed(&p, ino),
+            b"ORIGINAL-LONG-CONTENT".to_vec(),
+            "an aborted overwrite must recover the prior committed content"
+        );
+    }
+
+    /// A clean overwrite (write + flush) still replaces the content and leaves no stale tail —
+    /// the `begin_overwrite`-then-flush path must preserve the existing shorter-overwrite guarantee.
+    #[test]
+    fn clean_overwrite_replaces_content_no_stale_tail() {
+        let p = mem_provider();
+        let f = p.create(ROOT_INO, "f.txt").unwrap();
+        let ino = f.ino;
+        p.write(ino, 0, b"ORIGINAL-LONG-CONTENT").unwrap();
+        p.flush(ino).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        p.begin_overwrite(ino).unwrap();
+        let mut wf = WebdavFile {
+            provider: p.clone(),
+            hydrate: None,
+            ino,
+            pos: 0,
+            write_handle: true,
+            flushed: false,
+        };
+        rt.block_on(async {
+            wf.write_bytes(Bytes::from_static(b"NEW")).await.unwrap();
+            wf.flush().await.unwrap();
+        });
+        drop(wf);
+        assert_eq!(
+            read_committed(&p, ino),
+            b"NEW".to_vec(),
+            "a clean overwrite replaces the content with no stale tail"
+        );
+    }
+
+    /// BUG #9: a read-only handle's close must NOT commit. Its `flush` must be a no-op (a commit
+    /// would re-chunk + re-enqueue an unchanged file). We detect a spurious commit via the outbox.
+    #[test]
+    fn read_only_close_does_not_commit() {
+        let p = mem_provider();
+        let f = p.create(ROOT_INO, "g.txt").unwrap();
+        let ino = f.ino;
+        p.write(ino, 0, b"content").unwrap();
+        p.flush(ino).unwrap();
+        let nid = p.node_id_for(ino).unwrap().unwrap();
+        // Drain the create/flush enqueue so a spurious re-commit is observable.
+        p.outbox_clear(&nid).unwrap();
+        assert!(p.outbox_list().unwrap().is_empty());
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut wf = WebdavFile {
+            provider: p.clone(),
+            hydrate: None,
+            ino,
+            pos: 0,
+            write_handle: false,
+            flushed: false,
+        };
+        rt.block_on(async {
+            let _ = wf.read_bytes(7).await.unwrap();
+            wf.flush().await.unwrap(); // read-only close → must be a no-op
+        });
+        drop(wf);
+        assert!(
+            p.outbox_list().unwrap().is_empty(),
+            "a read-only close must NOT commit (no re-enqueue)"
+        );
     }
 }

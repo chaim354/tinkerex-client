@@ -267,6 +267,17 @@ pub struct ApplyOutcome {
     /// it there (the server's collision adjudication is the conflict's authoritative
     /// resolution). Without this signal the loss would be silent + permanent.
     pub displaced_pending: bool,
+    /// The **incoming node itself** had an un-pushed local edit — a pending outbox `upsert`
+    /// whose manifest differs from the incoming one — so `apply_remote` **left the local row
+    /// untouched** rather than overwriting the local manifest + base `version_id`. Overwriting
+    /// would silently destroy the local edit: the later push would then read the remote's
+    /// manifest, fast-forward on the remote's base, and the server would never record the
+    /// conflict. By preserving the local edit (manifest + its original base version), the queued
+    /// push sends the local content against its *stale* base, so the server records a real
+    /// conflict (keep/split) instead. The pull caller should treat this upsert as **deferred**
+    /// (not applied) and let the outbox push surface the conflict server-side. `false` for a
+    /// clean apply (no pending local edit, or the incoming manifest matches the local one).
+    pub dirty_local: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -339,14 +350,6 @@ pub trait Provider: Send + Sync {
     fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<u32>;
     /// Finalize writeback: chunk the staged content, store + dedup, update the tree.
     fn flush(&self, ino: u64) -> Result<()>;
-    /// Discard the in-progress (staged, uncommitted) write for `ino` *without* committing,
-    /// leaving the last committed content intact. Used to abort a partial/failed write — e.g.
-    /// a WebDAV PUT whose body ended early (fewer bytes than its declared length) — so a
-    /// truncated body is never persisted as a version. Default no-op (a provider with no
-    /// staging has nothing to discard); `SqliteProvider` drops the staging buffer.
-    fn discard(&self, _ino: u64) -> Result<()> {
-        Ok(())
-    }
     /// Set permission bits (the kernel's `chmod`). Default no-op; `SqliteProvider`
     /// persists + syncs it so the executable bit survives and propagates.
     fn set_mode(&self, _ino: u64, _mode: u32) -> Result<()> {
@@ -369,6 +372,27 @@ pub trait Provider: Send + Sync {
     /// leaves no stale tail); growing zero-fills. The new length is what `flush`
     /// will commit and what the sync push will export.
     fn truncate(&self, ino: u64, size: u64) -> Result<()>;
+
+    /// Begin an overwrite: stage an EMPTY buffer for `ino` **without committing**, so the last
+    /// committed version stays the durable fallback until the full new body is flushed. This is
+    /// what an overwriting open (a truncating WebDAV PUT) uses instead of `truncate(ino, 0)`:
+    /// `truncate(ino, 0)` on an unstaged file commits an empty version *immediately*, so an
+    /// aborted/short PUT would recover to 0 bytes (and an empty version could sync mid-PUT).
+    /// Staging-without-commit means an aborted write (see [`discard`](Self::discard)) reverts to
+    /// the PRIOR committed content. Default: fall back to `truncate(ino, 0)` (safe for providers
+    /// that don't stage); `SqliteProvider` overrides with the stage-without-commit behavior.
+    fn begin_overwrite(&self, ino: u64) -> Result<()> {
+        self.truncate(ino, 0)
+    }
+
+    /// Discard any in-progress (unflushed) staged write for `ino`, reverting to the last
+    /// committed version. Default no-op; `SqliteProvider` drops the staging buffer. The WebDAV
+    /// adapter calls this from a write handle's `Drop` when the handle was never successfully
+    /// flushed (a client disconnect mid-PUT), so stale staging can't shadow committed content.
+    fn discard(&self, _ino: u64) -> Result<()> {
+        Ok(())
+    }
+
     fn unlink(&self, parent: u64, name: &str) -> Result<()>;
     fn rmdir(&self, parent: u64, name: &str) -> Result<()>;
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<()>;
@@ -435,7 +459,12 @@ impl SqliteProvider {
     fn init(conn: Connection, store: Box<dyn ChunkStore>, chunk_cfg: ChunkConfig) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS nodes (
-                ino         INTEGER PRIMARY KEY,
+                -- AUTOINCREMENT so a deleted rowid is NEVER reused. A plain INTEGER PRIMARY
+                -- KEY reuses the rowid of a just-deleted highest node, and a reused ino could
+                -- inherit stale in-memory state (staging bytes / advisory locks) keyed by ino.
+                -- We also purge that state on every removal path (belt and braces), but not
+                -- reusing the ino closes the hazard structurally.
+                ino         INTEGER PRIMARY KEY AUTOINCREMENT,
                 parent_ino  INTEGER,
                 name        TEXT NOT NULL,
                 kind        TEXT NOT NULL,
@@ -649,6 +678,22 @@ impl SqliteProvider {
         k.map(|s| Kind::from_str(&s)).ok_or(FsError::NotFound)
     }
 
+    /// Drop the in-memory per-inode state — the staging buffer and any advisory locks — for
+    /// inodes whose tree rows have just been removed (unlink/rmdir/rename-replace/remote
+    /// delete/collision sweep). The rowids may be reused by a future node; without this purge a
+    /// reused ino could serve a dead file's staged bytes or inherit a phantom lock. Call it
+    /// AFTER the row delete commits, with the inos collected BEFORE the delete.
+    fn purge_inode_state(&self, inos: &[i64]) {
+        if inos.is_empty() {
+            return;
+        }
+        let mut staging = self.staging.lock().unwrap();
+        for &ino in inos {
+            staging.remove(&(ino as u64));
+            self.locks.purge(ino as u64);
+        }
+    }
+
     fn current_content(&self, ino: u64) -> Result<Vec<u8>> {
         if let Some(buf) = self.staging.lock().unwrap().get(&ino) {
             return Ok(buf.clone());
@@ -670,7 +715,7 @@ impl SqliteProvider {
 
     fn insert_node(&self, parent: u64, name: &str, kind: Kind) -> Result<Attr> {
         check_name_len(name)?;
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         // parent must exist and be a directory
         let pkind: String = conn
             .query_row(
@@ -686,9 +731,12 @@ impl SqliteProvider {
         let node_id = uuid::Uuid::new_v4().to_string();
         let mode = default_mode(kind);
         let mtime = now_nanos();
+        // The INSERT and the (dir) outbox enqueue land in ONE transaction so a crash can't
+        // create the node without its sync intent (or vice versa).
+        let tx = conn.transaction()?;
         // Seed atime = mtime at creation so it has a concrete value; thereafter set_mtime
         // never disturbs atime and set_atime never disturbs mtime (the UTIME_OMIT contract).
-        let res = conn.execute(
+        let res = tx.execute(
             "INSERT INTO nodes(parent_ino, name, kind, node_id, mode, mtime, atime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![parent as i64, name, kind.as_str(), node_id, mode as i64, mtime],
         );
@@ -701,11 +749,12 @@ impl SqliteProvider {
             }
             Err(e) => return Err(e.into()),
         }
-        let ino = conn.last_insert_rowid() as u64;
+        let ino = tx.last_insert_rowid() as u64;
         // Dirs are sync-ready on creation; files wait until `flush` has a manifest.
         if kind == Kind::Dir {
-            Self::enqueue(&conn, &node_id, "upsert")?;
+            Self::enqueue(&tx, &node_id, "upsert")?;
         }
+        tx.commit()?;
         Ok(Attr {
             ino,
             kind,
@@ -878,10 +927,16 @@ impl SqliteProvider {
     /// adapter must `invalidate(ino)` to drop the OS data cache (we no longer rely on an
     /// mtime bump to force the re-read).
     pub fn apply_remote(&self, node: &SyncNode) -> Result<ApplyOutcome> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        // Wrap the entire apply in ONE transaction. The manifest-chunk insert loop below runs
+        // under an `EXISTS` guard, so a crash partway through (with no transaction) would leave
+        // a PARTIAL manifest that the guard then treats as "already present" forever → the node
+        // reads back permanently truncated (silent data loss). A transaction makes the whole
+        // apply — manifest rows, collision sweep, and the node upsert — atomic.
+        let tx = conn.transaction()?;
         let parent_ino: i64 = match &node.parent_node_id {
             None => ROOT_INO as i64,
-            Some(pid) => conn
+            Some(pid) => tx
                 .query_row(
                     "SELECT ino FROM nodes WHERE node_id = ?1",
                     params![pid],
@@ -890,15 +945,51 @@ impl SqliteProvider {
                 .optional()?
                 .ok_or(FsError::NotFound)?,
         };
+        // Look up the prior row (ino + manifest + symlink target) so we can both reuse the
+        // inode on update and decide whether the content actually changed (→ cache invalidation).
+        let prior: Option<(i64, Option<String>, i64, String, Option<Vec<u8>>)> = tx
+            .query_row(
+                "SELECT ino, manifest_id, parent_ino, name, symlink_target FROM nodes WHERE node_id = ?1",
+                params![node.node_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        // BUG #1 (dirty-local guard): if the node ALREADY exists locally, carries a pending
+        // outbox `upsert` (an un-pushed local edit), AND the incoming manifest differs from the
+        // local one, then overwriting the row here would silently destroy the local edit and its
+        // base `version_id` — the later push would fast-forward on the remote's base and the
+        // server would never record the conflict. Leave the local row completely untouched and
+        // signal `dirty_local`; the queued push then sends the local content against its stale
+        // base, so the server records a real conflict (keep/split). No mutation has happened yet
+        // (the tx rolls back on drop), so this is a clean early return.
+        if let Some((prior_ino, old_manifest, _, _, _)) = &prior {
+            if *old_manifest != node.manifest_id {
+                let pending_upsert: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM outbox WHERE node_id = ?1 AND op = 'upsert')",
+                    params![node.node_id],
+                    |r| r.get(0),
+                )?;
+                if pending_upsert {
+                    return Ok(ApplyOutcome {
+                        ino: *prior_ino as u64,
+                        content_changed: false,
+                        moved: false,
+                        inserted: false,
+                        displaced_pending: false,
+                        dirty_local: true,
+                    });
+                }
+            }
+        }
         if let Some(mid) = &node.manifest_id {
-            let exists: bool = conn.query_row(
+            let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM manifest_chunks WHERE manifest_id = ?1)",
                 params![mid],
                 |r| r.get(0),
             )?;
             if !exists {
                 for (i, c) in node.chunks.iter().enumerate() {
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO manifest_chunks(manifest_id, seq, chunk_hash, offset, length)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
                         params![mid, i as i64, c.hash, c.offset as i64, c.length as i64],
@@ -912,15 +1003,6 @@ impl SqliteProvider {
             (Kind::Symlink, Some(t)) => t.len() as i64,
             _ => node.chunks.iter().map(|c| c.length as i64).sum(),
         };
-        // Look up the prior row (ino + manifest + symlink target) so we can both reuse the
-        // inode on update and decide whether the content actually changed (→ cache invalidation).
-        let prior: Option<(i64, Option<String>, i64, String, Option<Vec<u8>>)> = conn
-            .query_row(
-                "SELECT ino, manifest_id, parent_ino, name, symlink_target FROM nodes WHERE node_id = ?1",
-                params![node.node_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?;
         // Cycle guard (pull path): refuse to re-parent an *existing* node under itself or one
         // of its own descendants — that would detach the node + its subtree into a cycle that's
         // unreachable from ROOT (orphaned data + an infinite parent-walk). The authoritative
@@ -936,7 +1018,7 @@ impl SqliteProvider {
         // only check on a re-parent of an existing node.
         if let Some((self_ino, _, old_parent, _, _)) = &prior {
             if *old_parent != parent_ino
-                && self.ino_is_ancestor_or_self(&conn, *self_ino, parent_ino)?
+                && self.ino_is_ancestor_or_self(&tx, *self_ino, parent_ino)?
             {
                 return Err(FsError::InvalidArgument);
             }
@@ -956,7 +1038,7 @@ impl SqliteProvider {
         // delta can never re-add it. We still let the authoritative remote win the name, but we
         // signal `displaced_pending` so the pull caller triggers the reconcile backstop that
         // re-adds the displaced node (still live on the server under its prior name).
-        let displaced_pending: bool = conn.query_row(
+        let displaced_pending: bool = tx.query_row(
             "SELECT EXISTS(
                      SELECT 1 FROM outbox WHERE node_id IN (
                          WITH RECURSIVE sub(ino, node_id) AS (
@@ -971,7 +1053,25 @@ impl SqliteProvider {
             params![parent_ino, node.name, node.node_id],
             |r| r.get(0),
         )?;
-        conn.execute(
+        // Collect the displaced subtree's inodes BEFORE the sweep so their in-memory
+        // staging/lock state can be purged after commit (their rowids are freed for reuse).
+        let swept_inos: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "WITH RECURSIVE sub(ino) AS (
+                     SELECT ino FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND node_id != ?3
+                     UNION ALL
+                     SELECT n.ino FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                 )
+                 SELECT ino FROM sub",
+            )?;
+            let v: Vec<i64> = stmt
+                .query_map(params![parent_ino, node.name, node.node_id], |r| {
+                    r.get::<_, i64>(0)
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            v
+        };
+        tx.execute(
             "DELETE FROM nodes WHERE ino IN (
                  WITH RECURSIVE sub(ino) AS (
                      SELECT ino FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND node_id != ?3
@@ -983,18 +1083,18 @@ impl SqliteProvider {
             params![parent_ino, node.name, node.node_id],
         )?;
         let ino = if let Some((ino, _, _, _, _)) = &prior {
-            conn.execute(
+            tx.execute(
                 "UPDATE nodes SET parent_ino=?1, name=?2, kind=?3, manifest_id=?4, size=?5, mtime=?6, version_id=?7, mode=?8, symlink_target=?10 WHERE node_id=?9",
                 params![parent_ino, node.name, node.kind.as_str(), node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64, node.node_id, node.symlink_target],
             )?;
             *ino as u64
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO nodes(parent_ino, name, kind, node_id, manifest_id, size, mtime, version_id, mode, symlink_target)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![parent_ino, node.name, node.kind.as_str(), node.node_id, node.manifest_id, size, node.mtime, node.version_id, (node.mode & 0o7777) as i64, node.symlink_target],
             )?;
-            conn.last_insert_rowid() as u64
+            tx.last_insert_rowid() as u64
         };
         // Content changed iff the node already existed and its manifest moved (a same-size
         // edit included — that's exactly the case the old mtime-bump heuristic could miss) OR,
@@ -1015,12 +1115,17 @@ impl SqliteProvider {
             None => false,
         };
         let inserted = prior.is_none();
+        tx.commit()?;
+        // The collision sweep freed the displaced subtree's rowids — purge their in-memory
+        // staging/lock state so a future node reusing an ino can't inherit stale bytes/locks.
+        self.purge_inode_state(&swept_inos);
         Ok(ApplyOutcome {
             ino,
             content_changed,
             inserted,
             moved,
             displaced_pending,
+            dirty_local: false,
         })
     }
 
@@ -1086,34 +1191,52 @@ impl SqliteProvider {
     /// recursive-delete face of BUG #2's convergence loss, dual to
     /// [`ApplyOutcome::displaced_pending`].
     pub fn apply_remote_delete_signaled(&self, node_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        // Detect, BEFORE deleting, whether any node in the to-be-swept subtree OTHER than the
-        // explicit target has a pending outbox entry.
-        let swept_pending: bool = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM outbox WHERE node_id IN (
-                     WITH RECURSIVE sub(ino, node_id) AS (
-                         SELECT ino, node_id FROM nodes WHERE node_id = ?1
-                         UNION ALL
-                         SELECT n.ino, n.node_id FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+        let swept_inos: Vec<i64>;
+        let swept_pending: bool;
+        {
+            let conn = self.conn.lock().unwrap();
+            // Detect, BEFORE deleting, whether any node in the to-be-swept subtree OTHER than the
+            // explicit target has a pending outbox entry.
+            swept_pending = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM outbox WHERE node_id IN (
+                         WITH RECURSIVE sub(ino, node_id) AS (
+                             SELECT ino, node_id FROM nodes WHERE node_id = ?1
+                             UNION ALL
+                             SELECT n.ino, n.node_id FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                         )
+                         SELECT node_id FROM sub WHERE node_id != ?1
                      )
-                     SELECT node_id FROM sub WHERE node_id != ?1
-                 )
-             )",
-            params![node_id],
-            |r| r.get(0),
-        )?;
-        conn.execute(
-            "DELETE FROM nodes WHERE ino IN (
-                 WITH RECURSIVE sub(ino) AS (
+                 )",
+                params![node_id],
+                |r| r.get(0),
+            )?;
+            // Collect the subtree's inodes BEFORE deleting so we can purge their in-memory
+            // staging/lock state (their rowids are freed for reuse by the delete).
+            let mut stmt = conn.prepare(
+                "WITH RECURSIVE sub(ino) AS (
                      SELECT ino FROM nodes WHERE node_id = ?1
                      UNION ALL
                      SELECT n.ino FROM nodes n JOIN sub ON n.parent_ino = sub.ino
                  )
-                 SELECT ino FROM sub
-             )",
-            params![node_id],
-        )?;
+                 SELECT ino FROM sub",
+            )?;
+            swept_inos = stmt
+                .query_map(params![node_id], |r| r.get::<_, i64>(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            conn.execute(
+                "DELETE FROM nodes WHERE ino IN (
+                     WITH RECURSIVE sub(ino) AS (
+                         SELECT ino FROM nodes WHERE node_id = ?1
+                         UNION ALL
+                         SELECT n.ino FROM nodes n JOIN sub ON n.parent_ino = sub.ino
+                     )
+                     SELECT ino FROM sub
+                 )",
+                params![node_id],
+            )?;
+        }
+        self.purge_inode_state(&swept_inos);
         Ok(swept_pending)
     }
 
@@ -1465,10 +1588,30 @@ impl SqliteProvider {
         Ok(ready)
     }
 
-    /// Remove one outbox entry once it has been pushed to the server.
+    /// Remove one outbox entry once it has been pushed to the server. **Unconditional** —
+    /// use [`outbox_clear_upto`](Self::outbox_clear_upto) from the WAN drain, which is
+    /// re-enqueue-safe.
     pub fn outbox_clear(&self, node_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM outbox WHERE node_id = ?1", params![node_id])?;
+        Ok(())
+    }
+
+    /// Remove an outbox entry only if it has **not been re-enqueued since** `enqueued_at`
+    /// (the timestamp captured when the drain read the row). The sync-engine drain reads an
+    /// entry, spends seconds in WAN I/O pushing it, then clears it — but a mount write during
+    /// that window re-enqueues the same node, bumping its `enqueued_at` to a newer value.
+    /// An unconditional `DELETE ... WHERE node_id = ?` would throw that newer dirty mark away
+    /// → the just-made edit would never sync (a silent data-loss window). Gating the delete on
+    /// `enqueued_at <= ?` deletes only the row the drain actually pushed; a re-enqueued (newer)
+    /// row survives for the next tick. A `0` legacy timestamp on the captured side still clears
+    /// its own `0` row (`0 <= 0`).
+    pub fn outbox_clear_upto(&self, node_id: &str, enqueued_at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM outbox WHERE node_id = ?1 AND enqueued_at <= ?2",
+            params![node_id, enqueued_at],
+        )?;
         Ok(())
     }
 
@@ -1950,13 +2093,6 @@ impl Provider for SqliteProvider {
         Ok(())
     }
 
-    fn discard(&self, ino: u64) -> Result<()> {
-        // Drop the uncommitted staging buffer; the committed manifest (if any) is untouched,
-        // so the file reverts to its last durable content rather than a half-written one.
-        self.staging.lock().unwrap().remove(&ino);
-        Ok(())
-    }
-
     fn truncate(&self, ino: u64, size: u64) -> Result<()> {
         // POSIX: truncate() on a directory is EISDIR. Reject before touching staging/chunks
         // (a dir has no manifest; without this the size=0 path would commit an empty file
@@ -2009,33 +2145,60 @@ impl Provider for SqliteProvider {
         self.flush(ino)
     }
 
+    fn begin_overwrite(&self, ino: u64) -> Result<()> {
+        // Stage an empty buffer WITHOUT committing (contrast `truncate(ino, 0)`, which commits
+        // an empty version immediately for an unstaged file). The last committed manifest stays
+        // the durable content until the full new body is flushed, so an aborted/short PUT
+        // recovers the PRIOR content (via `discard`) rather than 0 bytes, and no empty
+        // intermediate version can sync. Same kind guards as `truncate`/`write`.
+        match self.kind_of(ino)? {
+            Kind::File => {}
+            Kind::Dir => return Err(FsError::IsADirectory),
+            Kind::Symlink => return Err(FsError::InvalidArgument),
+        }
+        self.staging.lock().unwrap().insert(ino, Vec::new());
+        Ok(())
+    }
+
+    fn discard(&self, ino: u64) -> Result<()> {
+        // Drop the in-progress staged write; the last committed version remains the content.
+        self.staging.lock().unwrap().remove(&ino);
+        Ok(())
+    }
+
     fn unlink(&self, parent: u64, name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         // Look the target up by (parent, name) WITHOUT a kind filter, so we can return the
         // POSIX-correct errno: a missing entry is ENOENT, but a *directory* is EISDIR
         // (`unlink` of a dir must not masquerade as "not found"). Linux maps this to EISDIR;
         // the mount adapters surface it as such.
-        let target: Option<(String, String)> = conn
+        let target: Option<(i64, String, String)> = conn
             .query_row(
-                "SELECT node_id, kind FROM nodes WHERE parent_ino = ?1 AND name = ?2",
+                "SELECT ino, node_id, kind FROM nodes WHERE parent_ino = ?1 AND name = ?2",
                 params![parent as i64, name],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (node_id, kind) = target.ok_or(FsError::NotFound)?;
+        let (ino, node_id, kind) = target.ok_or(FsError::NotFound)?;
         if Kind::from_str(&kind) == Kind::Dir {
             return Err(FsError::IsADirectory);
         }
-        conn.execute(
-            "DELETE FROM nodes WHERE parent_ino = ?1 AND name = ?2 AND kind = 'file'",
-            params![parent as i64, name],
-        )?;
-        Self::enqueue(&conn, &node_id, "delete")?;
+        // Delete the row and enqueue the tombstone in ONE transaction so a crash can't leave
+        // the row removed but the delete un-queued (or vice versa). Delete by `node_id`, NOT
+        // by `kind = 'file'`: a SYMLINK (which passed the IsADirectory guard above) matched
+        // zero rows under the old `kind = 'file'` filter, so `rm symlink` removed NOTHING yet
+        // still enqueued a delete — leaving a ghost row that then blocked re-creating the name.
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM nodes WHERE node_id = ?1", params![node_id])?;
+        Self::enqueue(&tx, &node_id, "delete")?;
+        tx.commit()?;
+        // The rowid is now free to be reused — drop any staged bytes / locks keyed to it.
+        self.purge_inode_state(&[ino]);
         Ok(())
     }
 
     fn rmdir(&self, parent: u64, name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         // Resolve without a kind filter for the POSIX-correct errno: a missing entry is
         // ENOENT, but `rmdir` of a *file* (non-directory) is ENOTDIR — it must not look
         // like "not found".
@@ -2065,10 +2228,14 @@ impl Provider for SqliteProvider {
                 |r| r.get(0),
             )
             .optional()?;
-        conn.execute("DELETE FROM nodes WHERE ino = ?1", params![ino])?;
-        if let Some(id) = node_id {
-            Self::enqueue(&conn, &id, "delete")?;
+        // Row delete + tombstone enqueue atomically (crash-consistency).
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM nodes WHERE ino = ?1", params![ino])?;
+        if let Some(id) = &node_id {
+            Self::enqueue(&tx, id, "delete")?;
         }
+        tx.commit()?;
+        self.purge_inode_state(&[ino]);
         Ok(())
     }
 
@@ -2146,6 +2313,9 @@ impl Provider for SqliteProvider {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
+        // Track a displaced (POSIX-replaced) destination inode so its in-memory staging/lock
+        // state can be purged after the commit (its rowid is now free to be reused).
+        let mut displaced_ino: Option<i64> = None;
         if let Some((dst_ino, dst_id, dst_kind_s)) = dst {
             if dst_ino == src_ino {
                 return Ok(()); // rename onto itself — no-op
@@ -2176,6 +2346,7 @@ impl Provider for SqliteProvider {
             // (otherwise other devices keep a duplicate).
             tx.execute("DELETE FROM nodes WHERE ino = ?1", params![dst_ino])?;
             Self::enqueue(&tx, &dst_id, "delete")?;
+            displaced_ino = Some(dst_ino);
         }
 
         tx.execute(
@@ -2184,6 +2355,10 @@ impl Provider for SqliteProvider {
         )?;
         Self::enqueue(&tx, &src_id, "upsert")?;
         tx.commit()?;
+        // The displaced destination's rowid is free now — drop its staged bytes / locks.
+        if let Some(ino) = displaced_ino {
+            self.purge_inode_state(&[ino]);
+        }
         Ok(())
     }
 
@@ -2196,7 +2371,7 @@ impl Provider for SqliteProvider {
         // node-creating op and the kernel enforces NAME_MAX on its component too. Without
         // this the over-long name fell through to SQLite as a generic Db error.
         check_name_len(name)?;
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let pkind: String = conn
             .query_row(
                 "SELECT kind FROM nodes WHERE ino = ?1",
@@ -2212,7 +2387,9 @@ impl Provider for SqliteProvider {
         let mode = default_mode(Kind::Symlink);
         let mtime = now_nanos();
         let size = target.len() as i64;
-        let res = conn.execute(
+        // INSERT + outbox enqueue in one transaction (crash-consistency).
+        let tx = conn.transaction()?;
+        let res = tx.execute(
             "INSERT INTO nodes(parent_ino, name, kind, node_id, mode, mtime, size, symlink_target)
              VALUES (?1, ?2, 'symlink', ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -2234,8 +2411,9 @@ impl Provider for SqliteProvider {
             }
             Err(e) => return Err(e.into()),
         }
-        let ino = conn.last_insert_rowid() as u64;
-        Self::enqueue(&conn, &node_id, "upsert")?;
+        let ino = tx.last_insert_rowid() as u64;
+        Self::enqueue(&tx, &node_id, "upsert")?;
+        tx.commit()?;
         Ok(Attr {
             ino,
             kind: Kind::Symlink,
@@ -2265,7 +2443,7 @@ impl Provider for SqliteProvider {
     }
 
     fn set_mode(&self, ino: u64, mode: u32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let node_id: Option<String> = conn
             .query_row(
                 "SELECT node_id FROM nodes WHERE ino = ?1",
@@ -2273,7 +2451,10 @@ impl Provider for SqliteProvider {
                 |r| r.get(0),
             )
             .optional()?;
-        let n = conn.execute(
+        // UPDATE + outbox enqueue atomically so a crash can't persist the new mode without
+        // the sync intent that propagates it (or enqueue without the mode change).
+        let tx = conn.transaction()?;
+        let n = tx.execute(
             "UPDATE nodes SET mode = ?1 WHERE ino = ?2",
             params![(mode & 0o7777) as i64, ino as i64],
         )?;
@@ -2281,14 +2462,15 @@ impl Provider for SqliteProvider {
             return Err(FsError::NotFound);
         }
         // Propagate the metadata change (re-commit/re-mkdir carries the new mode).
-        if let Some(id) = node_id {
-            Self::enqueue(&conn, &id, "upsert")?;
+        if let Some(id) = &node_id {
+            Self::enqueue(&tx, id, "upsert")?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     fn set_mtime(&self, ino: u64, mtime: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let node_id: Option<String> = conn
             .query_row(
                 "SELECT node_id FROM nodes WHERE ino = ?1",
@@ -2296,7 +2478,9 @@ impl Provider for SqliteProvider {
                 |r| r.get(0),
             )
             .optional()?;
-        let n = conn.execute(
+        // UPDATE + outbox enqueue atomically (crash-consistency).
+        let tx = conn.transaction()?;
+        let n = tx.execute(
             "UPDATE nodes SET mtime = ?1 WHERE ino = ?2",
             params![mtime, ino as i64],
         )?;
@@ -2305,9 +2489,10 @@ impl Provider for SqliteProvider {
         }
         // Propagate the metadata change so the real mtime (e.g. from `cp -p`) reaches the
         // other devices — the re-commit carries the new mtime alongside the manifest.
-        if let Some(id) = node_id {
-            Self::enqueue(&conn, &id, "upsert")?;
+        if let Some(id) = &node_id {
+            Self::enqueue(&tx, id, "upsert")?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2370,11 +2555,14 @@ impl<P: Provider + ?Sized> Provider for std::sync::Arc<P> {
     fn flush(&self, ino: u64) -> Result<()> {
         (**self).flush(ino)
     }
-    fn discard(&self, ino: u64) -> Result<()> {
-        (**self).discard(ino)
-    }
     fn truncate(&self, ino: u64, size: u64) -> Result<()> {
         (**self).truncate(ino, size)
+    }
+    fn begin_overwrite(&self, ino: u64) -> Result<()> {
+        (**self).begin_overwrite(ino)
+    }
+    fn discard(&self, ino: u64) -> Result<()> {
+        (**self).discard(ino)
     }
     fn unlink(&self, parent: u64, name: &str) -> Result<()> {
         (**self).unlink(parent, name)

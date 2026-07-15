@@ -348,7 +348,13 @@ impl SqliteProvider {
         }
         // 2. Collect the chunk hashes still referenced by files OUTSIDE this subtree — those
         //    are off-limits (a shared/deduped chunk an in-scope file depends on).
-        let keep = self.chunk_hashes_outside(node_id)?;
+        let mut keep = self.chunk_hashes_outside(node_id)?;
+        // 2b. ALSO keep every chunk referenced by a manifest that has a **pending outbox entry**
+        //     — a never-pushed local create/edit. Those bytes may exist ONLY in the local cache
+        //     (they have not reached object storage yet), so dropping them here would destroy the
+        //     only copy and the queued push would then fail to upload the chunk. This holds even
+        //     when the dirty file lives INSIDE the dehydrated subtree.
+        keep.extend(self.chunk_hashes_pending_outbox()?);
         // 3. Drop the bytes for subtree-only chunks.
         let mut dropped = 0;
         for h in &subtree_hashes {
@@ -402,6 +408,22 @@ impl SqliteProvider {
               )",
         )?;
         let rows = stmt.query_map(params![node_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The set of chunk hashes referenced by any manifest whose node has a **pending outbox
+    /// entry** — a never-pushed local create/edit. These bytes may live ONLY in the local cache
+    /// (not yet uploaded to object storage), so a dehydrate must never drop them even when the
+    /// dirty file sits inside the subtree being reclaimed.
+    fn chunk_hashes_pending_outbox(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn_lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT mc.chunk_hash
+               FROM outbox o
+               JOIN nodes n ON n.node_id = o.node_id
+               JOIN manifest_chunks mc ON mc.manifest_id = n.manifest_id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 

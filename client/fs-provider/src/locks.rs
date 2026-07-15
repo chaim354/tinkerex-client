@@ -94,6 +94,13 @@ impl LockManager {
             }
         }
     }
+
+    /// Drop **all** lock state for `ino`, regardless of owner. Called when the node itself
+    /// is removed (unlink/rmdir/rename-replace/remote-delete): the inode (a reused rowid)
+    /// must not carry a phantom lock into whatever node next reuses it.
+    pub fn purge(&self, ino: u64) {
+        self.by_ino.lock().unwrap().remove(&ino);
+    }
 }
 
 #[cfg(test)]

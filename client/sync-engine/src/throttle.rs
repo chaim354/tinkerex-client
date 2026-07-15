@@ -85,22 +85,31 @@ impl RateLimiter {
             return;
         }
         let need = n as f64;
-        loop {
-            let sleep_for = {
-                let mut b = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                self.refill(&mut b);
-                if b.tokens >= need {
-                    b.tokens -= need;
-                    return;
-                }
-                // A single request may exceed the burst cap: clamp the outstanding need to the
-                // burst so the bucket can actually satisfy it, and wait for that to accrue.
-                let deficit = (need - b.tokens).min(self.burst);
-                Duration::from_secs_f64(deficit / self.rate)
-            };
-            // Sleep outside the lock, then loop to re-check (another caller may have drained
-            // the bucket meanwhile — the re-check keeps the cap correct under contention).
-            std::thread::sleep(sleep_for);
+        // A request larger than the burst can NEVER accumulate `need` tokens at once —
+        // `refill` caps the bucket at `burst`. Waiting for `tokens >= need` would livelock
+        // forever (the bug that wedged the sync thread). Instead pay the request down in
+        // **burst-sized installments**: each installment is `<= burst`, so it is actually
+        // satisfiable, and the total drawn from the (rate-refilling) bucket is still exactly
+        // `need` bytes — so the average throughput remains capped at `rate`.
+        let mut paid = 0.0;
+        while paid < need {
+            let installment = (need - paid).min(self.burst);
+            loop {
+                let sleep_for = {
+                    let mut b = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    self.refill(&mut b);
+                    if b.tokens >= installment {
+                        b.tokens -= installment;
+                        break;
+                    }
+                    let deficit = installment - b.tokens;
+                    Duration::from_secs_f64(deficit / self.rate)
+                };
+                // Sleep outside the lock, then loop to re-check (another caller may have drained
+                // the bucket meanwhile — the re-check keeps the cap correct under contention).
+                std::thread::sleep(sleep_for);
+            }
+            paid += installment;
         }
     }
 
@@ -290,6 +299,48 @@ mod tests {
         assert!(
             elapsed >= expected.mul_f64(0.85),
             "download finished too fast: {elapsed:?} < {expected:?} (cap not enforced)"
+        );
+    }
+
+    #[test]
+    fn consume_larger_than_burst_terminates_and_rate_limits() {
+        // A chunk larger than the burst must NOT livelock: `consume(n)` for n > burst has to
+        // return in bounded time (the old code required `tokens >= need`, but `refill` caps
+        // tokens at `burst`, so a 4 MiB chunk under a 1 MB/s cap could never be satisfied →
+        // infinite loop that wedged the sync thread). Run it on a worker thread and require it
+        // to finish; then check average throughput stays within ~2x of the configured rate.
+        use std::sync::mpsc;
+
+        let rate = 1_000_000u64; // 1 MB/s → burst == rate == 1 MB
+        let limiter = Arc::new(RateLimiter::new(rate));
+        let big = 4_000_000usize; // 4 MB: four burst-widths — impossible for the old return cond
+
+        let (tx, rx) = mpsc::channel();
+        let l = limiter.clone();
+        let start = Instant::now();
+        let h = std::thread::spawn(move || {
+            l.consume(big);
+            let _ = tx.send(());
+        });
+        // Must complete well within the natural rate-limited time (4 MB / 1 MB/s ≈ 3 s after
+        // the 1 MB burst) plus slack. If it livelocks this recv times out and the test fails.
+        rx.recv_timeout(Duration::from_secs(15))
+            .expect("consume(n > burst) livelocked (never returned)");
+        h.join().unwrap();
+        let elapsed = start.elapsed();
+
+        // Rate-limited on average: draining 4 MB at 1 MB/s (1 MB free burst) should take at
+        // least ~(4 - 1) s. Allow generous slack but ensure the cap actually bit.
+        let lower = Duration::from_secs_f64((big as f64 - rate as f64) / rate as f64 * 0.7);
+        assert!(
+            elapsed >= lower,
+            "consume returned too fast ({elapsed:?} < {lower:?}); cap not enforced"
+        );
+        // And within ~2x of the ideal drain time (n/rate) so debt repayment doesn't overshoot.
+        let upper = Duration::from_secs_f64(big as f64 / rate as f64 * 2.0 + 2.0);
+        assert!(
+            elapsed <= upper,
+            "consume took too long ({elapsed:?} > {upper:?})"
         );
     }
 
