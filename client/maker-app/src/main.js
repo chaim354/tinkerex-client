@@ -87,7 +87,13 @@ const setFieldError = (input, errEl, msg) => {
   }
 };
 
-const args = () => ({ serverUrl: val("server"), email: val("email") });
+// The account the daemon is currently mounted for, snapshotted at sign-in. browse /
+// file_versions / conflict commands read THIS, not the live form fields — otherwise editing
+// the sign-in form after mounting would silently retarget those commands at a different
+// account than the one that's mounted. Null until a successful mount; cleared on unmount.
+let activeAccount = null;
+const args = () =>
+  activeAccount ?? { serverUrl: val("server"), email: val("email") };
 
 // ---- status pill -------------------------------------------------------------
 
@@ -194,6 +200,8 @@ $("mountBtn").onclick = async () => {
         password: $("password").value,
         mountpoint: val("mount"),
       });
+      // Pin the commands to the account we just mounted, so later form edits can't retarget.
+      activeAccount = { serverUrl: val("server"), email: val("email") };
       toast($("connToast"), result, "ok");
       await refreshStatus();
       loadFiles();
@@ -210,6 +218,7 @@ $("unmountBtn").onclick = async () => {
   await withBusy($("unmountBtn"), "Unmounting…", async () => {
     try {
       const result = await invoke("sync_stop");
+      activeAccount = null; // no mount → fall back to live form fields
       toast($("connToast"), result, "ok");
     } catch (e) {
       toast($("connToast"), errText(e), "err");

@@ -82,11 +82,17 @@ impl LocalTree {
         self.nodes.get(node_id).filter(|n| !n.deleted)
     }
 
-    /// Build the slash-path of a node by walking parents.
+    /// Build the slash-path of a node by walking parents. A malformed tree with a parent
+    /// cycle (e.g. a corrupt/adversarial changelog making A→B→A) would otherwise loop
+    /// forever; a visited-set guard breaks the cycle and returns `None` instead of hanging.
     pub fn path_of(&self, node_id: &str) -> Option<String> {
         let mut parts = Vec::new();
         let mut cur = node_id.to_string();
+        let mut seen = std::collections::HashSet::new();
         loop {
+            if !seen.insert(cur.clone()) {
+                return None; // parent cycle — bail rather than spin forever
+            }
             let n = self.nodes.get(&cur)?;
             parts.push(n.name.clone());
             match &n.parent_node_id {
@@ -159,6 +165,19 @@ mod tests {
         t.apply(&dir);
         t.apply(&put(2, "f", Some("d"), "box.lbrn2"));
         assert_eq!(t.path_of("f").as_deref(), Some("/Projects/box.lbrn2"));
+    }
+
+    #[test]
+    fn path_of_bails_on_parent_cycle_instead_of_hanging() {
+        // Adversarial/corrupt tree: a -> b -> a. path_of must terminate (return None), not spin.
+        let mut t = LocalTree::default();
+        let mut a = put(1, "a", Some("b"), "a");
+        a.node.as_mut().unwrap().parent_node_id = Some("b".into());
+        let mut b = put(2, "b", Some("a"), "b");
+        b.node.as_mut().unwrap().parent_node_id = Some("a".into());
+        t.apply(&a);
+        t.apply(&b);
+        assert_eq!(t.path_of("a"), None);
     }
 
     #[test]

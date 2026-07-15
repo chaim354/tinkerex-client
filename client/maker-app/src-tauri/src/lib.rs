@@ -12,7 +12,7 @@
 //! - **Linux:** FUSE (`fuser`).
 //! - **Windows:** WinFsp (drive letter; needs `winfsp-x64.dll` on the search path).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tauri::State;
@@ -114,8 +114,128 @@ struct AppState(Mutex<Option<Mount>>);
 
 // ---- credential persistence (register/pair once, reuse the token) ------------------
 
+/// The durable per-user local-data directory for ALL persistent state — the device token
+/// (`credentials.json`), prefs (`prefs.json`), and every per-account `tree.db` + chunk
+/// cache. **Must not** live in the OS temp dir: `/tmp` is tmpfs on Linux (wiped at reboot)
+/// and `$TMPDIR` is purged after a few days on macOS. A wipe would destroy the device token
+/// (→ a duplicate device on re-login), the whole local library (a full re-download), and —
+/// worst — any outbox entries not yet pushed (offline local edits are gone permanently).
+/// Uses the platform local-data dir (`~/Library/Application Support` on macOS,
+/// `~/.local/share` on Linux, `%LOCALAPPDATA%` on Windows), falling back to the temp dir
+/// only if it can't be determined (better than panicking).
 fn app_base() -> PathBuf {
+    dirs::data_local_dir()
+        .map(|d| d.join("maker-app"))
+        .unwrap_or_else(|| legacy_app_base())
+}
+
+/// The old (pre-fix) location: the OS temp dir. Retained so we can migrate state off it.
+fn legacy_app_base() -> PathBuf {
     std::env::temp_dir().join("maker-app")
+}
+
+/// One-time migration of persistent state from the old OS-temp location to the durable
+/// app-data dir. Anything left in temp — including unpushed offline edits in the outbox —
+/// is lost on the next reboot/purge, so we move it up front. Best-effort: on any IO error
+/// we leave the legacy copy in place (reads still fall back to it) and continue booting.
+fn migrate_legacy_state() {
+    let new_base = app_base();
+    let old_base = legacy_app_base();
+    if new_base == old_base || new_base.exists() || !old_base.exists() {
+        // Nothing to do: no durable dir available, already migrated / fresh install, or no
+        // legacy state to move.
+        return;
+    }
+    if let Some(parent) = new_base.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::rename(&old_base, &new_base) {
+        Ok(()) => eprintln!(
+            "app-state: migrated {} -> {}",
+            old_base.display(),
+            new_base.display()
+        ),
+        // Cross-device rename (e.g. /tmp tmpfs -> $HOME) fails with EXDEV — fall back to a
+        // recursive copy, then remove the old tree. If the copy fails, keep the old dir so
+        // the read-time fallback in `load_token`/`load_prefs` can still find the token.
+        Err(_) => match copy_dir_all(&old_base, &new_base) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&old_base);
+                eprintln!(
+                    "app-state: copied {} -> {}",
+                    old_base.display(),
+                    new_base.display()
+                );
+            }
+            Err(e) => eprintln!("app-state: legacy migration failed ({e}); using fallback reads"),
+        },
+    }
+}
+
+/// Recursively copy a directory tree (used only by the cross-device migration fallback).
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Create `dir` (and parents) with owner-only permissions (0700 on Unix). Idempotent; also
+/// tightens the mode if the dir already existed with looser perms.
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Atomically write `contents` to `path` with owner-only permissions (0600 on Unix). Writes
+/// a sibling temp file (owner-only), fsyncs, then renames over the target — so a crash or
+/// full disk mid-write can't leave a truncated/lost credentials file (which would strand
+/// every account's token), and the secret is never briefly world-readable (0644) on disk.
+fn write_secure_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"))?;
+    ensure_private_dir(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad file name"))?;
+    let tmp = parent.join(format!(".{file_name}.tmp"));
+
+    use std::io::Write;
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        // Tighten in case the temp file pre-existed with a looser mode (create won't reset it).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Normalize a user-entered mount path: expand a leading `~`/`~/…` to `$HOME`, and resolve a
@@ -150,25 +270,44 @@ fn creds_path() -> PathBuf {
 /// Per-account local state dir (the SQLite tree + chunk cache), keyed by `(server, email)` —
 /// the same identity the saved token is keyed by. Without this the local tree.db is shared
 /// across accounts, so mounting a *different* account shows the previous one's files (its
-/// changelog never deletes them). Hashed so the path has no `://`/`@`/separator surprises.
+/// changelog never deletes them). The key is SHA-256'd (a **stable** hash — unlike
+/// `DefaultHasher`, whose output changes across Rust releases and would silently remap an
+/// account to a fresh empty dir, forcing a full re-download and stranding unpushed edits) so
+/// the path also has no `://`/`@`/separator surprises.
 fn account_dir(server: &str, email: &str) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    creds_key(server, email).hash(&mut h);
-    app_base().join(format!("acct-{:016x}", h.finish()))
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(creds_key(server, email).as_bytes());
+    let hex = hex::encode(digest);
+    app_base().join(format!("acct-{}", &hex[..16]))
 }
 
+/// Normalize the `(server, email)` identity so trivially-equivalent inputs map to the SAME
+/// account (dir + token + prefs). Without this, `Email@X.com` vs `email@x.com`, or a
+/// trailing-slash server URL, would key different dirs → duplicate device enrollments and a
+/// split local tree. The server-URL normalization matches `ServerClient::new`'s
+/// `trim_end_matches('/')`; email is lowercased + trimmed (emails are case-insensitive in
+/// practice for our login).
 fn creds_key(server: &str, email: &str) -> String {
+    let server = server.trim().trim_end_matches('/');
+    let email = email.trim().to_lowercase();
     format!("{server}|{email}")
 }
 
-/// The saved device token for this (server, email), if this device has registered/paired.
+/// The saved device token for this (server, email), if this device has enrolled. Reads the
+/// durable creds file, falling back to the legacy temp-dir copy if a migration hasn't (or
+/// couldn't) move it yet.
 fn load_token(server: &str, email: &str) -> Option<String> {
-    let data = std::fs::read_to_string(creds_path()).ok()?;
-    let map: serde_json::Value = serde_json::from_str(&data).ok()?;
-    map.get(creds_key(server, email))?
-        .as_str()
-        .map(str::to_string)
+    let key = creds_key(server, email);
+    for path in [creds_path(), legacy_app_base().join("credentials.json")] {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(tok) = map.get(&key).and_then(|v| v.as_str()) {
+                    return Some(tok.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn save_token(server: &str, email: &str, token: &str) {
@@ -180,9 +319,12 @@ fn save_token(server: &str, email: &str, token: &str) {
         creds_key(server, email),
         serde_json::Value::String(token.to_string()),
     );
-    let _ = std::fs::create_dir_all(app_base());
     if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(creds_path(), json);
+        // Owner-only + atomic: the device token is a bearer credential — never world-readable,
+        // and a crash mid-write must not corrupt every account's tokens.
+        if let Err(e) = write_secure_atomic(&creds_path(), &json) {
+            eprintln!("save_token: could not persist credentials ({e})");
+        }
     }
 }
 
@@ -234,17 +376,17 @@ fn prefs_path() -> PathBuf {
 }
 
 fn load_prefs(server: &str, email: &str) -> Prefs {
-    let data = match std::fs::read_to_string(prefs_path()) {
-        Ok(d) => d,
-        Err(_) => return Prefs::default(),
-    };
-    let map: serde_json::Value = match serde_json::from_str(&data) {
-        Ok(m) => m,
-        Err(_) => return Prefs::default(),
-    };
-    map.get(creds_key(server, email))
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default()
+    let key = creds_key(server, email);
+    for path in [prefs_path(), legacy_app_base().join("prefs.json")] {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(p) = map.get(&key).and_then(|v| serde_json::from_value(v.clone()).ok()) {
+                    return p;
+                }
+            }
+        }
+    }
+    Prefs::default()
 }
 
 fn save_prefs(server: &str, email: &str, prefs: &Prefs) {
@@ -256,9 +398,10 @@ fn save_prefs(server: &str, email: &str, prefs: &Prefs) {
         creds_key(server, email),
         serde_json::to_value(prefs).unwrap_or(serde_json::Value::Null),
     );
-    let _ = std::fs::create_dir_all(app_base());
     if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(prefs_path(), json);
+        if let Err(e) = write_secure_atomic(&prefs_path(), &json) {
+            eprintln!("save_prefs: could not persist prefs ({e})");
+        }
     }
 }
 
@@ -289,9 +432,17 @@ fn mount_with_token(
 ) -> Result<String, String> {
     use sync_engine::DaemonConfig;
 
-    let mut guard = state.0.lock().unwrap();
+    // Recover a poisoned lock instead of panicking: a prior command that panicked while
+    // holding it must not permanently wedge every future mount/unmount.
+    let mut guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
     if guard.as_ref().is_some_and(|m| m.is_running()) {
         return Err("already mounted — unmount first".into());
+    }
+    // Drop any stale, stopped mount BEFORE starting the new one. Its `Drop` may unmount its
+    // mountpoint; if we created the new mount first (and it reused the same path), the old
+    // one's teardown could unmount the fresh mount out from under us.
+    if let Some(old) = guard.take() {
+        drop(old);
     }
 
     // Per-account local tree + chunk cache, so switching accounts doesn't surface the
@@ -1093,7 +1244,7 @@ fn maker_enqueue_preview(
 
 #[tauri::command]
 fn sync_stop(state: State<AppState>) -> Result<String, String> {
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
     match guard.take() {
         Some(mut m) => {
             m.stop();
@@ -1105,7 +1256,7 @@ fn sync_stop(state: State<AppState>) -> Result<String, String> {
 
 #[tauri::command]
 fn sync_status(state: State<AppState>) -> String {
-    let guard = state.0.lock().unwrap();
+    let guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
     match guard.as_ref() {
         Some(m) if m.is_running() => format!("mounted at {}", m.mountpoint().display()),
         _ => "unmounted".into(),
@@ -1121,6 +1272,11 @@ fn platform() -> &'static str {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Move any persistent state (device token, prefs, per-account tree.db + chunk cache) off
+    // the old OS-temp location onto the durable app-data dir before anything reads it. The
+    // temp dir is wiped on reboot / purged after days, taking unpushed offline edits with it.
+    migrate_legacy_state();
+
     // Evict the WKWebView on-disk cache when the app has been updated to a new version, so the
     // new bundled UI shows without a manual `~/Library/Caches/<bundle-id>` clear. Must run
     // BEFORE the window is created (i.e. before `Builder::run`), so the webview never loads the
@@ -1260,5 +1416,99 @@ mod tests {
         assert_eq!(p.down_bps(), None);
         assert_eq!(p.up_bps(), None);
         assert!(!p.progressive_hydration);
+    }
+
+    // ---- account-dir keying (fix #3) ----
+
+    #[test]
+    fn creds_key_normalizes_email_case_and_whitespace() {
+        assert_eq!(
+            creds_key("http://x", "  Email@X.com "),
+            creds_key("http://x", "email@x.com")
+        );
+    }
+
+    #[test]
+    fn creds_key_normalizes_trailing_slash_on_server() {
+        // Matches ServerClient::new's trim_end_matches('/') so the app and client agree.
+        assert_eq!(
+            creds_key("http://srv:3001/", "a@b.co"),
+            creds_key("http://srv:3001", "a@b.co")
+        );
+    }
+
+    #[test]
+    fn account_dir_maps_equivalent_identities_to_the_same_dir() {
+        let a = account_dir("http://srv/", "User@Host.com");
+        let b = account_dir("http://srv", "user@host.com");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn account_dir_separates_distinct_accounts() {
+        assert_ne!(
+            account_dir("http://srv", "a@b.co"),
+            account_dir("http://srv", "c@d.co")
+        );
+    }
+
+    #[test]
+    fn account_dir_hash_is_stable_and_hex() {
+        // Deterministic across runs (SHA-256, not DefaultHasher) — a stable, filesystem-safe
+        // name so an app rebuilt with a newer Rust keeps pointing at the same dir.
+        let dir = account_dir("http://srv", "a@b.co");
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("acct-"));
+        let hex = name.strip_prefix("acct-").unwrap();
+        assert_eq!(hex.len(), 16);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Recompute: must equal the SHA-256(creds_key)[..16] hex, not vary run to run.
+        use sha2::{Digest, Sha256};
+        let expected = hex::encode(Sha256::digest(creds_key("http://srv", "a@b.co").as_bytes()));
+        assert_eq!(hex, &expected[..16]);
+    }
+
+    // ---- secure credential write (fix #2) ----
+
+    #[test]
+    #[cfg(unix)]
+    fn write_secure_atomic_sets_owner_only_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("maker-secure-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("credentials.json");
+        write_secure_atomic(&file, r#"{"k":"v"}"#).unwrap();
+
+        // File is 0600 (owner rw only) and the dir is 0700 (owner rwx only).
+        let fmode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fmode, 0o600, "credential file must be owner-only");
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "state dir must be owner-only");
+
+        // Content round-trips, and a rewrite (atomic replace) keeps the tight mode.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"k":"v"}"#);
+        write_secure_atomic(&file, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+        let fmode2 = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fmode2, 0o600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_dir_all_replicates_a_nested_tree() {
+        let root = std::env::temp_dir().join(format!("maker-copy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), "b").unwrap();
+
+        copy_dir_all(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(), "b");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -283,6 +283,43 @@ pub struct SearchResponse {
 
 // ---- the API client -------------------------------------------------------
 
+/// Whether a failed transfer is worth retrying. Transport errors (connection reset,
+/// read/connect timeout) and transient server statuses (5xx / 408 / 429) are retryable;
+/// a definitive 4xx (e.g. a 403 on an expired presign) is not — re-issuing the same
+/// request/URL won't help, so we surface it immediately instead of burning the backoff.
+fn is_retryable(e: &Error) -> bool {
+    match e {
+        Error::Http(_) => true,
+        Error::Server { status, .. } => {
+            *status == 408 || *status == 429 || (*status >= 500 && *status < 600)
+        }
+        _ => false,
+    }
+}
+
+/// Run `op` with bounded exponential backoff (500ms → 1s → 2s → 4s, capped), retrying
+/// only on [`is_retryable`] errors. Used for bulk chunk PUT/GET so a transient network
+/// blip on a large upload doesn't fail the whole commit (which would re-list every chunk
+/// as missing next tick and re-upload from scratch, leaking orphaned bytes).
+fn with_retry<T>(max_attempts: u32, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut delay = std::time::Duration::from_millis(500);
+    let cap = std::time::Duration::from_secs(8);
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt >= max_attempts || !is_retryable(&e) {
+                    return Err(e);
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(cap);
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Cheap to clone — `reqwest::blocking::Client` shares its connection pool via an
 /// internal `Arc`, so the sync daemon hands a clone to each of its threads.
 #[derive(Clone)]
@@ -290,13 +327,18 @@ pub struct ServerClient {
     base: String,
     token: Option<String>,
     http: reqwest::blocking::Client,
+    /// A separate client for bulk chunk transfer (PUT/GET). It has NO whole-request
+    /// deadline — a 4 MB chunk on a slow uplink can legitimately exceed the control
+    /// plane's 30s cap — only an idle (per-read) timeout so a dead connection still
+    /// can't hang forever. Kept distinct so control-plane calls stay snappy.
+    http_bulk: reqwest::blocking::Client,
 }
 
 impl ServerClient {
     pub fn new(base: impl Into<String>) -> Self {
         // A default request timeout so a stalled connection can't wedge the caller forever — a
         // hung push on the sync thread would otherwise block graceful shutdown (join never
-        // returns). 30s is ample for a chunk upload/download yet bounds the worst case so an
+        // returns). 30s is ample for a control-plane call yet bounds the worst case so an
         // unmount can't stall on a dead connection; short-deadline ops (locks) set their own
         // tighter per-request timeout.
         let http = reqwest::blocking::Client::builder()
@@ -304,10 +346,21 @@ impl ServerClient {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
+        // Bulk transfer: a generous whole-request timeout (NOT the control plane's 30s — a
+        // large chunk over a slow uplink can legitimately take minutes), kept well under the
+        // 900s presign TTL so a stuck transfer still surfaces an error rather than blocking a
+        // sync thread forever. `connect_timeout` bounds a dead peer at dial time; `with_retry`
+        // adds the rest of the robustness (see `upload_chunk` / `download_chunk`).
+        let http_bulk = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap_or_default();
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             token: None,
             http,
+            http_bulk,
         }
     }
 
@@ -632,32 +685,42 @@ impl ServerClient {
 
     // ---- data plane: direct chunk transfer to/from presigned URLs ----------
 
-    /// PUT a chunk's bytes to a presigned upload URL (returned by `commit_begin`).
+    /// PUT a chunk's bytes to a presigned upload URL (returned by `commit_begin`). Uses the
+    /// bulk client (no 30s whole-request cap) with bounded retry-with-backoff over transient
+    /// failures, reusing the same already-minted presigned URL each attempt.
     pub fn upload_chunk(&self, put_url: &str, data: Vec<u8>) -> Result<()> {
-        let resp = self.http.put(put_url).body(data).send()?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(Error::Server {
-                status: status.as_u16(),
-                body: resp.text().unwrap_or_default(),
-            })
-        }
+        with_retry(4, || {
+            // Clone per attempt: the body is consumed by `send`, and a retry needs the bytes
+            // again. The extra copy only happens on the (rare) retry path for the first send
+            // reqwest still moves the buffer in.
+            let resp = self.http_bulk.put(put_url).body(data.clone()).send()?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(Error::Server {
+                    status: status.as_u16(),
+                    body: resp.text().unwrap_or_default(),
+                })
+            }
+        })
     }
 
-    /// GET a chunk's bytes from a presigned download URL.
+    /// GET a chunk's bytes from a presigned download URL. Bulk client + bounded
+    /// retry-with-backoff (same URL reused) for the same reasons as `upload_chunk`.
     pub fn download_chunk(&self, get_url: &str) -> Result<Vec<u8>> {
-        let resp = self.http.get(get_url).send()?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(resp.bytes()?.to_vec())
-        } else {
-            Err(Error::Server {
-                status: status.as_u16(),
-                body: resp.text().unwrap_or_default(),
-            })
-        }
+        with_retry(4, || {
+            let resp = self.http_bulk.get(get_url).send()?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok(resp.bytes()?.to_vec())
+            } else {
+                Err(Error::Server {
+                    status: status.as_u16(),
+                    body: resp.text().unwrap_or_default(),
+                })
+            }
+        })
     }
 
     /// The `/cable` WebSocket URL for this client's device token (`http`→`ws`).
@@ -680,6 +743,13 @@ impl ServerClient {
     pub fn watch_library(&self, mut on_head_seq: impl FnMut(i64)) -> Result<()> {
         use tungstenite::Message;
         let (mut socket, _resp) = tungstenite::connect(self.cable_url()?)?;
+        // Bound the blocking read so a silently-dead socket (NAT drop, laptop sleep) can't
+        // wedge here forever — without this the daemon's reconnect loop, which only runs
+        // when we RETURN, would never fire. ActionCable emits a liveness ping every ~3s as a
+        // TEXT frame (`{"type":"ping"}`), so any read that blocks a full ~3x that window with
+        // no frame at all means the connection is gone → return an error to trigger reconnect.
+        let liveness = std::time::Duration::from_secs(10);
+        set_ws_read_timeout(socket.get_mut(), Some(liveness));
         // ActionCable subscribe: the identifier is a *stringified* JSON object.
         let subscribe = serde_json::json!({
             "command": "subscribe",
@@ -688,10 +758,12 @@ impl ServerClient {
         .to_string();
         socket.send(Message::Text(subscribe))?;
         loop {
-            match socket.read()? {
-                Message::Text(txt) => {
+            match socket.read() {
+                Ok(Message::Text(txt)) => {
                     // Envelope: {"identifier":..,"message":{"head_seq":N}}. Only act on
-                    // frames that carry a head_seq (skip welcome/confirm/ping).
+                    // frames that carry a head_seq (skip welcome/confirm/the liveness ping).
+                    // Simply receiving any frame — including the ActionCable ping — resets the
+                    // read timeout, which is our liveness signal.
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
                         if let Some(seq) = v
                             .get("message")
@@ -702,11 +774,37 @@ impl ServerClient {
                         }
                     }
                 }
-                Message::Ping(p) => socket.send(Message::Pong(p))?,
-                Message::Close(_) => return Ok(()),
-                _ => {}
+                Ok(Message::Ping(p)) => socket.send(Message::Pong(p))?,
+                Ok(Message::Close(_)) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => {
+                    // A read timeout (WouldBlock/TimedOut) with no server ping in the window
+                    // means the connection is dead; any other error is a real socket failure.
+                    // Either way we return so the caller re-subscribes on a fresh connection —
+                    // the cursor-delta poll is the correctness backbone, so a dropped nudge
+                    // socket is never fatal.
+                    return Err(e.into());
+                }
             }
         }
+    }
+}
+
+/// Set a read timeout on the (optionally TLS-wrapped) WebSocket's underlying TCP socket.
+/// A `None` clears it. Best-effort: an unknown stream variant is left untouched.
+fn set_ws_read_timeout(
+    stream: &mut tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    dur: Option<std::time::Duration>,
+) {
+    use tungstenite::stream::MaybeTlsStream;
+    match stream {
+        MaybeTlsStream::Plain(s) => {
+            let _ = s.set_read_timeout(dur);
+        }
+        MaybeTlsStream::Rustls(s) => {
+            let _ = s.get_ref().set_read_timeout(dur);
+        }
+        _ => {}
     }
 }
 
@@ -737,6 +835,73 @@ mod tests {
     fn url_join_trims_trailing_slash() {
         let c = ServerClient::new("http://localhost:3001/");
         assert_eq!(c.url("/v1/tree"), "http://localhost:3001/v1/tree");
+    }
+
+    #[test]
+    fn retryable_covers_transport_and_transient_server_errors() {
+        // Transient server statuses → retry.
+        for status in [500u16, 502, 503, 504, 408, 429] {
+            assert!(
+                is_retryable(&Error::Server {
+                    status,
+                    body: String::new()
+                }),
+                "status {status} should be retryable"
+            );
+        }
+        // Definitive 4xx (expired presign 403, bad request 400, not found 404) → do not retry.
+        for status in [400u16, 403, 404, 409, 422] {
+            assert!(
+                !is_retryable(&Error::Server {
+                    status,
+                    body: String::new()
+                }),
+                "status {status} should NOT be retryable"
+            );
+        }
+        // Auth is a hard stop, not a transient blip.
+        assert!(!is_retryable(&Error::Unauthenticated));
+    }
+
+    #[test]
+    fn with_retry_returns_first_success_without_sleeping() {
+        let mut calls = 0;
+        let out: Result<u32> = with_retry(4, || {
+            calls += 1;
+            Ok(7)
+        });
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls, 1, "a success must not retry");
+    }
+
+    #[test]
+    fn with_retry_gives_up_immediately_on_non_retryable() {
+        let mut calls = 0;
+        let out: Result<u32> = with_retry(4, || {
+            calls += 1;
+            Err(Error::Server {
+                status: 403,
+                body: "expired".into(),
+            })
+        });
+        assert!(out.is_err());
+        assert_eq!(calls, 1, "a non-retryable error must not burn the backoff");
+    }
+
+    #[test]
+    fn with_retry_exhausts_attempts_on_persistent_retryable() {
+        // 2 attempts with a retryable error → exactly 2 calls (one initial + one retry),
+        // then surfaces the error. Kept at 2 so the test's backoff sleep stays short.
+        let mut calls = 0;
+        let out: Result<u32> = with_retry(2, || {
+            calls += 1;
+            Err(Error::Server {
+                status: 503,
+                body: "busy".into(),
+            })
+        });
+        assert!(out.is_err());
+        assert_eq!(calls, 2);
     }
 
     #[test]
