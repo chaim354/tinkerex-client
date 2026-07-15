@@ -136,6 +136,52 @@ pub fn decide_action(ev: RemoteNodeEvent) -> PlaceholderAction {
     }
 }
 
+/// Normalize a path to the echo-guard / index key form (case-insensitive, `/`-separated, no
+/// trailing separator) so two spellings of the same path — the daemon's own form and the CfAPI
+/// callback's `VolumeDosName + NormalizedPath` form, which can differ in case / separators —
+/// collide on the same key. Shared by [`SelfOps::key`] and [`PathIndex::invalidate_subtree`].
+pub fn normalize_path_key(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+// --- Windows file-attribute predicates (pure, so the capture-path decisions are unit-tested) --
+//
+// Kept as plain `u32` constants + predicates (not the `windows` crate's newtypes) so they build
+// and test on any host; the Windows layer reads the real attributes via `MetadataExt` /
+// `GetFileAttributes` and passes them here.
+
+/// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` — a dehydrated placeholder whose bytes aren't resident.
+pub const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+/// `FILE_ATTRIBUTE_RECALL_ON_OPEN` — opening recalls (a fully-dehydrated placeholder).
+pub const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+/// `FILE_ATTRIBUTE_OFFLINE` — the data is not immediately available (dropped to the cloud).
+pub const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+/// `FILE_ATTRIBUTE_REPARSE_POINT` — a CfAPI placeholder still carries the cloud reparse tag.
+pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// True if a file with these attributes is a **dehydrated** cloud placeholder whose bytes are not
+/// resident. Reading it under `CF_HYDRATION_POLICY_FULL` triggers a full recall (re-download), so
+/// the local-edit capture paths must SKIP such files — a plain close / attribute-toggle event must
+/// never re-hydrate a file the user freed up. A hydrated / in-sync placeholder has none of these
+/// bits and reads freely (a genuine edit is captured).
+pub fn is_placeholder_dehydrated(attrs: u32) -> bool {
+    attrs
+        & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_OFFLINE)
+        != 0
+}
+
+/// True if the file is a reparse point — a CfAPI placeholder carries the cloud reparse tag, a
+/// genuine plain file does not. Used by the new-file watcher to tell an atomic-save of a real new
+/// file (rename of a plain file → must capture) from a placeholder rename (owned by NOTIFY_RENAME,
+/// so the watcher must NOT double-capture it and risk a duplicate node before the rename applies).
+pub fn is_reparse_point(attrs: u32) -> bool {
+    attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 /// Strip the sync-root prefix from an absolute on-disk path, yielding a library-relative
 /// forward-slash path. `None` if `abs` is not under `root`.
 ///
@@ -404,6 +450,25 @@ impl PathIndex {
         self.map.lock().unwrap().remove(&ino);
     }
 
+    /// Drop every cached entry whose path is `prefix` **or under it** (case/separator-insensitive).
+    /// Used when a **directory** is renamed/moved: the moved dir's own entry AND every descendant's
+    /// entry embed the old ancestor path and are now stale. Invalidating only the moved node (the
+    /// old behavior) left descendants as poisoned *hits* — `path_for`/`removed`/`invalidate` trust a
+    /// hit, so a later remote update to a child served the old bytes forever and a remote delete
+    /// left a ghost. Dropping the whole subtree forces those consumers back onto the authoritative
+    /// tree walk (a miss), which re-derives + back-fills the correct current path.
+    pub fn invalidate_subtree(&self, prefix: &std::path::Path) {
+        let pk = normalize_path_key(&prefix.to_string_lossy());
+        if pk.is_empty() {
+            return;
+        }
+        let child_prefix = format!("{pk}/");
+        self.map.lock().unwrap().retain(|_, p| {
+            let k = normalize_path_key(&p.to_string_lossy());
+            k != pk && !k.starts_with(&child_prefix)
+        });
+    }
+
     /// Drop every cached entry (e.g. a library rebind wiped the tree).
     pub fn clear(&self) {
         self.map.lock().unwrap().clear();
@@ -442,10 +507,9 @@ impl SelfOps {
 
     /// Normalize a path to the echo-guard key form (case-insensitive, `/`-separated, no trailing
     /// separator) so the daemon's and the callback's path spellings collide on the same entry.
+    /// Delegates to the shared [`normalize_path_key`] so the index + echo guard agree.
     pub fn key(path: &str) -> String {
-        path.replace('\\', "/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
+        normalize_path_key(path)
     }
 
     /// Record that the daemon is about to mutate `path` itself — the next matching NOTIFY callback
@@ -940,6 +1004,65 @@ mod tests {
         idx.insert(7, PathBuf::from(r"C:\x\here.txt"));
         idx.insert(7, PathBuf::from(r"C:\x\moved\here.txt"));
         assert_eq!(idx.get(7), Some(PathBuf::from(r"C:\x\moved\here.txt")));
+    }
+
+    #[test]
+    fn path_index_invalidate_subtree_drops_dir_and_descendants() {
+        use std::path::{Path, PathBuf};
+        let idx = PathIndex::new();
+        // A moved directory `root/proj` with children + a nested grandchild, plus an unrelated
+        // sibling that must survive.
+        idx.insert(10, PathBuf::from(r"C:\Lib\proj"));
+        idx.insert(11, PathBuf::from(r"C:\Lib\proj\a.stl"));
+        idx.insert(12, PathBuf::from(r"C:\Lib\proj\sub"));
+        idx.insert(13, PathBuf::from(r"C:\Lib\proj\sub\deep.txt"));
+        idx.insert(20, PathBuf::from(r"C:\Lib\other.txt"));
+        idx.invalidate_subtree(Path::new(r"C:\Lib\proj"));
+        assert_eq!(idx.get(10), None, "the dir itself is dropped");
+        assert_eq!(idx.get(11), None, "a direct child is dropped");
+        assert_eq!(idx.get(12), None, "a child dir is dropped");
+        assert_eq!(idx.get(13), None, "a nested grandchild is dropped");
+        assert!(idx.get(20).is_some(), "an unrelated sibling survives");
+    }
+
+    #[test]
+    fn path_index_invalidate_subtree_does_not_match_sibling_prefix() {
+        use std::path::{Path, PathBuf};
+        // `proj` must NOT sweep `projX` (a textual prefix that isn't a path ancestor).
+        let idx = PathIndex::new();
+        idx.insert(1, PathBuf::from(r"C:\Lib\proj\a"));
+        idx.insert(2, PathBuf::from(r"C:\Lib\projX\b"));
+        idx.invalidate_subtree(Path::new(r"C:\Lib\proj"));
+        assert_eq!(idx.get(1), None);
+        assert!(idx.get(2).is_some(), "projX is a different directory");
+    }
+
+    #[test]
+    fn path_index_invalidate_subtree_is_case_and_separator_insensitive() {
+        use std::path::{Path, PathBuf};
+        let idx = PathIndex::new();
+        idx.insert(1, PathBuf::from(r"C:\Lib\Proj\A.txt"));
+        // Prefix given in a different case + forward slashes still matches.
+        idx.invalidate_subtree(Path::new("c:/lib/proj"));
+        assert_eq!(idx.get(1), None);
+    }
+
+    #[test]
+    fn placeholder_attribute_predicates() {
+        // A dehydrated placeholder (recall-on-data-access) must be detected so capture skips it.
+        assert!(is_placeholder_dehydrated(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS));
+        assert!(is_placeholder_dehydrated(FILE_ATTRIBUTE_RECALL_ON_OPEN));
+        assert!(is_placeholder_dehydrated(FILE_ATTRIBUTE_OFFLINE));
+        assert!(is_placeholder_dehydrated(
+            FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | 0x20 /* ARCHIVE */
+        ));
+        // A hydrated / plain file (no recall bits) reads freely — a genuine edit is captured.
+        assert!(!is_placeholder_dehydrated(0x20 /* ARCHIVE */));
+        assert!(!is_placeholder_dehydrated(0));
+        // Reparse-point predicate distinguishes a placeholder from a plain new file.
+        assert!(is_reparse_point(FILE_ATTRIBUTE_REPARSE_POINT));
+        assert!(is_reparse_point(FILE_ATTRIBUTE_REPARSE_POINT | 0x20));
+        assert!(!is_reparse_point(0x20));
     }
 
     #[test]
