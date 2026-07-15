@@ -22,8 +22,9 @@
 //! These tests cover the **data + control plane end-to-end at the engine/provider level**:
 //! a local write through `Provider` (the same SQLite tree the kernel mount writes into via
 //! FUSE `flush` / WebDAV PUT / CfAPI `NOTIFY_FILE_CLOSE`), then the real `SyncEngine` loop
-//! body + the real `ServerClient` HTTP wire + a `ChunkIO` chunk store (`SharedDirIO`, the
-//! `PresignedIO` stand-in). They run **headlessly on all three OSes** because they don't open
+//! body + the real `ServerClient` HTTP wire + `PresignedIO` — the **production** `ChunkIO`
+//! transport, so bytes genuinely move client ⇄ object storage via presigned URLs, the same
+//! path the real app uses. They run **headlessly on all three OSes** because they don't open
 //! a kernel mount — the part that can't run headless (FUSE-T / WebDAV / CfAPI all need an
 //! interactive session, per CLAUDE.md §12.1 and SETUP.md). The **kernel-mount leg** (the
 //! adapter translating syscalls → these same `Provider` calls) is proven separately and
@@ -32,15 +33,28 @@
 //! convergence is automated here on every OS; the kernel-syscall translation is the
 //! conformance suites' job.
 //!
+//! ## Why `PresignedIO`, not `SharedDirIO`
+//!
+//! The server's finalize step has a **verify-on-finalize** check (`config.x.verify_finalize`,
+//! ON by default): before creating a version it does a storage `exists?` check that the chunk
+//! bytes it was told about actually landed. `integration.rs` gets away with the `SharedDirIO`
+//! stand-in (a shared temp dir the server never sees) by disabling that check
+//! (`SYNC_VERIFY_FINALIZE=0`) — appropriate there, since that suite is testing engine logic,
+//! not the data plane. This suite is different: it's meant to be the genuine end-to-end proof,
+//! including against the **deployed** server (`e2e-windows`, real SeaweedFS, verify ON), so it
+//! must use the real transport — `PresignedIO` — or verify can never pass.
+//!
 //! Skips cleanly (prints a notice, passes) when no server is configured — same convention as
-//! `integration.rs`. CI boots `STORAGE_BACKEND=memory` Rails and sets `SYNC_IT_SERVER_URL`.
+//! `integration.rs`. CI boots a `STORAGE_BACKEND=local` Rails (so presigned URLs are real,
+//! followable absolute URLs, not the memory store's relative `/dev/blobs/...` paths) and sets
+//! `SYNC_IT_SERVER_URL`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs_provider::{ChunkConfig, LocalChunkStore, Provider, SqliteProvider, ROOT_INO};
 use sync_client::{RegisterResponse, ServerClient};
-use sync_engine::{ChunkIO, SharedDirIO, SyncEngine};
+use sync_engine::{ChunkIO, PresignedIO, SyncEngine};
 
 /// `Some(url)` if a test server is configured, else early-return with a skip notice.
 macro_rules! server_url {
@@ -120,10 +134,13 @@ impl DeviceCtx {
 
     /// The daemon's loop body: push local outbox, then pull + apply the changelog delta. This
     /// is exactly `sync_engine::daemon::sync_loop`'s per-tick work (`push_outbox` then the
-    /// delta pull inside `sync_tick`), with the cursor persisted in `sync_state`.
-    fn sync_tick(&self, io: &dyn ChunkIO) {
+    /// delta pull inside `sync_tick`), with the cursor persisted in `sync_state`. Builds its
+    /// own `PresignedIO` bound to this device's own client/token — each device authenticates
+    /// independently, exactly like the real app.
+    fn sync_tick(&self) {
+        let io = PresignedIO::new(&self.client);
         let cursor = self.provider.cursor().unwrap();
-        let new_cursor = SyncEngine::sync_tick(&self.provider, &self.client, io, cursor)
+        let new_cursor = SyncEngine::sync_tick(&self.provider, &self.client, &io, cursor)
             .unwrap_or_else(|e| panic!("{} sync_tick: {e}", self.name));
         self.provider.set_cursor(new_cursor).unwrap();
     }
@@ -137,10 +154,12 @@ impl DeviceCtx {
     }
 
     /// Read a file's full content the way a mount read does: hydrate any missing chunks via the
-    /// engine (the adapter's hydrate hook), then read from the local provider.
-    fn read_hydrated(&self, ino: u64, io: &dyn ChunkIO) -> Vec<u8> {
+    /// engine (the adapter's hydrate hook), then read from the local provider. Uses this
+    /// device's own `PresignedIO`, same reasoning as `sync_tick`.
+    fn read_hydrated(&self, ino: u64) -> Vec<u8> {
+        let io = PresignedIO::new(&self.client);
         let node_id = self.provider.node_id_for(ino).unwrap().unwrap();
-        SyncEngine::hydrate(&self.provider, &self.client, io, &node_id)
+        SyncEngine::hydrate(&self.provider, &self.client, &io, &node_id)
             .unwrap_or_else(|e| panic!("{} hydrate {node_id}: {e}", self.name));
         let size = self.provider.getattr(ino).unwrap().size;
         if size == 0 {
@@ -157,12 +176,11 @@ impl DeviceCtx {
 
 /// Register device A (creates the library), then pair device B into it via the **real pairing
 /// flow** (`create_pairing` on A → `pair` on B) — exactly what the app's `create_pairing` +
-/// `sync_pair` commands do. Returns both device contexts + a shared "cloud" chunk store.
+/// `sync_pair` commands do. Returns both device contexts.
 ///
-/// (The shared `SharedDirIO` stands in for SeaweedFS/R2; in production the bytes move via
-/// `PresignedIO` to object storage. Both implement `ChunkIO`, so the loop code is identical —
-/// only the transport differs, which `presigned_roundtrip.rs` exercises against live storage.)
-fn register_and_pair(url: &str) -> (DeviceCtx, DeviceCtx, SharedDirIO) {
+/// (Each device builds its own `PresignedIO` internally, in `sync_tick`/`read_hydrated` — bytes
+/// move over the real presigned data plane, per-device-token, not through a shared stand-in.)
+fn register_and_pair(url: &str) -> (DeviceCtx, DeviceCtx) {
     let email = format!("e2e-{}@example.com", uniq());
 
     // Device A creates the (confirmed) account + enrolls (the app's `sync_login` first-run path).
@@ -179,9 +197,7 @@ fn register_and_pair(url: &str) -> (DeviceCtx, DeviceCtx, SharedDirIO) {
         .expect("B logs in");
     let b = DeviceCtx::new("B", url, reg_b.device_token);
 
-    let cloud =
-        SharedDirIO::new(std::env::temp_dir().join(format!("e2e-cloud-{}", uniq()))).unwrap();
-    (a, b, cloud)
+    (a, b)
 }
 
 // ============================================================================================
@@ -191,7 +207,7 @@ fn register_and_pair(url: &str) -> (DeviceCtx, DeviceCtx, SharedDirIO) {
 #[test]
 fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     // --- 1. Device A writes a file through its provider (= a mount write) and the daemon pushes.
     let dir = a.provider.mkdir(ROOT_INO, "Projects").unwrap();
@@ -199,7 +215,7 @@ fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
     let v1: Vec<u8> = b"// v1: a parametric lamp\nmodule lamp(){ cube(10); }\n".repeat(120);
     a.provider.write(af.ino, 0, &v1).unwrap();
     a.provider.flush(af.ino).unwrap();
-    a.sync_tick(&cloud); // outbox → server + chunk store
+    a.sync_tick(); // outbox → server + chunk store
     assert!(
         a.provider.outbox_list().unwrap().is_empty(),
         "A's outbox drained after push"
@@ -216,7 +232,7 @@ fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
         .lookup(b_proj.ino, "lamp.scad")
         .expect("B sees lamp.scad");
     assert_eq!(
-        b.read_hydrated(bf.ino, &cloud),
+        b.read_hydrated(bf.ino),
         v1,
         "B reads A's v1 byte-for-byte"
     );
@@ -227,12 +243,12 @@ fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
     b.provider.truncate(bf.ino, 0).unwrap();
     b.provider.write(bf.ino, 0, &v2).unwrap();
     b.provider.flush(bf.ino).unwrap();
-    b.sync_tick(&cloud);
+    b.sync_tick();
 
     // --- 4. Device A's daemon pulls → A sees B's edit byte-for-byte.
-    a.sync_tick(&cloud);
+    a.sync_tick();
     assert_eq!(
-        a.read_hydrated(af.ino, &cloud),
+        a.read_hydrated(af.ino),
         v2,
         "A reads B's v2 edit byte-for-byte"
     );
@@ -251,7 +267,7 @@ fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
 #[test]
 fn new_files_and_nested_dirs_propagate() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     // A builds a nested tree with files at multiple depths.
     let docs = a.provider.mkdir(ROOT_INO, "Docs").unwrap();
@@ -264,7 +280,7 @@ fn new_files_and_nested_dirs_propagate() {
         .write(deep.ino, 0, b"Q3 plan: ship sync\n")
         .unwrap();
     a.provider.flush(deep.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
 
     // B converges on the whole structure.
     b.initial_sync();
@@ -282,12 +298,12 @@ fn new_files_and_nested_dirs_propagate() {
         .lookup(ROOT_INO, "README.md")
         .expect("B has README.md");
     assert_eq!(
-        b.read_hydrated(b_deep.ino, &cloud),
+        b.read_hydrated(b_deep.ino),
         b"Q3 plan: ship sync\n",
         "nested file content"
     );
     assert_eq!(
-        b.read_hydrated(b_top.ino, &cloud),
+        b.read_hydrated(b_top.ino),
         b"# Maker library\n",
         "top-level file content"
     );
@@ -300,12 +316,12 @@ fn new_files_and_nested_dirs_propagate() {
 #[test]
 fn delete_propagates_a_to_b() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     let f = a.provider.create(ROOT_INO, "scratch.txt").unwrap();
     a.provider.write(f.ino, 0, b"temporary").unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
 
     b.initial_sync();
     assert!(
@@ -315,8 +331,8 @@ fn delete_propagates_a_to_b() {
 
     // A deletes; B's next tick applies the deletion.
     a.provider.unlink(ROOT_INO, "scratch.txt").unwrap();
-    a.sync_tick(&cloud);
-    b.sync_tick(&cloud);
+    a.sync_tick();
+    b.sync_tick();
     assert!(
         b.provider.lookup(ROOT_INO, "scratch.txt").is_err(),
         "delete converged on B"
@@ -330,14 +346,14 @@ fn delete_propagates_a_to_b() {
 #[test]
 fn rename_and_move_propagate_a_to_b() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     let inbox = a.provider.mkdir(ROOT_INO, "Inbox").unwrap();
     let archive = a.provider.mkdir(ROOT_INO, "Archive").unwrap();
     let f = a.provider.create(inbox.ino, "draft.txt").unwrap();
     a.provider.write(f.ino, 0, b"keep me").unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
 
     b.initial_sync();
     let b_inbox = b.provider.lookup(ROOT_INO, "Inbox").unwrap().ino;
@@ -351,15 +367,15 @@ fn rename_and_move_propagate_a_to_b() {
     a.provider
         .rename(inbox.ino, "draft.txt", archive.ino, "final.txt")
         .unwrap();
-    a.sync_tick(&cloud);
-    b.sync_tick(&cloud);
+    a.sync_tick();
+    b.sync_tick();
 
     let moved = b
         .provider
         .lookup(b_archive, "final.txt")
         .expect("B sees the file at the new path");
     assert_eq!(
-        b.read_hydrated(moved.ino, &cloud),
+        b.read_hydrated(moved.ino),
         b"keep me",
         "content preserved across move"
     );
@@ -376,16 +392,7 @@ fn rename_and_move_propagate_a_to_b() {
 #[test]
 fn large_file_edit_dedups_unchanged_chunks() {
     let url = server_url!();
-    // This test counts files in the chunk store to prove dedup, so it owns the dir explicitly
-    // (instead of `register_and_pair`'s internal one) — `SharedDirIO` doesn't expose its path.
-    let (a, b, _unused) = register_and_pair(&url);
-    let cloud_path = std::env::temp_dir().join(format!("e2e-dedup-cloud-{}", uniq()));
-    let cloud = SharedDirIO::new(&cloud_path).unwrap();
-    let count = || {
-        std::fs::read_dir(&cloud_path)
-            .map(|d| d.count())
-            .unwrap_or(0)
-    };
+    let (a, b) = register_and_pair(&url);
 
     // A pushes a large (multi-chunk) file: a stable head, then a tail we'll edit. Use
     // low-self-similarity (deterministic PRNG) bytes so the file is genuinely many *distinct*
@@ -399,45 +406,64 @@ fn large_file_edit_dedups_unchanged_chunks() {
     let f = a.provider.create(ROOT_INO, "model.stl").unwrap();
     a.provider.write(f.ino, 0, &v1).unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
-    let chunks_after_v1 = count();
+    a.sync_tick();
+    let node_id = a.node_id(f.ino);
+    // Content-addressed manifest hashes after v1. With `PresignedIO` there's no shared
+    // test-visible directory to count objects in (unlike the old `SharedDirIO` stand-in) — but
+    // the server's dedup IS content-addressing: identical bytes hash identically, so
+    // `commit_begin` reports a hash as already-present iff it was pushed before. Comparing the
+    // local manifest's hash set directly is therefore an exact measure of "what would need
+    // uploading," not just a proxy for it.
+    let hashes_v1: HashSet<String> = a
+        .provider
+        .node_manifest_hashes(&node_id)
+        .unwrap()
+        .into_iter()
+        .collect();
     assert!(
-        chunks_after_v1 > 1,
-        "a >chunk-size file lands as multiple chunks ({chunks_after_v1})"
+        hashes_v1.len() > 1,
+        "a >chunk-size file lands as multiple chunks ({})",
+        hashes_v1.len()
     );
 
     // B reads v1.
     b.initial_sync();
     let bf = b.provider.lookup(ROOT_INO, "model.stl").unwrap();
-    assert_eq!(b.read_hydrated(bf.ino, &cloud), v1, "B reads v1");
+    assert_eq!(b.read_hydrated(bf.ino), v1, "B reads v1");
 
-    // A edits ONLY the tail; the head's content-defined chunks are unchanged → dedup: the cloud
-    // gains only the new tail chunks, not a fresh copy of the whole file.
+    // A edits ONLY the tail; the head's content-defined chunks are unchanged → dedup: pushing v2
+    // only needs the new tail chunks, not a fresh copy of the whole file.
     let tail_v2 = prng(0xCAFE, 30_000);
     let mut v2 = head.clone();
     v2.extend_from_slice(&tail_v2);
     a.provider.truncate(f.ino, 0).unwrap();
     a.provider.write(f.ino, 0, &v2).unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
-    let chunks_after_v2 = count();
+    a.sync_tick();
+    let hashes_v2: HashSet<String> = a
+        .provider
+        .node_manifest_hashes(&node_id)
+        .unwrap()
+        .into_iter()
+        .collect();
 
-    // The head is ~half the file; only the changed tail's chunks should be new. So the bytes that
-    // moved on the edit are well under a full re-upload (which would ~double the store). This is
-    // the "only changed chunks move" guarantee — the FastCDC block-delta win — asserted as a
-    // generous bound (≈ the tail, with slack for the head/tail boundary chunk) rather than an
-    // exact count, so it's robust to chunker tuning.
-    let added = chunks_after_v2 - chunks_after_v1;
+    // The head is ~half the file; only the changed tail's chunks should be new. So the chunks
+    // that would need uploading on the edit are well under a full re-upload (which would ~double
+    // the chunk count). This is the "only changed chunks move" guarantee — the FastCDC
+    // block-delta win — asserted as a generous bound (≈ the tail, with slack for the head/tail
+    // boundary chunk) rather than an exact count, so it's robust to chunker tuning.
+    let added = hashes_v2.difference(&hashes_v1).count();
     assert!(
-        added < chunks_after_v1 * 3 / 4,
+        added < hashes_v1.len() * 3 / 4,
         "edit re-used the unchanged head's chunks: added {added} new chunks, but a full re-upload \
-         would have added ~{chunks_after_v1}"
+         would have added ~{}",
+        hashes_v1.len()
     );
 
     // B converges on v2, byte-for-byte (it only hydrates the chunks it's missing).
-    b.sync_tick(&cloud);
+    b.sync_tick();
     assert_eq!(
-        b.read_hydrated(bf.ino, &cloud),
+        b.read_hydrated(bf.ino),
         v2,
         "B reads v2 after a dedup'd edit"
     );
@@ -450,20 +476,20 @@ fn large_file_edit_dedups_unchanged_chunks() {
 #[test]
 fn version_history_and_restore_converge() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     // A publishes v1, then v2 (two versions in history).
     let f = a.provider.create(ROOT_INO, "spec.md").unwrap();
     a.provider.write(f.ino, 0, b"spec v1: original").unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
 
     a.provider.truncate(f.ino, 0).unwrap();
     a.provider
         .write(f.ino, 0, b"spec v2: revised heading")
         .unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
 
     let node_id = a.node_id(f.ino);
 
@@ -471,7 +497,7 @@ fn version_history_and_restore_converge() {
     b.initial_sync();
     let bf = b.provider.lookup(ROOT_INO, "spec.md").unwrap();
     assert_eq!(
-        b.read_hydrated(bf.ino, &cloud),
+        b.read_hydrated(bf.ino),
         b"spec v2: revised heading",
         "B has v2"
     );
@@ -494,9 +520,9 @@ fn version_history_and_restore_converge() {
     a.client.restore(&node_id, &oldest).expect("restore to v1");
 
     // B's daemon pulls the restore and converges back to v1's content, byte-for-byte.
-    b.sync_tick(&cloud);
+    b.sync_tick();
     assert_eq!(
-        b.read_hydrated(bf.ino, &cloud),
+        b.read_hydrated(bf.ino),
         b"spec v1: original",
         "B converged to the restored v1 content"
     );
@@ -509,13 +535,13 @@ fn version_history_and_restore_converge() {
 #[test]
 fn offline_divergent_edits_conflict_then_resolve() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     // A creates + pushes a file; B pulls it (both now track version V1).
     let f = a.provider.create(ROOT_INO, "design.scad").unwrap();
     a.provider.write(f.ino, 0, b"base design").unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
     b.initial_sync();
     let bf = b.provider.lookup(ROOT_INO, "design.scad").unwrap();
 
@@ -523,13 +549,13 @@ fn offline_divergent_edits_conflict_then_resolve() {
     a.provider.truncate(f.ino, 0).unwrap();
     a.provider.write(f.ino, 0, b"A online change").unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
 
     // B (which never saw V2 — it was "offline") edits its V1-based copy and pushes.
     b.provider.truncate(bf.ino, 0).unwrap();
     b.provider.write(bf.ino, 0, b"B offline change").unwrap();
     b.provider.flush(bf.ino).unwrap();
-    b.sync_tick(&cloud);
+    b.sync_tick();
 
     // The server flags a conflict (both versions kept) instead of silently dropping B's edit.
     let conflicts = b.client.conflicts().expect("conflicts").conflicts;
@@ -560,8 +586,8 @@ fn offline_divergent_edits_conflict_then_resolve() {
     );
 
     // Both devices converge on the resolved tree: the original + the split sibling both present.
-    a.sync_tick(&cloud);
-    b.sync_tick(&cloud);
+    a.sync_tick();
+    b.sync_tick();
     let count_scad = |d: &DeviceCtx| {
         d.provider
             .readdir(ROOT_INO)
@@ -589,12 +615,12 @@ fn offline_divergent_edits_conflict_then_resolve() {
 #[test]
 fn cross_device_lock_is_visible_to_the_other_device() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     let f = a.provider.create(ROOT_INO, "shared.scad").unwrap();
     a.provider.write(f.ino, 0, b"shared").unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
     b.initial_sync();
     let node_id = a.node_id(f.ino);
 
@@ -634,19 +660,19 @@ impl ChunkIO for OfflineIO {
 #[test]
 fn hydrated_file_reads_offline_on_b() {
     let url = server_url!();
-    let (a, b, cloud) = register_and_pair(&url);
+    let (a, b) = register_and_pair(&url);
 
     let f = a.provider.create(ROOT_INO, "offline.bin").unwrap();
     let body: Vec<u8> = (0..8000u32).map(|i| (i % 251) as u8).collect();
     a.provider.write(f.ino, 0, &body).unwrap();
     a.provider.flush(f.ino).unwrap();
-    a.sync_tick(&cloud);
+    a.sync_tick();
 
     // B hydrates ONLINE (chunks land in B's local cache).
     b.initial_sync();
     let bf = b.provider.lookup(ROOT_INO, "offline.bin").unwrap();
     assert_eq!(
-        b.read_hydrated(bf.ino, &cloud),
+        b.read_hydrated(bf.ino),
         body,
         "online read after hydrate"
     );
