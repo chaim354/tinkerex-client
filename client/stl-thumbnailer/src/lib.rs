@@ -29,6 +29,9 @@ const BG: [u8; 3] = [0x20, 0x22, 0x28];
 const MATERIAL: Vec3<f32> = Vec3::new(0.78, 0.80, 0.84);
 /// Ambient term so faces away from the key light aren't pure black.
 const AMBIENT: f32 = 0.28;
+/// World up. **+Z, the STL/3MF convention** — see `auto_frame`. Named rather than spelled inline
+/// because the camera direction and the look-at both have to agree about it, and they did not.
+const UP: Vec3<f32> = Vec3::new(0.0, 0.0, 1.0);
 
 /// A single triangle vertex fed to the rasterizer: world position + normal.
 #[derive(Clone)]
@@ -102,8 +105,11 @@ pub fn render_stl(stl: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
 
     if !verts.is_empty() {
         let mvp = auto_frame(&verts, sw as u32, sh as u32);
-        // Key light from the upper-front-right — classic product-shot direction.
-        let light_dir = Vec3::new(0.5, 0.7, 0.6).normalized();
+        // Key light from the upper-front-right — classic product-shot direction. Z-UP LIKE THE
+        // CAMERA: the "upper" component is the Z one. Shading is two-sided (`|n . l|`), so this is
+        // cosmetic rather than correctness — but a light left orbiting the old axis would relight
+        // every model sideways and quietly undo half of what the camera fix bought.
+        let light_dir = Vec3::new(0.5, 0.6, 0.7).normalized();
         ThumbPipeline { mvp, light_dir }.draw::<Triangles<_, BackfaceCullingDisabled>, _>(
             &verts,
             &mut color,
@@ -147,6 +153,18 @@ fn build_vertices(mesh: &stl_io::IndexedMesh) -> Vec<Vert> {
 
 /// Build a model-view-projection matrix that frames the whole model with a fixed
 /// iso-ish camera (~30 deg pitch, ~45 deg yaw) and ~10% margin.
+///
+/// **THE WORLD IS Z-UP, BECAUSE STL IS.** The format itself declares no orientation, but every
+/// producer and consumer in 3D printing and CAD — Fusion, SolidWorks, Onshape, FreeCAD, and every
+/// slicer, which puts the build plate at Z=0 — treats +Z as up. So does the 3MF core spec, and
+/// `ThreeMf#mesh_to_stl` feeds this same function.
+///
+/// This used to orbit Y and pass `Vec3::unit_y()` as the up vector, i.e. render a Z-up model under
+/// a Y-up camera: every thumbnail in the library came out **tipped onto its side**, consistently
+/// enough to read as a house style rather than a bug. Nothing errored and every existing test
+/// stayed green, because they all ask "is the frame non-blank?" — a question a model lying down
+/// answers exactly as well as one standing up. Only a POSITIONAL assertion can see this, which is
+/// what `tall_model_renders_taller_than_wide` is.
 fn auto_frame(verts: &[Vert], w: u32, h: u32) -> Mat4<f32> {
     let mut min = Vec3::broadcast(f32::INFINITY);
     let mut max = Vec3::broadcast(f32::NEG_INFINITY);
@@ -157,13 +175,15 @@ fn auto_frame(verts: &[Vert], w: u32, h: u32) -> Mat4<f32> {
     let center = (min + max) * 0.5;
     let radius = ((max - min).magnitude() * 0.5).max(1e-6);
 
-    // Iso-ish camera direction: 45 deg around Y, ~30 deg above the horizon.
+    // Iso-ish camera direction: 45 deg of yaw about the UP axis (Z), ~30 deg above the horizon.
+    // The pitch therefore belongs on Z and the yaw sweeps X/Y — the mirror image of the Y-up
+    // spelling this replaces.
     let yaw = 45f32.to_radians();
     let pitch = 30f32.to_radians();
     let dir = Vec3::new(
         yaw.cos() * pitch.cos(),
-        pitch.sin(),
         yaw.sin() * pitch.cos(),
+        pitch.sin(),
     )
     .normalized();
 
@@ -173,7 +193,7 @@ fn auto_frame(verts: &[Vert], w: u32, h: u32) -> Mat4<f32> {
     let eye = center + dir * distance;
 
     let proj = Mat4::perspective_fov_rh_no(fov, w as f32, h as f32, 0.01, distance + radius * 4.0);
-    let view = Mat4::look_at_rh(eye, center, Vec3::unit_y());
+    let view = Mat4::look_at_rh(eye, center, UP);
     proj * view
 }
 

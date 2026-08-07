@@ -104,6 +104,82 @@ fn binary_stl_zero_normals(tris: &[[[f32; 3]; 3]]) -> Vec<u8> {
     out
 }
 
+/// Bounding box of the non-background pixels, as `(min_x, min_y, max_x, max_y)`.
+/// `None` when the frame is blank.
+fn ink_bbox(pixels: &[[u8; 4]], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    let bg = pixels[0]; // corner pixel: always background at these framings
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    let mut any = false;
+    for (i, p) in pixels.iter().enumerate() {
+        let d = (p[0] as i32 - bg[0] as i32).abs()
+            + (p[1] as i32 - bg[1] as i32).abs()
+            + (p[2] as i32 - bg[2] as i32).abs();
+        if d <= 24 {
+            continue;
+        }
+        any = true;
+        let (x, y) = (i as u32 % w, i as u32 / w);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let _ = h;
+    any.then_some((x0, y0, x1, y1))
+}
+
+/// An upright box, much taller in Z than it is wide in X/Y.
+fn tall_box(width: f32, height: f32) -> Vec<u8> {
+    let (a, b, c) = (width, width, height);
+    let v = |x: f32, y: f32, z: f32| [x, y, z];
+    // 12 triangles, the 6 faces of an axis-aligned box from (0,0,0) to (a,b,c).
+    let q = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3]| {
+        [[p0, p1, p2], [p0, p2, p3]]
+    };
+    let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
+    tris.extend(q(v(0., 0., 0.), v(a, 0., 0.), v(a, b, 0.), v(0., b, 0.))); // bottom
+    tris.extend(q(v(0., 0., c), v(a, 0., c), v(a, b, c), v(0., b, c))); // top
+    tris.extend(q(v(0., 0., 0.), v(a, 0., 0.), v(a, 0., c), v(0., 0., c)));
+    tris.extend(q(v(0., b, 0.), v(a, b, 0.), v(a, b, c), v(0., b, c)));
+    tris.extend(q(v(0., 0., 0.), v(0., b, 0.), v(0., b, c), v(0., 0., c)));
+    tris.extend(q(v(a, 0., 0.), v(a, b, 0.), v(a, b, c), v(a, 0., c)));
+    binary_stl_zero_normals(&tris)
+}
+
+/// THE ONLY TEST HERE THAT CAN SEE AN AXIS FLIP, and the reason every other one is blind to it is
+/// that they all ask "is the frame non-blank?" — a question a model lying on its side answers just
+/// as well as one standing up. STL is Z-UP by universal convention (see `auto_frame`), so a column
+/// four times taller than it is wide must RENDER taller than it is wide.
+///
+/// Mutation-checked by restoring the old Y-up camera (`pitch.sin()` on the middle component plus
+/// `Vec3::unit_y()` as the up vector): the box then renders 3.5x WIDER than tall and this goes red,
+/// while the whole rest of this file stays green.
+#[test]
+fn tall_model_renders_taller_than_wide() {
+    let png = render_stl(&tall_box(4.0, 16.0), 256, 256).expect("render should succeed");
+    let pixels = decode(&png, 256, 256);
+    let (x0, y0, x1, y1) = ink_bbox(&pixels, 256, 256).expect("the box must be visible");
+    let (ink_w, ink_h) = (x1 - x0 + 1, y1 - y0 + 1);
+    assert!(
+        ink_h > ink_w * 2,
+        "an upright 4x4x16 column rendered {ink_w}x{ink_h} — the camera is not Z-up"
+    );
+}
+
+/// The other half of the same property, so a fix that merely swapped which axis is wrong cannot
+/// pass. A slab WIDE in X/Y and thin in Z must render wider than it is tall.
+#[test]
+fn flat_model_renders_wider_than_tall() {
+    let png = render_stl(&tall_box(16.0, 1.0), 256, 256).expect("render should succeed");
+    let pixels = decode(&png, 256, 256);
+    let (x0, y0, x1, y1) = ink_bbox(&pixels, 256, 256).expect("the slab must be visible");
+    let (ink_w, ink_h) = (x1 - x0 + 1, y1 - y0 + 1);
+    assert!(
+        ink_w > ink_h,
+        "a flat 16x16x1 slab rendered {ink_w}x{ink_h} — the camera is not Z-up"
+    );
+}
+
 #[test]
 fn zero_normals_are_recomputed_and_render() {
     // A simple quad (two triangles) in the XY plane, normals all zero.
