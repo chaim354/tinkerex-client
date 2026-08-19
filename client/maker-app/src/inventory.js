@@ -26,6 +26,11 @@ let suppliersCache = [];
 // ---- list --------------------------------------------------------------------
 
 async function loadInventory() {
+  // See library.js#loadCatalog.
+  if (!UI.signedIn()) {
+    $("invList").innerHTML = `<div class="muted">${esc(UI.SIGNED_OUT_HINT)}</div>`;
+    return;
+  }
   let items;
   try {
     items = lowStockOnly

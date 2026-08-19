@@ -26,6 +26,11 @@ async function refreshNames() {
 
 async function loadPreviews() {
   $("prevHint").textContent = "";
+  // See library.js#loadCatalog.
+  if (!UI.signedIn()) {
+    $("prevGrid").innerHTML = `<div class="muted">${esc(UI.SIGNED_OUT_HINT)}</div>`;
+    return;
+  }
   $("prevGrid").innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`;
   await refreshNames();
   let previews;

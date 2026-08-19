@@ -12,6 +12,15 @@ const a = () => UI.args();
 
 async function loadPrefs() {
   let prefs;
+  // set_prefs/get_prefs take NO device token — they key a file on (serverUrl, email) alone — so
+  // signed out these were the one pair that reached a real account's prefs.json on any box, not
+  // just a developer's. Don't ask, and refuse the write below.
+  if (!UI.signedIn()) {
+    $("bwDown").value = 0;
+    $("bwUp").value = 0;
+    $("progHydrate").checked = false;
+    return;
+  }
   try {
     prefs = await invoke("get_prefs", a());
   } catch {
@@ -23,6 +32,7 @@ async function loadPrefs() {
 }
 
 $("prefsSave").onclick = async () => {
+  if (!UI.signedIn()) return UI.toast($("settingsToast"), UI.SIGNED_OUT_HINT, "err");
   const prefs = {
     down_mbps: Math.max(0, Number($("bwDown").value) || 0),
     up_mbps: Math.max(0, Number($("bwUp").value) || 0),

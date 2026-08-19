@@ -44,6 +44,11 @@ let pickerResolve = null;
 async function loadPickerList(filter = "") {
   const list = $("mkPickerList");
   $("mkPickerErr").textContent = "";
+  if (!UI.signedIn()) {
+    list.innerHTML = "";
+    $("mkPickerErr").textContent = UI.SIGNED_OUT_HINT;
+    return;
+  }
   list.innerHTML = `<div class="muted"><span class="spinner"></span>loading files…</div>`;
   let entries;
   try {
