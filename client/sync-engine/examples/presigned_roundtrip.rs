@@ -84,5 +84,35 @@ fn main() {
         got.len()
     );
 
+    // --- Which store did those bytes actually go to? ----------------------------------
+    // The round trip above already proves the bytes LANDED: the example enrolls a fresh
+    // user every run and dedup is per-user, so every chunk is first-seen, and the server's
+    // finalize verification (SYNC_VERIFY_FINALIZE, ON by default) HEADs its own store before
+    // accepting the commit. What it does NOT show is WHICH store that is — a green run says
+    // "the store the server is configured with", which is exactly the question a cutover asks.
+    //
+    // S3ChunkStore sets force_path_style, so a presigned URL is
+    // https://<host>/<bucket>/chunks/<user>/<hash>?X-Amz-... — origin and first path segment
+    // name the endpoint AND the bucket. Print ONLY those two. The query string carries the
+    // SigV4 signature and must never reach a log or a transcript (CLAUDE.md §14g: a redirected
+    // `op read` printed a live PAT once and forced a rotation).
+    let hashes = b.node_manifest_hashes(&node_id).expect("B manifest hashes");
+    let first = hashes.first().expect("the file has at least one chunk");
+    let urls = client_b
+        .download_urls(std::slice::from_ref(first))
+        .expect("presign a download URL");
+    let url = urls
+        .urls
+        .values()
+        .next()
+        .expect("a presigned GET url")
+        .clone();
+    let mut seg = url.split('?').next().unwrap_or_default().splitn(5, '/');
+    let scheme = seg.next().unwrap_or_default();
+    let _empty = seg.next();
+    let host = seg.next().unwrap_or_default();
+    let bucket = seg.next().unwrap_or_default();
+    println!("✓ store identity (from the presigned GET; query string withheld): {scheme}//{host} bucket={bucket}");
+
     println!("\nPRESIGNED ROUNDTRIP OK — real bytes through live S3-compatible storage.");
 }
