@@ -126,6 +126,12 @@ impl<P: Provider + 'static> Drop for WriteGuard<P> {
             Ok(m) => m,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // NOTHING PINS THIS. Every other property in this file has a test that reddens when it
+        // breaks; the map's non-growth does not, and saying so is cheaper than implying otherwise.
+        // It is safe to leave untested because it fails toward WASTE, never toward wrongness — a
+        // leaked entry is an unused Arc, and correctness rests on the lock, not on the cleanup. If
+        // this ever becomes load-bearing (an eviction policy, a memory budget), it needs a test
+        // that day.
         if map.get(&self.ino).is_some_and(|e| Arc::strong_count(e) <= 2) {
             map.remove(&self.ino);
         }
@@ -178,6 +184,14 @@ impl<P: Provider + 'static> WebdavFs<P> {
     /// `open` can only return one of those. `Forbidden` (403) is the closest honest one: terminal,
     /// and distinguishable in a log from the `GeneralFailure` (500) dav-server already emits for
     /// a genuine provider fault.
+    ///
+    /// THE COST OF THAT CHOICE, NAMED RATHER THAN LEFT FOR THE NEXT READER TO DISCOVER: 403 is
+    /// TERMINAL and this condition is NOT. A macOS or Windows WebDAV client reads it as "you may
+    /// never do this" and will not retry a PUT that would succeed a second later — the user gets
+    /// a permission dialog over a transient lock. The only alternative that reads as retryable is
+    /// `IsRemote` (502), which collides with "bad gateway" and triggers `must_close()`, so 403 is
+    /// still the better of the two. The right fix is upstream: a `Locked` variant. Until then this
+    /// is a known-wrong-flavour error, not an accidentally-wrong one.
     async fn acquire_write(&self, ino: u64) -> FsResult<WriteGuard<P>> {
         let lock = {
             let mut map = match self.writers.lock() {
@@ -289,6 +303,14 @@ impl<P: Provider + 'static> DavFileSystem for WebdavFs<P> {
                 // `begin_overwrite`. Taken after, the truncating open would still wipe the
                 // incumbent writer's staged bytes on its way to the queue — the corruption
                 // happens in the very statement the wait exists to order.
+                //
+                // ONE STATEMENT IS DELIBERATELY OUTSIDE THE EXCLUSION and a reviewer had to
+                // re-derive why, so it is written down: `provider.create` above runs before the
+                // guard is taken. Benign, for two reasons that must BOTH hold — `UNIQUE INDEX
+                // idx_parent_name` makes a racing double-create impossible, and `create`'s own
+                // `staged.put(ino, Vec::new())` runs only for a name that did NOT exist, so there
+                // is no incumbent's staging to wipe. It cannot move inside the exclusion anyway:
+                // the guard is keyed on an inode the create is what produces.
                 let write = self.acquire_write(ino).await?;
                 if options.truncate {
                     self.provider.begin_overwrite(ino).map_err(map_err)?;
