@@ -46,6 +46,13 @@ async function loadPreviews() {
 
 // The thumbnail box for one card. `previewPresentation` has already decided which of the three
 // it is; this only knows how to draw them.
+//
+// THE LOOKUP BELOW FALLS BACK, and that is not defensive noise. `previewPresentation` is total by
+// construction (an explicit UNKNOWN row), but THIS table is total only by ENUMERATION — the
+// totality test iterates a hard-coded list of the five status names, so a SIXTH `ROWS` entry
+// carrying a novel `thumb` passes 23/23 green and is a `TypeError` at runtime that blanks the whole
+// grid. Probed. That is a harder failure than anything this table was added to fix, and it is the
+// likelier edit of the two residuals, because it is the edit someone makes in this very file.
 const THUMBS = {
   image: (href) => `<div class="prev-thumb" style="background-image:url('${esc(href)}')"></div>`,
   spinner: () => `<div class="prev-thumb empty"><span class="spinner"></span></div>`,
@@ -70,7 +77,7 @@ function renderPreviews(previews) {
     // see preview-status.js for which, and why `pending` may NOT show the url it carries.
     const view = previewPresentation(p.status, p.error, href);
     card.innerHTML = `
-      ${THUMBS[view.thumb](href)}
+      ${(THUMBS[view.thumb] || THUMBS.icon)(href)}
       <div class="prev-cap" title="${esc(caption)}">${esc(caption)}</div>
       <div class="prev-meta"><span class="prev-status ${view.badgeClass}">${esc(p.status)}</span> <span class="muted">${esc(p.kind)}</span></div>
       ${view.reason ? `<div class="${view.reasonClass}">${esc(view.reason)}</div>` : ""}
