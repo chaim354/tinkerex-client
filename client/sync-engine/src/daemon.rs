@@ -689,13 +689,21 @@ pub struct CfApiMount {
     handle: Option<fs_cfapi::CfApiMountHandle>,
     sync_handle: Option<JoinHandle<()>>,
     mountpoint: PathBuf,
-    // Kept for the post-disconnect shutdown drain (see `stop`): after the sync thread is
-    // joined and the sync root disconnected (which flushes CfAPI's NOTIFY callbacks into the
-    // outbox), we push whatever those callbacks captured — on the main thread, lock-contention-free.
+    // Kept for the post-disconnect shutdown drain (see `stop`): once the sync root is
+    // disconnected (which flushes CfAPI's NOTIFY callbacks into the outbox) we push whatever those
+    // callbacks captured — on the caller's thread, and BEFORE the sync thread is joined, never
+    // after. `stop`'s step 4 says why that order is deliberate.
     provider: Arc<SqliteProvider>,
     client: ServerClient,
     // Serializes the sync loop's push against the shutdown drain so they never push the same
-    // outbox node concurrently (which would self-conflict on the second push's stale base version).
+    // outbox node concurrently. NOT to prevent a conflict — that rationale is false. Both push
+    // through the same `ServerClient` (built once in `start`, cloned into the sync thread), so both
+    // carry the same device token and resolve to the same server-side `device_id`, and
+    // `Sync::Commit` has a dedicated same-device exemption that fast-forwards a stale base version
+    // instead of recording one ("a divergence from the SAME device is not a real conflict",
+    // app/services/sync/commit.rb; test/services/sync/conflicts_test.rb pins it). What the gate
+    // actually saves is waste: a duplicate `versions` row, a duplicate `changelog_entries` row
+    // broadcast to every device, and redundant content-addressed chunk re-PUTs.
     push_gate: Arc<std::sync::Mutex<()>>,
     // Bandwidth caps (shared with the sync loop) so the post-disconnect drain throttles too.
     limits: TransferLimits,
@@ -934,9 +942,13 @@ impl CfApiMount {
     }
 
     /// Push whatever the disconnect's NOTIFY callbacks captured into the outbox. Runs on the
-    /// caller's thread after the sync thread is joined + the root disconnected. Requires the
-    /// outbox to stay empty for a few consecutive polls before declaring done (CfAPI can deliver
-    /// a callback a moment after `CfDisconnectSyncRoot` returns), bounded by a deadline.
+    /// caller's thread after the root is disconnected but **BEFORE the sync thread is joined** —
+    /// deliberately, per step 4 of `stop`: the sync thread may be stuck mid-push on a slow HTTP
+    /// call (observed: the join hung in the push phase), so blocking on it first would risk losing
+    /// the very rename this drain exists to deliver. That the sync thread is therefore still
+    /// running is exactly why the loop below takes `push_gate`. Requires the outbox to stay empty
+    /// for a few consecutive polls before declaring done (CfAPI can deliver a callback a moment
+    /// after `CfDisconnectSyncRoot` returns), bounded by a deadline.
     fn shutdown_drain(&self) {
         let io = self.limits.wrap(PresignedIO::new(&self.client));
         let start = std::time::Instant::now();
@@ -955,7 +967,9 @@ impl CfApiMount {
             let before;
             {
                 // Hold the push gate so we never push concurrently with the (possibly still
-                // winding-down) sync thread — that would self-conflict on a shared node. The gate
+                // winding-down) sync thread — a shared node would otherwise be committed twice,
+                // costing a duplicate version + changelog entry and redundant chunk PUTs. NOT a
+                // conflict; see the `push_gate` field doc for why the server exempts this. The gate
                 // also makes us wait out the sync thread's in-flight push before our first attempt.
                 let _gate = self.push_gate.lock().unwrap_or_else(|e| e.into_inner());
                 before = self.provider.outbox_list().unwrap_or_default();
@@ -1042,8 +1056,11 @@ fn sync_loop(
         // Wrap the production transport in the bandwidth throttle (a no-op when unlimited).
         let io = limits.wrap(PresignedIO::new(&client));
         // Hold the push gate across the tick (CfAPI only) so the shutdown drain can't push the
-        // SAME outbox node concurrently — a concurrent double-push sends the same base_version_id
-        // twice and the server records a spurious self-conflict on the second.
+        // SAME outbox node concurrently. A double-push does send the same base_version_id twice,
+        // but the server does NOT conflict on it: both pushes carry this device's token, and
+        // `Sync::Commit`'s same-device exemption fast-forwards instead. What the gate avoids is a
+        // duplicate version row, a duplicate changelog entry broadcast to every device, and
+        // redundant chunk re-PUTs. See the `push_gate` field doc on `CfApiMount`.
         let guard = push_gate
             .as_ref()
             .map(|g| g.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1080,9 +1097,14 @@ fn sync_loop(
     }
     // Graceful shutdown: drain the outbox one final time so a local change captured between the
     // last tick and `stop` (e.g. a FUSE write right before unmount) still reaches the server.
-    // (The CfAPI backend does NOT rely on this — its NOTIFY callbacks flush only at disconnect,
-    // *after* the sync thread is joined, so `CfApiMount::stop` runs its own post-disconnect drain.
-    // For FUSE/WebDAV/WinFsp the local change is already in the outbox here, so one pass suffices.)
+    // For FUSE/WebDAV/WinFsp the local change is already in the outbox here, so one pass suffices —
+    // and all three pass `push_gate: None`, so this is their ONLY drain and it races nothing.
+    // The CfAPI backend does NOT rely on this: its NOTIFY callbacks flush at disconnect, and
+    // `CfApiMount::stop` runs its own post-disconnect drain — BEFORE joining this thread, not
+    // after it (step 4 there says why). So on Windows alone the two can overlap, and this final
+    // push is not gated. The cost of that overlap is a duplicate version row, a duplicate
+    // changelog entry and redundant chunk re-PUTs — never a conflict, because both drains push
+    // through the same `ServerClient` and `Sync::Commit` exempts a same-device divergence.
     let io = limits.wrap(PresignedIO::new(&client));
     if let Err(e) = SyncEngine::push_outbox(&provider, &client, &io) {
         eprintln!("sync: final outbox drain failed: {e}");
