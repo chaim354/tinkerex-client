@@ -744,7 +744,16 @@ thread_local! {
     /// absent locally cannot collide with a local node under that same absent parent. Reaching the
     /// collision therefore needs a local write landing between the parent's apply and the retry —
     /// and a single-threaded pull has no such window. So the sweep cannot *generate* the case at
-    /// all; it is not that its assertions would miss the result. `deferred_retry_that_displaces_a
+    /// all; it is not that its assertions would miss the result.
+    ///
+    /// AND IT IS WIDER THAN A MISSING COLLISION, which review instrumentation established and this
+    /// comment previously understated. The wording above implies retries succeed and merely fail to
+    /// collide. They do not succeed: across 150 seeds this `retry_deferred` is entered with a
+    /// non-empty buffer **30** times and applies a deferred node successfully **ZERO** times —
+    /// every buffered node stays `NotFound` and is dropped. So the whole `Ok` arm of this harness's
+    /// retry, including the `progress |= !outcome.dirty_local` beside it, is **dead across every
+    /// seed**. Do not cite this sweep as coverage of the retry path at all; only the deterministic
+    /// test below covers it. `deferred_retry_that_displaces_a
     /// _pending_node_signals_reconcile` pins it deterministically instead. Widening the deferral
     /// to `InvalidArgument` would let the sweep reach it, and is a separate change — it is
     /// expected to surface real convergence failures, and it WOULD move this number.
