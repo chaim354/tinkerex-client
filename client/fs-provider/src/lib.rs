@@ -26,6 +26,10 @@ pub use locks::{LockManager, LockRange};
 pub mod subscriptions;
 pub use subscriptions::SubRule;
 
+/// Private on purpose: `StagingArea` is an internal invariant (a leaf lock), not API.
+mod staging;
+use staging::StagingArea;
+
 pub const ROOT_INO: u64 = 1;
 
 /// POSIX `NAME_MAX`: the maximum length, **in bytes**, of a single path component. A
@@ -436,9 +440,14 @@ pub trait Provider: Send + Sync {
 pub struct SqliteProvider {
     conn: Mutex<Connection>,
     store: Box<dyn ChunkStore>,
-    /// In-progress writes, buffered in memory until `flush`. (Production streams to a
-    /// staging file; in-memory keeps the foundation simple and fully testable.)
-    staging: Mutex<HashMap<u64, Vec<u8>>>,
+    /// In-progress writes, buffered in memory until `flush`.
+    ///
+    /// **A leaf lock, enforced by the type** — `StagingArea`'s methods acquire and release
+    /// internally and return owned values, so no call site *can* hold it across a `conn`
+    /// query. That is what stops the ABBA deadlock that a bare `Mutex<HashMap<..>>` here
+    /// invited: `getattr` held it while taking `conn`, while `purge_inode_state`'s callers
+    /// hold `conn` and then take it. See `staging.rs` — do not reach around this type.
+    staged: StagingArea,
     chunk_cfg: ChunkConfig,
     /// Local advisory file locks (POSIX byte-range), honored between processes on this
     /// device. Lives in memory: locks are inherently per-mount and released on close.
@@ -537,7 +546,7 @@ impl SqliteProvider {
         Ok(Self {
             conn: Mutex::new(conn),
             store,
-            staging: Mutex::new(HashMap::new()),
+            staged: StagingArea::new(),
             chunk_cfg,
             locks: LockManager::new(),
         })
@@ -687,16 +696,20 @@ impl SqliteProvider {
         if inos.is_empty() {
             return;
         }
-        let mut staging = self.staging.lock().unwrap();
+        // SEQUENTIALLY, never nested: the staging lock is released before `locks` is
+        // taken. The old loop held `staging` across `locks.purge`, which made `locks` an
+        // INNER lock of `staging`. `locks` is a leaf everywhere else today, so that was
+        // latent rather than live — but it is the same ABBA shape one level down, and a
+        // future lock-aware flush taking `locks` first would complete the cycle.
+        self.staged.purge_many(inos);
         for &ino in inos {
-            staging.remove(&(ino as u64));
             self.locks.purge(ino as u64);
         }
     }
 
     fn current_content(&self, ino: u64) -> Result<Vec<u8>> {
-        if let Some(buf) = self.staging.lock().unwrap().get(&ino) {
-            return Ok(buf.clone());
+        if let Some(buf) = self.staged.snapshot(ino) {
+            return Ok(buf);
         }
         let conn = self.conn.lock().unwrap();
         let manifest: Option<String> = conn
@@ -1902,7 +1915,7 @@ impl SqliteProvider {
             Kind::Dir => return Err(FsError::IsADirectory),
             Kind::Symlink => return Err(FsError::InvalidArgument),
         }
-        self.staging.lock().unwrap().insert(ino, data.to_vec());
+        self.staged.put(ino, data.to_vec());
         self.flush(ino)
     }
 }
@@ -1924,15 +1937,24 @@ impl Provider for SqliteProvider {
     }
 
     fn getattr(&self, ino: u64) -> Result<Attr> {
-        // If open for write, report the live staged size.
-        if let Some(buf) = self.staging.lock().unwrap().get(&ino) {
+        // Read the row and RELEASE `conn` BEFORE asking the staging area anything. This
+        // is deliberately an inversion, not a reordering: `getattr` now holds no two locks
+        // at once, so it stops being a lock-order site at all rather than becoming a
+        // correctly-ordered one. (It used to hold `staging` — because `buf` borrowed from
+        // the `if let` scrutinee temporary — while taking `conn`, deadlocking against
+        // every `purge_inode_state` caller, which holds `conn` and then takes `staging`.)
+        let mut a = {
             let conn = self.conn.lock().unwrap();
-            let mut a = Self::attr_row(&conn, ino)?;
-            a.size = buf.len() as u64;
-            return Ok(a);
+            Self::attr_row(&conn, ino)?
+        };
+        // If open for write, report the live staged size. A concurrent `flush` landing
+        // between the two reads makes this report the committed size instead of the
+        // staged one — which NARROWS an existing race rather than introducing one: this
+        // read was already unsynchronized against `flush` in every other respect.
+        if let Some(len) = self.staged.len(ino) {
+            a.size = len;
         }
-        let conn = self.conn.lock().unwrap();
-        Self::attr_row(&conn, ino)
+        Ok(a)
     }
 
     fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>> {
@@ -1971,10 +1993,8 @@ impl Provider for SqliteProvider {
         }
         // Open for write → serve from the in-memory staging buffer (the live, uncommitted
         // content). Slice the requested range out of it.
-        if let Some(buf) = self.staging.lock().unwrap().get(&ino) {
-            let start = (offset as usize).min(buf.len());
-            let end = (start + size as usize).min(buf.len());
-            return Ok(buf[start..end].to_vec());
+        if let Some(bytes) = self.staged.slice(ino, offset, size) {
+            return Ok(bytes);
         }
         // Committed file → assemble **only the chunks the range overlaps**, not the whole file.
         // This is what lets progressive hydration serve a header read from just the first
@@ -1998,7 +2018,7 @@ impl Provider for SqliteProvider {
     fn create(&self, parent: u64, name: &str) -> Result<Attr> {
         let attr = self.insert_node(parent, name, Kind::File)?;
         // Open it for write immediately (FUSE create → open).
-        self.staging.lock().unwrap().insert(attr.ino, Vec::new());
+        self.staged.put(attr.ino, Vec::new());
         Ok(attr)
     }
 
@@ -2015,26 +2035,24 @@ impl Provider for SqliteProvider {
             Kind::Dir => return Err(FsError::IsADirectory),
             Kind::Symlink => return Err(FsError::InvalidArgument),
         }
-        let mut staging = self.staging.lock().unwrap();
-        if !staging.contains_key(&ino) {
-            drop(staging);
-            // Seed the staging buffer with current committed content so partial
-            // writes to an existing file are correct.
+        // Already open for write → splice straight in, under one lock hold.
+        if !self.staged.write_at(ino, offset, data) {
+            // Not staged yet. Seed with the current committed content so partial writes to
+            // an existing file are correct — and compute that seed with NOTHING held:
+            // `current_content` takes the staging lock itself, so seeding from inside it
+            // would self-deadlock on this non-reentrant mutex. (This is the drop-and-relock
+            // the bare-`Mutex` version spelled out by hand; the shape is unchanged.)
             let seed = self.current_content(ino)?;
-            staging = self.staging.lock().unwrap();
-            staging.entry(ino).or_insert(seed);
+            // Seed-and-splice is ONE lock hold, and it `or_insert`s: a concurrent writer
+            // may have seeded during the gap above, and clobbering its bytes would lose
+            // that write.
+            self.staged.seed_and_write_at(ino, seed, offset, data);
         }
-        let buf = staging.get_mut(&ino).unwrap();
-        let off = offset as usize;
-        if off + data.len() > buf.len() {
-            buf.resize(off + data.len(), 0);
-        }
-        buf[off..off + data.len()].copy_from_slice(data);
         Ok(data.len() as u32)
     }
 
     fn flush(&self, ino: u64) -> Result<()> {
-        let buf = match self.staging.lock().unwrap().remove(&ino) {
+        let buf = match self.staged.take(ino) {
             Some(b) => b,
             None => return Ok(()), // nothing staged
         };
@@ -2120,19 +2138,17 @@ impl Provider for SqliteProvider {
         // is what clears the stale tail an overwrite-with-shorter would otherwise leave
         // (the kernel issues this `setattr(size=0)` on an `O_TRUNC` open, before the
         // shorter `write`).
-        {
-            let mut staging = self.staging.lock().unwrap();
-            if let Some(buf) = staging.get_mut(&ino) {
-                buf.resize(size as usize, 0);
-                return Ok(());
-            }
+        // `resize` returns false when the inode is NOT open for write — that fall-through
+        // is what reaches the `size == 0` short-circuit and the seed-and-commit path below.
+        if self.staged.resize(ino, size) {
+            return Ok(());
         }
         // Truncating to empty discards everything, so it must NOT read the old content
         // first — that would assemble the committed chunks and fail on a pulled-but-
         // unhydrated placeholder (the `O_TRUNC` overwrite of a not-yet-downloaded file,
         // a routine mount operation). Short-circuit to an empty buffer.
         if size == 0 {
-            self.staging.lock().unwrap().insert(ino, Vec::new());
+            self.staged.put(ino, Vec::new());
             return self.flush(ino);
         }
         // Otherwise (a bare `truncate(n)` to a non-zero size): seed from the committed
@@ -2141,7 +2157,7 @@ impl Provider for SqliteProvider {
         // the prefix bytes [0, n), so this path does require the file to be hydrated.
         let mut content = self.current_content(ino)?;
         content.resize(size as usize, 0);
-        self.staging.lock().unwrap().insert(ino, content);
+        self.staged.put(ino, content);
         self.flush(ino)
     }
 
@@ -2156,13 +2172,13 @@ impl Provider for SqliteProvider {
             Kind::Dir => return Err(FsError::IsADirectory),
             Kind::Symlink => return Err(FsError::InvalidArgument),
         }
-        self.staging.lock().unwrap().insert(ino, Vec::new());
+        self.staged.put(ino, Vec::new());
         Ok(())
     }
 
     fn discard(&self, ino: u64) -> Result<()> {
         // Drop the in-progress staged write; the last committed version remains the content.
-        self.staging.lock().unwrap().remove(&ino);
+        self.staged.discard(ino);
         Ok(())
     }
 
