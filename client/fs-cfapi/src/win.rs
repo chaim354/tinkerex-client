@@ -98,11 +98,19 @@ struct CfState {
     /// instead of an O(tree) DFS. Shared (`Arc`) with the invalidator, which reads it + drops stale
     /// entries on rename/delete. A miss falls back to the tree walk, so it's always correct.
     path_index: Arc<crate::PathIndex>,
-    /// B6.3: transfer keys for FETCH_DATA hydrations the kernel asked us to **cancel** (the reading
-    /// app went away / the file was deleted mid-download). The streamed `fetch_data_callback`
-    /// checks this between slices and stops early; `cancel_fetch_data_callback` inserts the key.
-    /// A `HashSet<i64>` of `CF_CALLBACK_INFO::TransferKey`s.
-    cancelled_transfers: Mutex<std::collections::HashSet<i64>>,
+    /// B6.3: the **in-flight** FETCH_DATA hydrations, each carrying a cancel flag the streamed
+    /// `fetch_data_callback` polls between slices so it stops early when the kernel aborts a
+    /// transfer (the reading app went away / the file was deleted mid-download).
+    ///
+    /// This was a `HashSet<i64>` of *cancelled keys* — "a cancel happened for K", decoupled from
+    /// whether any transfer for K was running. It was inserted into unconditionally and removed
+    /// only on a successful consume, and the callback cleaned up at just 3 of its 8 exits, so a
+    /// cancel that raced the final remove or arrived for a transfer that had bailed early leaked
+    /// **for the process lifetime** — then aborted a LATER FETCH_DATA after its first slice, on a
+    /// path that issues no completion for the remainder, hanging the reader to the CfAPI timeout.
+    /// [`crate::TransferRegistry`] models live transfers instead and deregisters via RAII, so all
+    /// eight exits are covered with no manual `.remove()` to keep in step with a new `return`.
+    transfers: Arc<crate::TransferRegistry>,
     /// Echo guard for placeholder deletes/renames the **daemon itself** performs while applying a
     /// remote delete/move (`CfApiInvalidate::removed`/`moved`). Those FS ops fire `NOTIFY_DELETE` /
     /// `NOTIFY_RENAME`, which would otherwise mirror the change back into the `Provider` (re-enqueue
@@ -338,7 +346,7 @@ pub fn mount_full(
         self_writes: crate::SelfOps::new(),
         shutting_down: shutting_down.clone(),
         path_index,
-        cancelled_transfers: Mutex::new(std::collections::HashSet::new()),
+        transfers: Arc::new(crate::TransferRegistry::new()),
         self_removes,
     }));
 
@@ -902,6 +910,14 @@ unsafe extern "system" fn fetch_data_callback(
     }
     let state = &*state;
 
+    // F-53: register this transfer as in-flight for the whole callback. The guard's `Drop`
+    // deregisters on EVERY exit below — the teardown bail, the three resolve failures, the
+    // empty-plan branch, a mid-stream read or `CfExecute` failure, the cancel, and the clean
+    // finish. The predecessor tracked *cancelled keys* and cleaned up at only three of those, so
+    // the rest leaked permanently and truncated a later read. Nothing here may `return` before
+    // this line without also being unable to leak (the two null guards above resolve no state).
+    let transfer = state.transfers.register(info.TransferKey);
+
     let fetch = params.Anonymous.FetchData;
     let req_offset = fetch.RequiredFileOffset;
     let req_length = fetch.RequiredLength;
@@ -1004,13 +1020,7 @@ unsafe extern "system" fn fetch_data_callback(
                 );
                 let remaining = (req_offset + req_length) - chunk.offset as i64;
                 transfer_data_error(info, chunk.offset as i64, remaining);
-                // Clear any cancel marker for this key so it can't leak (minor-fix hygiene).
-                state
-                    .cancelled_transfers
-                    .lock()
-                    .unwrap()
-                    .remove(&info.TransferKey);
-                return;
+                return; // `transfer`'s Drop deregisters
             }
         };
         let op_info = op_info_for(info, CF_OPERATION_TYPE_TRANSFER_DATA);
@@ -1043,12 +1053,8 @@ unsafe extern "system" fn fetch_data_callback(
 
         // B6.3: honor a CANCEL_FETCH_DATA that arrived for this transfer — stop streaming further
         // slices (the kernel already knows the transfer is cancelled; no extra completion needed).
-        if state
-            .cancelled_transfers
-            .lock()
-            .unwrap()
-            .remove(&info.TransferKey)
-        {
+        // A relaxed atomic load, not a mutex acquisition, in the 16 MiB hydration loop.
+        if transfer.is_cancelled() {
             eprintln!(
                 "cfapi: FETCH_DATA node={node_id} cancelled mid-stream at off={}",
                 chunk.offset
@@ -1071,18 +1077,21 @@ unsafe extern "system" fn fetch_data_callback(
         transfer_data_error(info, tail_off, req_end - tail_off);
     }
 
-    // Done streaming cleanly — clear any (late) cancel marker for this key so it can't leak.
-    state
-        .cancelled_transfers
-        .lock()
-        .unwrap()
-        .remove(&info.TransferKey);
+    // Done streaming cleanly. `transfer`'s Drop deregisters — including a cancel that lands in the
+    // window after the last slice, which the old code could only consume by racing it.
 }
 
 /// CANCEL_FETCH_DATA: the platform aborts an in-flight hydration (the reading app closed the
-/// handle, or the file was deleted while downloading). Record the transfer key so the streaming
-/// [`fetch_data_callback`] loop stops before its next slice. No completion is issued — a cancel is
-/// not answered with `CfExecute` (the kernel owns the cancellation).
+/// handle, or the file was deleted while downloading). Raise the cancel flag on the **running**
+/// transfer so the streaming [`fetch_data_callback`] loop stops before its next slice. No
+/// completion is issued — a cancel is not answered with `CfExecute` (the kernel owns the
+/// cancellation).
+///
+/// A cancel for a key with no live transfer is **dropped**, which is the fix: recording it is what
+/// used to leak a permanent entry that truncated a later read. The trade is stated on
+/// [`crate::TransferRegistry`] — a cancel that beats its own fetch's registration is missed and
+/// that hydration streams to completion, which is benign (the kernel discards) where the leak was
+/// a reader hang.
 unsafe extern "system" fn cancel_fetch_data_callback(
     info: *const CF_CALLBACK_INFO,
     _params: *const CF_CALLBACK_PARAMETERS,
@@ -1096,12 +1105,11 @@ unsafe extern "system" fn cancel_fetch_data_callback(
         return;
     }
     let state = &*state;
-    eprintln!("cfapi: CANCEL_FETCH_DATA transfer_key={}", info.TransferKey);
-    state
-        .cancelled_transfers
-        .lock()
-        .unwrap()
-        .insert(info.TransferKey);
+    let found = state.transfers.cancel(info.TransferKey);
+    eprintln!(
+        "cfapi: CANCEL_FETCH_DATA transfer_key={} (in-flight: {found})",
+        info.TransferKey
+    );
 }
 
 /// B6.1 — reconcile a placeholder's **pin state** to its local bytes ("Always keep on this device"

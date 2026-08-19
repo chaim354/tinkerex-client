@@ -533,9 +533,284 @@ impl SelfOps {
     }
 }
 
+/// The **in-flight FETCH_DATA transfers**, each holding a cancel flag the streaming hydration loop
+/// polls between slices. `CANCEL_FETCH_DATA` raises the flag for a transfer that is *running*.
+///
+/// **This models LIVE transfers, not "a cancel happened for key K".** The predecessor was a
+/// `HashSet<i64>` of cancelled keys, inserted into unconditionally and removed only on a successful
+/// consume — so a CANCEL that raced the final remove, or that arrived for a transfer which had
+/// already bailed out early, was never consumed and **persisted for the process lifetime**. A
+/// leaked key then aborted a *later* FETCH_DATA after its first slice, on a path that deliberately
+/// issues no completion for the unsatisfied remainder, so the reading app blocked to the CfAPI
+/// timeout — the exact hang class the error-completion fix exists to eliminate.
+///
+/// A registration returns a [`TransferGuard`] whose `Drop` deregisters, so **every** exit path of
+/// the callback is covered — including the five early returns that had no manual cleanup — without
+/// a single hand-written `.remove()` to keep in step with a new `return`. Growth is bounded by the
+/// number of concurrently-executing callbacks rather than by process uptime.
+///
+/// **Direction of failure.** A CANCEL arriving *before* its fetch registers now finds nothing and
+/// is dropped, so a genuine cancel can be missed and that hydration streams to completion. That is
+/// benign — the kernel discards bytes for a transfer it cancelled — and is strictly better than
+/// the reader hang the stale-entry leak produced. The change fails safe.
+///
+/// **The key is `CF_CALLBACK_INFO::TransferKey` verbatim, an `i64`, deliberately unchanged.** Its
+/// reuse semantics are undocumented in the generated `windows` 0.61 bindings and cannot be settled
+/// off a Windows box: `TransferKey` is CfAPI's handle to the *file object*, not the request, so two
+/// outstanding FETCH_DATAs on one open file may share it. **Do not key on `(TransferKey,
+/// RequestKey)` and do not add range matching without live Windows verification.** The lifetime fix
+/// above is independent of that choice, which is what makes it landable now.
+///
+/// Pure + cross-platform (`i64` -> flag, no Windows types), so it is unit-tested on any host — the
+/// point of putting it here rather than in `win.rs`, which no registered CI runner compiles.
+#[derive(Debug, Default)]
+pub struct TransferRegistry {
+    map: std::sync::Mutex<
+        std::collections::HashMap<i64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    >,
+}
+
+impl TransferRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a transfer as in-flight. The returned guard deregisters on drop; hold it for the
+    /// life of the callback and poll [`TransferGuard::is_cancelled`] between slices.
+    ///
+    /// A second registration for a key already present **replaces** it, so the newcomer starts
+    /// un-cancelled and can never inherit a stale flag.
+    pub fn register(
+        self: &std::sync::Arc<Self>,
+        key: i64,
+    ) -> TransferGuard {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.map.lock().unwrap().insert(key, flag.clone());
+        TransferGuard {
+            registry: std::sync::Arc::clone(self),
+            key,
+            flag,
+        }
+    }
+
+    /// Flag the in-flight transfer for `key` as cancelled. Returns whether one was actually
+    /// running: a cancel for a key with no live transfer is **dropped**, which is the whole point
+    /// (there is nothing to cancel, and recording it is what used to leak).
+    pub fn cancel(&self, key: i64) -> bool {
+        match self.map.lock().unwrap().get(&key) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Number of transfers currently registered. For tests and diagnostics — the property that
+    /// matters is that this returns to zero once the callbacks have returned.
+    pub fn in_flight(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+}
+
+/// RAII registration for one in-flight FETCH_DATA. Deregisters on drop, so every `return` in the
+/// callback — early bail, error completion, mid-stream cancel, or clean finish — is covered.
+#[derive(Debug)]
+pub struct TransferGuard {
+    registry: std::sync::Arc<TransferRegistry>,
+    key: i64,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TransferGuard {
+    /// Has a `CANCEL_FETCH_DATA` arrived for this transfer? A relaxed atomic load — cheap enough
+    /// to poll every slice of the 16 MiB hydration loop, where the predecessor took a mutex.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The transfer key this guard registered under.
+    pub fn key(&self) -> i64 {
+        self.key
+    }
+}
+
+impl Drop for TransferGuard {
+    /// **MUST NOT PANIC.** This runs inside an `extern "system"` callback, and an unwind across
+    /// that boundary aborts the process — so the lock is taken poison-tolerantly rather than with
+    /// `.unwrap()`. A poisoned mutex here means some other callback panicked; deregistering is
+    /// still the right thing to do, and refusing to would leak the very entry this type exists to
+    /// reclaim.
+    fn drop(&mut self) {
+        let mut map = match self.registry.map.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Remove only if the live entry is still OURS. If a later transfer reused this key it
+        // replaced the entry with its own flag, and dropping this stale guard must not deregister
+        // the newcomer.
+        if let Some(current) = map.get(&self.key) {
+            if std::sync::Arc::ptr_eq(current, &self.flag) {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- TransferRegistry (F-53): in-flight transfers, not a set of cancelled keys ---
+
+    #[test]
+    fn transfer_guard_deregisters_on_every_exit_including_an_early_return() {
+        // The defect this replaces: 5 of the callback's 8 exits had no manual cleanup. An RAII
+        // guard covers them all, so the check is that a scope exit — however it happens —
+        // deregisters. `?`-style early returns are modelled by returning out of a closure.
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+        assert_eq!(reg.in_flight(), 0);
+
+        // Clean finish.
+        {
+            let _g = reg.register(7);
+            assert_eq!(reg.in_flight(), 1, "registered for the life of the callback");
+        }
+        assert_eq!(reg.in_flight(), 0, "clean exit deregisters");
+
+        // Early return from the middle of the body (the shape of the 5 leaking exits).
+        let bail = |reg: &std::sync::Arc<TransferRegistry>| {
+            let _g = reg.register(7);
+            if true {
+                return "bailed";
+            }
+            #[allow(unreachable_code)]
+            "streamed"
+        };
+        assert_eq!(bail(&reg), "bailed");
+        assert_eq!(reg.in_flight(), 0, "early return deregisters too");
+
+        // Exit while a cancel is outstanding — the race the old code could not consume.
+        {
+            let _g = reg.register(7);
+            assert!(reg.cancel(7));
+        }
+        assert_eq!(reg.in_flight(), 0, "a cancelled transfer still deregisters");
+    }
+
+    #[test]
+    fn cancel_for_an_unregistered_key_is_dropped() {
+        // The old `HashSet` inserted unconditionally, so a cancel with no live transfer became a
+        // permanent entry. There is nothing to cancel; it must leave no trace.
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+        assert!(!reg.cancel(42), "no live transfer for this key");
+        assert_eq!(reg.in_flight(), 0, "and nothing was recorded");
+    }
+
+    #[test]
+    fn a_cancel_is_not_observable_by_a_later_transfer_with_the_same_key() {
+        // THIS IS THE DEFECT. Under the old `HashSet<i64>`, a cancel that was never consumed
+        // aborted a SUBSEQUENT FETCH_DATA after its first slice — and that path issues no
+        // completion for the remainder, so the reading app blocked to the CfAPI timeout.
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+
+        // A transfer is cancelled and ends without the flag ever being read.
+        {
+            let g = reg.register(7);
+            assert!(reg.cancel(7));
+            assert!(g.is_cancelled(), "the running transfer does see its own cancel");
+        }
+
+        // A later, unrelated transfer reusing the key must start clean.
+        let g2 = reg.register(7);
+        assert!(
+            !g2.is_cancelled(),
+            "a later transfer must not inherit the earlier cancel"
+        );
+    }
+
+    #[test]
+    fn a_stale_guard_does_not_deregister_a_later_transfer_on_the_same_key() {
+        // `register` replaces, so two guards for one key can be alive at once. The elder's Drop
+        // must not evict the younger's registration, or the younger silently stops being
+        // cancellable.
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+        let old = reg.register(7);
+        let new = reg.register(7);
+        drop(old);
+        assert_eq!(reg.in_flight(), 1, "the younger registration survives");
+        assert!(reg.cancel(7), "and is still reachable by a cancel");
+        assert!(new.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_lands_on_the_transfer_that_is_running_when_it_arrives() {
+        // Ordering: a cancel only ever affects a transfer registered BEFORE it. One arriving
+        // before registration is dropped (benign — the fetch streams on and the kernel discards),
+        // which is the deliberate trade recorded on `TransferRegistry`.
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+
+        assert!(!reg.cancel(1), "arrives before registration — dropped");
+        let g = reg.register(1);
+        assert!(!g.is_cancelled(), "so the fetch is NOT cancelled");
+
+        assert!(reg.cancel(1), "arrives during — lands");
+        assert!(g.is_cancelled());
+    }
+
+    #[test]
+    fn transfers_are_independent_across_keys() {
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+        let a = reg.register(1);
+        let b = reg.register(2);
+        assert!(reg.cancel(1));
+        assert!(a.is_cancelled());
+        assert!(!b.is_cancelled(), "a cancel is scoped to its own key");
+        assert_eq!(reg.in_flight(), 2);
+        drop(a);
+        assert_eq!(reg.in_flight(), 1, "only the dropped one deregisters");
+        drop(b);
+        assert_eq!(reg.in_flight(), 0);
+    }
+
+    #[test]
+    fn concurrent_registers_and_cancels_leave_nothing_behind() {
+        // Growth must be bounded by concurrently-executing callbacks, not by uptime: after every
+        // thread returns, the registry is empty however the cancels interleaved.
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+        let mut handles = Vec::new();
+        for key in 0..16i64 {
+            let reg = std::sync::Arc::clone(&reg);
+            handles.push(std::thread::spawn(move || {
+                let g = reg.register(key);
+                // Cancel our own and a neighbour's — the neighbour may or may not be live.
+                reg.cancel(key);
+                reg.cancel((key + 1) % 16);
+                assert!(g.is_cancelled(), "our own cancel is always observed");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(reg.in_flight(), 0, "every guard deregistered");
+    }
+
+    #[test]
+    fn drop_does_not_panic_on_a_poisoned_lock() {
+        // A guard's Drop runs inside an `extern "system"` callback, where an unwind aborts the
+        // process. Poison the mutex from a panicking thread, then drop a guard: it must return
+        // normally rather than `.unwrap()`-panicking.
+        let reg = std::sync::Arc::new(TransferRegistry::new());
+        let guard = reg.register(3);
+        let r = std::sync::Arc::clone(&reg);
+        let _ = std::thread::spawn(move || {
+            let _held = r.map.lock().unwrap();
+            panic!("poison the registry mutex");
+        })
+        .join();
+        assert!(reg.map.is_poisoned(), "precondition: the lock is poisoned");
+        drop(guard); // must not panic
+    }
 
     #[test]
     fn self_ops_suppresses_one_echo_then_releases() {
