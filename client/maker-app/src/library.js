@@ -53,6 +53,13 @@ const closeOverlay = (id) => $(id).classList.remove("show");
 // ============================================================================
 
 async function loadCatalog() {
+  // Signed out, libArgs() is null and every command below would fail with a raw Tauri
+  // deserialization string. Say what to do instead.
+  if (!UI.signedIn()) {
+    $("libGrid").innerHTML = `<div class="muted">${esc(UI.SIGNED_OUT_HINT)}</div>`;
+    $("libEmpty").classList.add("hidden");
+    return;
+  }
   const a = libArgs();
   const itemType = $("libType").value || null;
   const q = $("libSearch").value.trim() || null;

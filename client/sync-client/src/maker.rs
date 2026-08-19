@@ -656,6 +656,41 @@ pub struct PreviewsResponse {
     pub previews: Vec<Preview>,
 }
 
+/// The body for `POST /v1/maker/previews` (`{ preview: { … } }`).
+///
+/// A DERIVED STRUCT RATHER THAN AN INLINE `serde_json::json!`, AND THAT IS THE WHOLE POINT:
+/// a `json!` literal has nowhere to hang `skip_serializing_if`, so every `None` went out as
+/// an explicit `null` — `{"filename":null,"kind":null,"node_id":"…","version_id":null}`.
+///
+/// The server distinguishes an ABSENT key from an explicit `null` and is right to:
+/// `attrs.fetch(:kind, "thumbnail")` defaults only on absence, so a `null` reached the model
+/// and the `kind` inclusion validation refused it — **422**, zero rows. That is the correct
+/// answer to a client that named the key and supplied nothing (reject, don't normalize —
+/// CLAUDE.md §14a's `key_for`, §14c's `validate_asset_path!` and the SDK's path-segment
+/// rule all take the same side), so the fix belongs on THIS end: don't send the key.
+///
+/// Reachable, not theoretical: `maker_enqueue_preview` is a Tauri command whose `kind` is an
+/// `Option<String>`, so any JS caller omitting it produced a request that could never succeed.
+///
+/// Borrowed rather than owned so `enqueue_preview`'s `&str` signature is unchanged and the
+/// body costs no allocations. Every other request body in this file — `ItemInput`,
+/// `FileAttachmentInput`, `InventoryItemInput`, `BomInput` — is already a derived struct
+/// carrying these attributes; the preview door was the crate's lone exception to its own
+/// typed-input pattern.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PreviewInput<'a> {
+    pub node_id: &'a str,
+    /// Omitted when `None`. Absent and `null` are NOT equivalent to the server here either:
+    /// `refuse_stale_version!` gates on `attrs[:version_id].blank?`, which is true for both,
+    /// so omitting is a no-op for that check — it is `kind` that the omission rescues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<&'a str>,
+}
+
 // ---- the API methods ------------------------------------------------------------
 
 impl ServerClient {
@@ -1300,12 +1335,15 @@ impl ServerClient {
         kind: Option<&str>,
         filename: Option<&str>,
     ) -> Result<Preview> {
+        let input = PreviewInput {
+            node_id,
+            version_id,
+            kind,
+            filename,
+        };
         let resp = self
             .authed(self.http.post(self.url("/v1/maker/previews")))?
-            .json(&serde_json::json!({ "preview": {
-                "node_id": node_id, "version_id": version_id,
-                "kind": kind, "filename": filename
-            }}))
+            .json(&serde_json::json!({ "preview": input }))
             .send()?;
         Self::json(resp)
     }
@@ -1620,6 +1658,53 @@ mod tests {
         assert_eq!(full.quantity_cached, 10.5);
         assert_eq!(full.notes.as_deref(), Some("hex head"));
         assert_eq!(full.unit_cost.as_deref(), Some("0.05"));
+    }
+
+    #[test]
+    fn preview_input_omits_none_fields_from_the_wire() {
+        // ASSERTED ON THE SERIALIZED BYTES, NOT A ROUND-TRIP (CLAUDE.md §14e, the FakeS3
+        // lesson): `serde_json::from_str` reads an absent key and an explicit `null` into the
+        // SAME `None`, so any assertion that parses this back confirms the bug instead of
+        // catching it. Only the string can tell the two apart, and only the string is what the
+        // server sees.
+        let body = serde_json::to_string(&PreviewInput {
+            node_id: "n1.svg",
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(body, r#"{"node_id":"n1.svg"}"#);
+        // Named individually so each `skip_serializing_if` carries its own weight — asserting
+        // only `kind` is how the other two stayed unguarded through the inline-`json!` era.
+        assert!(!body.contains("\"kind\""), "kind leaked: {body}");
+        assert!(!body.contains("\"version_id\""), "version_id leaked: {body}");
+        assert!(!body.contains("\"filename\""), "filename leaked: {body}");
+
+        // A value that IS supplied still goes out, under its own key.
+        let full = serde_json::to_string(&PreviewInput {
+            node_id: "n1.svg",
+            version_id: Some("v1"),
+            kind: Some("thumbnail"),
+            filename: Some("plate.stl"),
+        })
+        .unwrap();
+        assert!(full.contains(r#""kind":"thumbnail""#), "{full}");
+        assert!(full.contains(r#""version_id":"v1""#), "{full}");
+        assert!(full.contains(r#""filename":"plate.stl""#), "{full}");
+    }
+
+    #[test]
+    fn preview_input_rides_inside_the_preview_envelope() {
+        // The shape `enqueue_preview` actually sends. The envelope is what the controller's
+        // `params.require(:preview)` reads, so a body missing it is a 400 rather than a create.
+        let body = serde_json::json!({ "preview": PreviewInput {
+            node_id: "n1.svg",
+            kind: Some("thumbnail"),
+            ..Default::default()
+        }});
+        assert_eq!(
+            body,
+            serde_json::json!({ "preview": { "node_id": "n1.svg", "kind": "thumbnail" } })
+        );
     }
 
     #[test]

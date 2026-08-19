@@ -6,6 +6,7 @@
 //   maker_enqueue_preview {…,nodeId,versionId?,kind?,filename?}
 
 import { esc, safeHref, pickFile } from "/maker-shared.js";
+import { previewPresentation } from "/preview-status.js";
 
 const UI = window.MakerUI;
 const { invoke, $ } = UI;
@@ -26,6 +27,11 @@ async function refreshNames() {
 
 async function loadPreviews() {
   $("prevHint").textContent = "";
+  // See library.js#loadCatalog.
+  if (!UI.signedIn()) {
+    $("prevGrid").innerHTML = `<div class="muted">${esc(UI.SIGNED_OUT_HINT)}</div>`;
+    return;
+  }
   $("prevGrid").innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`;
   await refreshNames();
   let previews;
@@ -38,10 +44,20 @@ async function loadPreviews() {
   renderPreviews(previews);
 }
 
-function statusBadge(status) {
-  const cls = { ready: "ok", pending: "busy", failed: "err", processing: "busy" }[status] || "";
-  return `<span class="prev-status ${cls}">${esc(status)}</span>`;
-}
+// The thumbnail box for one card. `previewPresentation` has already decided which of the three
+// it is; this only knows how to draw them.
+//
+// THE LOOKUP BELOW FALLS BACK, and that is not defensive noise. `previewPresentation` is total by
+// construction (an explicit UNKNOWN row), but THIS table is total only by ENUMERATION — the
+// totality test iterates a hard-coded list of the five status names, so a SIXTH `ROWS` entry
+// carrying a novel `thumb` passes 23/23 green and is a `TypeError` at runtime that blanks the whole
+// grid. Probed. That is a harder failure than anything this table was added to fix, and it is the
+// likelier edit of the two residuals, because it is the edit someone makes in this very file.
+const THUMBS = {
+  image: (href) => `<div class="prev-thumb" style="background-image:url('${esc(href)}')"></div>`,
+  spinner: () => `<div class="prev-thumb empty"><span class="spinner"></span></div>`,
+  icon: () => `<div class="prev-thumb empty">🖼️</div>`,
+};
 
 function renderPreviews(previews) {
   const grid = $("prevGrid");
@@ -56,24 +72,26 @@ function renderPreviews(previews) {
     card.className = "prev-card";
     const caption = nameByNode[p.node_id] || p.node_id;
     const href = safeHref(p.url);
-    const thumb = href
-      ? `<div class="prev-thumb" style="background-image:url('${esc(href)}')"></div>`
-      : `<div class="prev-thumb empty">${p.status === "pending" || p.status === "processing"
-          ? '<span class="spinner"></span>'
-          : "🖼️"}</div>`;
+    // ONE LOOKUP, FOUR FIELD READS. These four decisions used to be re-derived independently from
+    // three different fields and contradicted each other in six of nine reachable combinations —
+    // see preview-status.js for which, and why `pending` may NOT show the url it carries.
+    const view = previewPresentation(p.status, p.error, href);
     card.innerHTML = `
-      ${thumb}
+      ${(THUMBS[view.thumb] || THUMBS.icon)(href)}
       <div class="prev-cap" title="${esc(caption)}">${esc(caption)}</div>
-      <div class="prev-meta">${statusBadge(p.status)} <span class="muted">${esc(p.kind)}</span></div>
-      ${p.error ? `<div class="err prev-error">${esc(p.error)}</div>` : ""}
+      <div class="prev-meta"><span class="prev-status ${view.badgeClass}">${esc(p.status)}</span> <span class="muted">${esc(p.kind)}</span></div>
+      ${view.reason ? `<div class="${view.reasonClass}">${esc(view.reason)}</div>` : ""}
     `;
-    if (href) {
+    if (view.action === "zoom") {
       card.style.cursor = "zoom-in";
       card.onclick = () => window.open(href, "_blank", "noopener");
-    } else {
-      // let the user re-enqueue a pending/failed one
+    } else if (view.action === "retry") {
+      // Re-enqueue. This is also the only recovery this surface has from a job that was lost
+      // while the row still says pending/processing — see preview-status.js.
+      card.style.cursor = "pointer";
       card.onclick = () => enqueueFor(p.node_id);
     }
+    // "inert" — unsupported. No cursor, no handler: a re-render can only land back here.
     grid.appendChild(card);
   }
 }

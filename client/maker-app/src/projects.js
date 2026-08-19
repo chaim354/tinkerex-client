@@ -27,6 +27,13 @@ const UNITS = ["each", "g", "kg", "m", "mm", "cm", "ml", "l", "pack", "roll", "s
 // ---- list --------------------------------------------------------------------
 
 async function loadProjects() {
+  // See library.js#loadCatalog — signed out, a() is null and the command fails with a raw
+  // Tauri deserialization string.
+  if (!UI.signedIn()) {
+    $("projList").innerHTML = `<div class="muted">${esc(UI.SIGNED_OUT_HINT)}</div>`;
+    $("projEmpty").classList.add("hidden");
+    return;
+  }
   const status = $("projStatus").value || null;
   let projects;
   try {

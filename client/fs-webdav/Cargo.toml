@@ -8,7 +8,9 @@ license = "Apache-2.0"
 [dependencies]
 fs-provider = { path = "../fs-provider" }
 dav-server = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+# `sync` is the per-inode write lock (`tokio::sync::Mutex`, held across `.await`);
+# `time` bounds how long a second writer waits for it. See `WriteGuard` in src/lib.rs.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 futures-util = "0.3"

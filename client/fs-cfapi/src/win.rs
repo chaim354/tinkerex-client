@@ -23,7 +23,6 @@
 //! target on macOS (`cargo check --target x86_64-pc-windows-gnu`) + the `cfapi-windows` CI job.
 //! Gaps flagged `LIMITATION:`/`PHASE 2:`.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,14 +66,24 @@ struct CfState {
     /// the new-file capture branch (Phase 2b). The close callback only gets the full on-disk
     /// path, so it needs the root to map back into the `Provider` tree.
     root: PathBuf,
-    /// Echo guard: paths we just converted to placeholders ourselves, each stamped with the
-    /// time we inserted it. Our own `CfConvertToPlaceholder` triggers another close, which would
-    /// otherwise re-enter the new-file branch; a fresh entry short-circuits that re-entry exactly
-    /// once. The timestamp makes it **self-healing**: if the convert-triggered close never
-    /// arrives (so the entry is never consumed), a later genuine edit at the same path finds the
-    /// entry stale (≥5 s old), drops it, and is captured normally — bounding any leak to a 5 s
-    /// window instead of permanently suppressing the next real change.
-    self_writes: Mutex<HashMap<String, std::time::Instant>>,
+    /// Echo guard: paths we just converted to placeholders ourselves. Our own
+    /// `CfConvertToPlaceholder` triggers another close, which would otherwise re-enter the
+    /// new-file branch; a fresh mark short-circuits that re-entry exactly once.
+    ///
+    /// A [`crate::SelfOps`] — the same tested type as `self_removes` below, keyed by the same
+    /// [`crate::normalize_path_key`], with the same self-healing TTL
+    /// ([`crate::SelfOps::ECHO_TTL`]): if the convert-triggered close never arrives (so the mark
+    /// is never consumed), a later genuine edit at the same path finds it stale, drops it, and is
+    /// captured normally — bounding any leak to that window instead of permanently suppressing
+    /// the next real change. This was an open-coded duplicate of `SelfOps` (same key function,
+    /// same TTL as a bare literal, same remove-on-hit) — two copies free to drift, and the last
+    /// untested copy of the logic.
+    ///
+    /// **A SEPARATE `SelfOps` FROM `self_removes`, DELIBERATELY — do not share one.** They guard
+    /// different callbacks that can name the SAME path: sharing would let a daemon-initiated
+    /// *remove* mark be consumed by this *convert-echo* check, silently disabling the push-loop
+    /// guard `self_removes` exists to be.
+    self_writes: crate::SelfOps,
     /// Set the instant teardown begins (before `CfDisconnectSyncRoot`). While true, callbacks
     /// still **mirror** the change into the provider/outbox (so a local edit/delete/rename made
     /// right before unmount is not lost), but **skip the re-entrant CfAPI calls**
@@ -89,11 +98,19 @@ struct CfState {
     /// instead of an O(tree) DFS. Shared (`Arc`) with the invalidator, which reads it + drops stale
     /// entries on rename/delete. A miss falls back to the tree walk, so it's always correct.
     path_index: Arc<crate::PathIndex>,
-    /// B6.3: transfer keys for FETCH_DATA hydrations the kernel asked us to **cancel** (the reading
-    /// app went away / the file was deleted mid-download). The streamed `fetch_data_callback`
-    /// checks this between slices and stops early; `cancel_fetch_data_callback` inserts the key.
-    /// A `HashSet<i64>` of `CF_CALLBACK_INFO::TransferKey`s.
-    cancelled_transfers: Mutex<std::collections::HashSet<i64>>,
+    /// B6.3: the **in-flight** FETCH_DATA hydrations, each carrying a cancel flag the streamed
+    /// `fetch_data_callback` polls between slices so it stops early when the kernel aborts a
+    /// transfer (the reading app went away / the file was deleted mid-download).
+    ///
+    /// This was a `HashSet<i64>` of *cancelled keys* — "a cancel happened for K", decoupled from
+    /// whether any transfer for K was running. It was inserted into unconditionally and removed
+    /// only on a successful consume, and the callback cleaned up at just 3 of its 8 exits, so a
+    /// cancel that raced the final remove or arrived for a transfer that had bailed early leaked
+    /// **for the process lifetime** — then aborted a LATER FETCH_DATA after its first slice, on a
+    /// path that issues no completion for the remainder, hanging the reader to the CfAPI timeout.
+    /// [`crate::TransferRegistry`] models live transfers instead and deregisters via RAII, so all
+    /// eight exits are covered with no manual `.remove()` to keep in step with a new `return`.
+    transfers: Arc<crate::TransferRegistry>,
     /// Echo guard for placeholder deletes/renames the **daemon itself** performs while applying a
     /// remote delete/move (`CfApiInvalidate::removed`/`moved`). Those FS ops fire `NOTIFY_DELETE` /
     /// `NOTIFY_RENAME`, which would otherwise mirror the change back into the `Provider` (re-enqueue
@@ -326,10 +343,10 @@ pub fn mount_full(
         hydrate,
         connection_key: Mutex::new(None),
         root: root.to_path_buf(),
-        self_writes: Mutex::new(HashMap::new()),
+        self_writes: crate::SelfOps::new(),
         shutting_down: shutting_down.clone(),
         path_index,
-        cancelled_transfers: Mutex::new(std::collections::HashSet::new()),
+        transfers: Arc::new(crate::TransferRegistry::new()),
         self_removes,
     }));
 
@@ -893,6 +910,14 @@ unsafe extern "system" fn fetch_data_callback(
     }
     let state = &*state;
 
+    // F-53: register this transfer as in-flight for the whole callback. The guard's `Drop`
+    // deregisters on EVERY exit below — the teardown bail, the two identity/ino resolve failures, the
+    // empty-plan branch, a mid-stream read or `CfExecute` failure, the cancel, and the clean
+    // finish. The predecessor tracked *cancelled keys* and cleaned up at only three of those, so
+    // the rest leaked permanently and truncated a later read. Nothing here may `return` before
+    // this line without also being unable to leak (the two null guards above resolve no state).
+    let transfer = state.transfers.register(info.TransferKey);
+
     let fetch = params.Anonymous.FetchData;
     let req_offset = fetch.RequiredFileOffset;
     let req_length = fetch.RequiredLength;
@@ -995,13 +1020,7 @@ unsafe extern "system" fn fetch_data_callback(
                 );
                 let remaining = (req_offset + req_length) - chunk.offset as i64;
                 transfer_data_error(info, chunk.offset as i64, remaining);
-                // Clear any cancel marker for this key so it can't leak (minor-fix hygiene).
-                state
-                    .cancelled_transfers
-                    .lock()
-                    .unwrap()
-                    .remove(&info.TransferKey);
-                return;
+                return; // `transfer`'s Drop deregisters
             }
         };
         let op_info = op_info_for(info, CF_OPERATION_TYPE_TRANSFER_DATA);
@@ -1034,12 +1053,8 @@ unsafe extern "system" fn fetch_data_callback(
 
         // B6.3: honor a CANCEL_FETCH_DATA that arrived for this transfer — stop streaming further
         // slices (the kernel already knows the transfer is cancelled; no extra completion needed).
-        if state
-            .cancelled_transfers
-            .lock()
-            .unwrap()
-            .remove(&info.TransferKey)
-        {
+        // A relaxed atomic load, not a mutex acquisition, in the 16 MiB hydration loop.
+        if transfer.is_cancelled() {
             eprintln!(
                 "cfapi: FETCH_DATA node={node_id} cancelled mid-stream at off={}",
                 chunk.offset
@@ -1062,18 +1077,21 @@ unsafe extern "system" fn fetch_data_callback(
         transfer_data_error(info, tail_off, req_end - tail_off);
     }
 
-    // Done streaming cleanly — clear any (late) cancel marker for this key so it can't leak.
-    state
-        .cancelled_transfers
-        .lock()
-        .unwrap()
-        .remove(&info.TransferKey);
+    // Done streaming cleanly. `transfer`'s Drop deregisters — including a cancel that lands in the
+    // window after the last slice, which the old code could only consume by racing it.
 }
 
 /// CANCEL_FETCH_DATA: the platform aborts an in-flight hydration (the reading app closed the
-/// handle, or the file was deleted while downloading). Record the transfer key so the streaming
-/// [`fetch_data_callback`] loop stops before its next slice. No completion is issued — a cancel is
-/// not answered with `CfExecute` (the kernel owns the cancellation).
+/// handle, or the file was deleted while downloading). Raise the cancel flag on the **running**
+/// transfer so the streaming [`fetch_data_callback`] loop stops before its next slice. No
+/// completion is issued — a cancel is not answered with `CfExecute` (the kernel owns the
+/// cancellation).
+///
+/// A cancel for a key with no live transfer is **dropped**, which is the fix: recording it is what
+/// used to leak a permanent entry that truncated a later read. The trade is stated on
+/// [`crate::TransferRegistry`] — a cancel that beats its own fetch's registration is missed and
+/// that hydration streams to completion, which is benign (the kernel discards) where the leak was
+/// a reader hang.
 unsafe extern "system" fn cancel_fetch_data_callback(
     info: *const CF_CALLBACK_INFO,
     _params: *const CF_CALLBACK_PARAMETERS,
@@ -1087,12 +1105,11 @@ unsafe extern "system" fn cancel_fetch_data_callback(
         return;
     }
     let state = &*state;
-    eprintln!("cfapi: CANCEL_FETCH_DATA transfer_key={}", info.TransferKey);
-    state
-        .cancelled_transfers
-        .lock()
-        .unwrap()
-        .insert(info.TransferKey);
+    let found = state.transfers.cancel(info.TransferKey);
+    eprintln!(
+        "cfapi: CANCEL_FETCH_DATA transfer_key={} (in-flight: {found})",
+        info.TransferKey
+    );
 }
 
 /// B6.1 — reconcile a placeholder's **pin state** to its local bytes ("Always keep on this device"
@@ -1396,25 +1413,16 @@ unsafe extern "system" fn notify_file_close_callback(
 /// The convert itself fires another close on the same path; the `self_writes` echo guard
 /// short-circuits that one re-entry so we don't create a duplicate node.
 unsafe fn capture_new_file(state: &CfState, path: &str) {
-    // Echo guard (self-healing): if we just converted this path AND the entry is fresh
-    // (<5 s old), this close is the convert echo — consume it and skip exactly once. If the
-    // entry is stale (≥5 s, e.g. the convert-triggered close never arrived), drop it and fall
-    // through so a genuine edit isn't wrongly suppressed. Bounds any leak to a 5 s window.
-    // MINOR-fix: key `self_writes` by the NORMALIZED path (case/separator-insensitive), so an
-    // insert from one call site and a lookup from another (the watcher's `root.join(rel)` form vs
-    // the close callback's `VolumeDosName + NormalizedPath` form) collide — otherwise the guard was
-    // effectively dead for any path whose two spellings differed (e.g. subdir files).
-    let self_key = crate::normalize_path_key(path);
-    {
-        let mut seen = state.self_writes.lock().unwrap();
-        if let Some(&inserted) = seen.get(&self_key) {
-            seen.remove(&self_key);
-            if inserted.elapsed() < std::time::Duration::from_secs(5) {
-                eprintln!("cfapi: new file {path} — echo of our own convert, suppressed");
-                return; // fresh — the convert echo; suppress
-            }
-            // stale — fall through and capture normally
-        }
+    // Echo guard (self-healing): if we just converted this path AND the mark is fresh, this close
+    // is the convert echo — `take` consumes it and we skip exactly once. A stale mark is dropped
+    // and we fall through, so a genuine edit isn't wrongly suppressed. `SelfOps` keys by the
+    // NORMALIZED path (case/separator-insensitive), so a `mark` from one call site and a `take`
+    // from another (the watcher's `root.join(rel)` form vs the close callback's
+    // `VolumeDosName + NormalizedPath` form) collide — otherwise the guard is effectively dead for
+    // any path whose two spellings differ (e.g. subdir files).
+    if state.self_writes.take(path) {
+        eprintln!("cfapi: new file {path} — echo of our own convert, suppressed");
+        return; // fresh — the convert echo; suppress
     }
 
     // Map the absolute on-disk path back into the library tree.
@@ -1533,11 +1541,7 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
     // Convert the real on-disk file into a placeholder carrying our identity so future closes
     // take the edit path (content-compare). Mark in-sync — the bytes are already correct locally
     // and the sync loop will push them. Guard the echo (our convert fires another close).
-    state
-        .self_writes
-        .lock()
-        .unwrap()
-        .insert(self_key.clone(), std::time::Instant::now());
+    state.self_writes.mark(path);
     let identity = FileIdentity::from_node_id(&node_id);
     let path_w = path_wide(Path::new(path));
     match CreateFileW(
@@ -1575,14 +1579,14 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
                 Err(e) => {
                     eprintln!("cfapi: new file CfConvertToPlaceholder(node={node_id}) failed: {e}");
                     // The convert didn't fire its own close, so drop the echo guard we inserted.
-                    state.self_writes.lock().unwrap().remove(&self_key);
+                    let _ = state.self_writes.take(path);
                 }
             }
             let _ = CloseHandle(handle);
         }
         Err(e) => {
             eprintln!("cfapi: new file open(node={node_id}) failed: {e}");
-            state.self_writes.lock().unwrap().remove(&self_key);
+            let _ = state.self_writes.take(path);
         }
     }
 }

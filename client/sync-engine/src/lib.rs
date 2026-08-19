@@ -483,16 +483,17 @@ impl SyncEngine {
 
             if resp.changes.is_empty() {
                 // Caught up. Final retry of any still-buffered upserts (a parent may have
-                // landed in the last page); `dropped` is true if any remained unresolvable.
-                let dropped = retry_deferred(provider, &mut deferred, inval, true);
+                // landed in the last page). `RetryOutcome::diverged` folds BOTH of that pass's
+                // signals — a node left unresolvable and dropped, AND a displacement one of its
+                // applies caused. The second was discarded entirely until 2026-08-19.
+                let retry = retry_deferred(provider, &mut deferred, inval, true);
                 // A dropped (still-parentless) upsert OR a clobbered-pending displacement
                 // means the changelog delta did not fully converge the local tree to the
                 // server. Fall back to the documented reconcile floor so the missing/displaced
                 // node is re-added (it's still live on the server). Mark dirty FIRST so the
                 // reconcile is retried on the next tick if it can't fully converge yet (the
                 // racing peer's push may not have landed); `pull_snapshot` clears it.
-                if needs_reconcile || dropped {
-                    let _ = provider.set_needs_resync(true);
+                if raise_reconcile_floor(provider, needs_reconcile || retry.diverged()) {
                     let head = Self::pull_snapshot(provider, client)?;
                     let _ = provider.set_needs_resync(false);
                     return Ok(head);
@@ -505,8 +506,14 @@ impl SyncEngine {
                 }
             }
             // A parent applied this page may unblock a buffered child — retry now (mid-page:
-            // unresolved nodes stay buffered for later pages, nothing dropped).
-            retry_deferred(provider, &mut deferred, inval, false);
+            // unresolved nodes stay buffered for later pages, nothing dropped). Its return was
+            // DISCARDED until 2026-08-19, which lost a mid-page displacement outright: `dropped`
+            // is false here by design (leftovers are retained, not decided), but a
+            // `displaced_pending` is a real, permanent divergence and must survive to the
+            // end-of-pull decision above.
+            if retry_deferred(provider, &mut deferred, inval, false).diverged() {
+                needs_reconcile = true;
+            }
             // Advance only as far as we actually applied; loop for the next page.
             cursor = resp.changes.last().map(|c| c.seq).unwrap_or(cursor);
         }
@@ -1369,21 +1376,54 @@ fn apply_change(
     } else if let Some(sn) = change_to_sync(ch) {
         // Defer (don't abort) if the parent isn't present locally yet — see BUG #2. The
         // parent's own upsert may arrive later in this same delta; `retry_deferred` reapplies.
-        return apply_upsert(provider, sn, inval, deferred);
+        return Ok(matches!(
+            apply_upsert(provider, sn, inval, deferred)?,
+            Applied::Clean {
+                displaced_pending: true
+            }
+        ));
     }
     Ok(false)
+}
+
+/// What [`apply_upsert`] did with one remote upsert — the engine's SINGLE reading of the
+/// provider's six-field [`fs_provider::ApplyOutcome`].
+///
+/// It exists so `retry_deferred` can DELEGATE to `apply_upsert` rather than re-implement it: a
+/// plain `bool` cannot tell "applied" from "buffered for retry", and that distinction is what
+/// drives the retry loop's `progress` flag. Before this type there were two hand-written
+/// readings of `ApplyOutcome` and the second (`retry_deferred`'s) silently dropped
+/// `displaced_pending` — a clobbered pending local node whose reconcile floor therefore never
+/// fired, i.e. permanent silent loss on the one path that skipped the guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// Applied to the local tree. `displaced_pending` is the provider's own signal that the
+    /// collision sweep hard-deleted a DIFFERENT local node that still carried a pending outbox
+    /// entry — the delta can never re-add it, so the caller MUST reach the reconcile floor.
+    Clean { displaced_pending: bool },
+    /// Parent not present locally yet (`NotFound`) or applying now would create a cycle
+    /// (`InvalidArgument`) → the node was pushed into `deferred` for retry. Nothing applied.
+    Deferred,
+    /// BUG #1: the node itself carries an un-pushed local edit, so `apply_remote` deliberately
+    /// left the local row untouched. **Not a reconcile signal and not progress** — nothing
+    /// changed, the local node is intact and still live, and its queued push is what surfaces
+    /// the conflict server-side. Treating this as a divergence would turn every conflicting
+    /// edit into a full-tree resync.
+    SkippedDirtyLocal,
 }
 
 /// Apply one upsert `SyncNode`, deferring it (buffering for retry) instead of erroring if
 /// its parent isn't present locally yet. Any *other* provider error still propagates. On a
 /// successful apply, fires the appropriate OS-cache invalidation hook.
-/// Returns `true` if the apply clobbered a pending local node (`displaced_pending`).
+///
+/// **This is the ONLY caller of `apply_remote` for an upsert.** `retry_deferred` delegates here
+/// rather than keeping a second copy of the dispatch.
 fn apply_upsert(
     provider: &SqliteProvider,
     sn: SyncNode,
     inval: Option<&dyn Invalidate>,
     deferred: &mut Vec<SyncNode>,
-) -> Result<bool> {
+) -> Result<Applied> {
     match provider.apply_remote(&sn) {
         Ok(outcome) => {
             if outcome.dirty_local {
@@ -1395,7 +1435,7 @@ fn apply_upsert(
                 // sends the local content against its stale base → the server records a real
                 // conflict (keep/split) instead of a silent loss. Not a reconcile signal (the
                 // local node is intact and still live).
-                return Ok(false);
+                return Ok(Applied::SkippedDirtyLocal);
             }
             if let Some(inval) = inval {
                 if outcome.inserted {
@@ -1416,7 +1456,9 @@ fn apply_upsert(
                     inval.invalidate(outcome.ino);
                 }
             }
-            Ok(outcome.displaced_pending)
+            Ok(Applied::Clean {
+                displaced_pending: outcome.displaced_pending,
+            })
         }
         // Parent not present locally yet (`NotFound`) OR applying this re-parent now would
         // create a cycle (`InvalidArgument` — the new parent is the node itself or one of its
@@ -1431,68 +1473,103 @@ fn apply_upsert(
         // is an INSERT, not an error).
         Err(fs_provider::FsError::NotFound | fs_provider::FsError::InvalidArgument) => {
             deferred.push(sn);
-            Ok(false)
+            Ok(Applied::Deferred)
         }
         Err(e) => Err(e.into()),
     }
 }
 
-/// Re-apply buffered (parentless) upserts, looping until no further progress — a parent
-/// applied this round may unblock a child. Returns `true` if any node remained unresolvable
-/// at the fixed point.
+/// Raise the sticky reconcile floor when this pull failed to converge the local tree, and say
+/// whether the caller must now run `pull_snapshot`. One statement, one place, so a test can
+/// drive the whole decision without a server — and so the flag can never be set by one caller
+/// and read by another that composed the condition differently.
+fn raise_reconcile_floor(provider: &SqliteProvider, diverged: bool) -> bool {
+    if !diverged {
+        return false;
+    }
+    let _ = provider.set_needs_resync(true);
+    true
+}
+
+/// What one [`retry_deferred`] pass concluded. Two independent signals, both meaning "the
+/// changelog delta alone did not converge this device" — see [`Self::diverged`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RetryOutcome {
+    /// A buffered upsert stayed unresolvable at the fixed point and was dropped. Only ever
+    /// true on the final pass; mid-page leftovers are RETAINED for a later page, not decided.
+    dropped: bool,
+    /// An apply during this pass clobbered a pending local node ([`Applied::Clean`]'s
+    /// `displaced_pending`). Discarded entirely before 2026-08-19 — the displaced row is hard
+    /// deleted, its queued outbox upsert then pushes as a no-op, and without this the loss is
+    /// silent and permanent.
+    displaced_pending: bool,
+}
+
+impl RetryOutcome {
+    /// Did this pass leave the local tree diverged from the server? Either signal alone is
+    /// enough; both are answered by the reconcile floor (`pull_snapshot`).
+    fn diverged(&self) -> bool {
+        self.dropped || self.displaced_pending
+    }
+}
+
+/// Re-apply buffered (parentless / would-cycle) upserts, looping until no further progress — a
+/// parent applied this round may unblock a child. Every apply goes through [`apply_upsert`], so
+/// there is exactly ONE reading of `ApplyOutcome` in this crate; this function's whole job is
+/// the fixed point plus the two signals in [`RetryOutcome`].
 ///
 /// `final_pass` distinguishes the two call sites:
 ///   - mid-page (`false`): leftover unresolvable nodes are RETAINED in `deferred` — their
-///     parent may arrive on a LATER page — and `false` is returned (no decision yet).
+///     parent may arrive on a LATER page — so `dropped` stays false (no decision yet).
+///     `displaced_pending` is still reported: a displacement already happened and is permanent.
 ///   - end-of-pull (`true`): leftovers are genuinely unresolvable from the delta; they are
-///     dropped and `true` is returned so the caller reconciles from the full tree
+///     dropped and `dropped` is true so the caller reconciles from the full tree
 ///     (`pull_snapshot`, the correctness floor) rather than silently losing them (BUG #2).
 fn retry_deferred(
     provider: &SqliteProvider,
     deferred: &mut Vec<SyncNode>,
     inval: Option<&dyn Invalidate>,
     final_pass: bool,
-) -> bool {
+) -> RetryOutcome {
+    let mut out = RetryOutcome::default();
     if deferred.is_empty() {
-        return false;
+        return out;
     }
     let mut progress = true;
     while progress && !deferred.is_empty() {
         progress = false;
+        // `apply_upsert` re-pushes anything still unresolvable into this same (now emptied)
+        // vec, which is exactly the buffering this loop wants — do NOT also push here.
         let pending = std::mem::take(deferred);
         for sn in pending {
-            match provider.apply_remote(&sn) {
-                Ok(outcome) => {
+            match apply_upsert(provider, sn, inval, deferred) {
+                Ok(Applied::Clean { displaced_pending }) => {
                     progress = true;
-                    if let Some(inval) = inval {
-                        if outcome.inserted {
-                            inval.created(outcome.ino);
-                        } else if outcome.moved {
-                            inval.moved(outcome.ino);
-                        } else if outcome.content_changed {
-                            inval.invalidate(outcome.ino);
-                        }
-                    }
+                    out.displaced_pending |= displaced_pending;
                 }
                 // Still parent-not-present, or still would-cycle (a later page / a yet-to-retry
-                // sibling may resolve either) → keep buffered.
-                Err(fs_provider::FsError::NotFound | fs_provider::FsError::InvalidArgument) => {
-                    deferred.push(sn)
-                }
+                // sibling may resolve either) → already re-buffered by `apply_upsert`.
+                Ok(Applied::Deferred) => {}
+                // BUG #1: nothing was applied and the local row is intact, so this is neither
+                // progress nor a divergence. The node leaves the buffer (a retry would take the
+                // same branch forever); its queued push surfaces the conflict server-side.
+                Ok(Applied::SkippedDirtyLocal) => {}
                 // A non-parent error on a deferred node: log + drop (don't poison the pull).
+                // `apply_upsert` propagates these with `?`; the direct path wants that, but here
+                // a transient DB error must not abort a pull that is otherwise converging.
                 Err(e) => eprintln!("retry_deferred: dropping node after error: {e}"),
             }
         }
     }
     if !final_pass {
-        // Mid-page: keep unresolved nodes buffered for a later page; no drop, no signal.
-        return false;
+        // Mid-page: keep unresolved nodes buffered for a later page; no drop.
+        return out;
     }
     // Whatever remains is unresolvable from the delta alone — drop it and tell the caller to
     // reconcile (don't silently lose it: it may still be live on the authoritative tree).
-    let dropped = !deferred.is_empty();
+    out.dropped = !deferred.is_empty();
     deferred.clear();
-    dropped
+    out
 }
 
 fn change_to_sync(ch: &Change) -> Option<SyncNode> {
@@ -1546,9 +1623,9 @@ mod apply_tests {
     //! verified on any host (the CfAPI FFI that actually removes the on-disk placeholder is
     //! Windows-only and verified live).
     use super::*;
-    use fs_provider::{ChunkConfig, LocalChunkStore};
+    use fs_provider::{ChunkConfig, LocalChunkStore, Provider};
     use std::sync::Mutex;
-    use sync_client::NodeView;
+    use sync_client::{ChunkRef, NodeView};
 
     const TINY: ChunkConfig = ChunkConfig {
         min: 64,
@@ -1785,7 +1862,7 @@ mod apply_tests {
         );
 
         // End-of-pull drain: the cycle can't resolve from the delta alone → dropped, reconcile.
-        let dropped = retry_deferred(&p, &mut deferred, None, true);
+        let dropped = retry_deferred(&p, &mut deferred, None, true).dropped;
         assert!(
             dropped,
             "an unresolvable cyclic upsert is dropped → caller hits the reconcile floor"
@@ -1823,7 +1900,7 @@ mod apply_tests {
 
         // Retry the buffered cyclic upsert: it now applies cleanly. final_pass=true, but nothing
         // remains → no drop, no reconcile floor.
-        let dropped = retry_deferred(&p, &mut deferred, None, true);
+        let dropped = retry_deferred(&p, &mut deferred, None, true).dropped;
         assert!(!dropped, "the interleaving resolved → no reconcile floor");
         assert!(deferred.is_empty());
         assert!(
@@ -1861,9 +1938,139 @@ mod apply_tests {
         );
         assert!(tree_is_acyclic_reachable(&p), "tree stays reachable");
 
-        let dropped = retry_deferred(&p, &mut deferred, None, true);
+        let dropped = retry_deferred(&p, &mut deferred, None, true).dropped;
         assert!(dropped, "still unresolvable → reconcile floor");
         assert!(tree_is_acyclic_reachable(&p));
+    }
+
+    /// **F-51.** A deferred upsert that APPLIES on retry can still clobber a pending local node —
+    /// and `retry_deferred` used to discard that `displaced_pending`, so the reconcile floor never
+    /// fired and the displaced node was lost permanently (its queued outbox upsert pushes as a
+    /// no-op once the row is hard-deleted; see `ApplyOutcome::displaced_pending`).
+    ///
+    /// The interleaving is ordinary, not exotic: `apply_upsert` defers on `InvalidArgument` (a
+    /// would-be cycle) as well as `NotFound`, and a cycle-deferred node ALREADY EXISTS locally —
+    /// so when a later delta entry breaks the cycle, the retry lands the node on a `(parent, name)`
+    /// a local create is holding with an un-pushed outbox entry.
+    ///
+    /// Asserts the persistent `needs_resync` FLAG, not a returned bool: that flag is what a
+    /// subsequent tick reads, and it is nil-until-written, so a regression cannot leave it
+    /// coincidentally right.
+    #[test]
+    fn a_displacement_on_the_deferred_retry_path_raises_the_reconcile_floor() {
+        let p = provider();
+        let mut deferred = Vec::new();
+
+        // ROOT → X → Y, both from the server.
+        apply_change(&p, &dir_upsert("X", None, "X"), None, &mut deferred).unwrap();
+        apply_change(&p, &dir_upsert("Y", Some("X"), "Y"), None, &mut deferred).unwrap();
+        let y_ino = p.ino_for_node_id("Y").unwrap().expect("Y is local");
+
+        // A LOCAL file at (Y, "x") with an un-pushed outbox upsert — un-synced local intent.
+        let f = p.create(y_ino, "x").unwrap();
+        p.write(f.ino, 0, b"local work").unwrap();
+        p.flush(f.ino).unwrap();
+        let f_id = p.node_id_for(f.ino).unwrap().unwrap();
+        assert!(
+            p.outbox_list()
+                .unwrap()
+                .iter()
+                .any(|(id, op)| id == &f_id && op == "upsert"),
+            "precondition: the local file's create is queued (un-pushed)"
+        );
+
+        // Delta entry 1: X moves under Y and takes the name "x". Y is X's descendant right now,
+        // so this would CYCLE → deferred, nothing applied, no signal yet.
+        let r1 = apply_change(&p, &dir_upsert("X", Some("Y"), "x"), None, &mut deferred).unwrap();
+        assert!(!r1, "the deferral itself signals nothing");
+        assert_eq!(deferred.len(), 1, "the cyclic upsert is buffered");
+
+        // Delta entry 2: Y moves out to ROOT, breaking the cycle. Applies cleanly, no collision.
+        let r2 = apply_change(&p, &dir_upsert("Y", None, "Y"), None, &mut deferred).unwrap();
+        assert!(!r2, "moving Y out displaces nothing");
+
+        // End-of-pull retry: X now applies under Y as "x" — and its collision sweep hard-deletes
+        // the local (pending) file that held that name.
+        let retry = retry_deferred(&p, &mut deferred, None, true);
+        assert!(
+            !retry.dropped,
+            "the cycle resolved, so nothing was dropped — `dropped` alone cannot carry this"
+        );
+        assert!(
+            retry.displaced_pending,
+            "the retry clobbered a pending local node and must SAY SO"
+        );
+        assert!(
+            p.ino_for_node_id(&f_id).unwrap().is_none(),
+            "the local file really was swept out of the tree"
+        );
+
+        // The caller's own decision, through the one shared reading of it.
+        assert!(
+            raise_reconcile_floor(&p, retry.diverged()),
+            "a displacement means the delta did not converge → reconcile"
+        );
+        assert!(
+            p.needs_resync().unwrap(),
+            "the sticky reconcile floor must be raised, or the displaced node is lost for good"
+        );
+    }
+
+    /// The other half of the same rule: a BUG #1 dirty-local skip is NOT a divergence. Nothing was
+    /// applied and the local row is intact, so raising the reconcile floor here would turn every
+    /// conflicting edit into a full-tree resync (and `pull_snapshot` would overwrite the very edit
+    /// the skip exists to preserve).
+    #[test]
+    fn a_dirty_local_skip_is_not_a_reconcile_signal() {
+        let p = provider();
+        let mut deferred = Vec::new();
+        apply_change(&p, &dir_upsert("D", None, "D"), None, &mut deferred).unwrap();
+        let d_ino = p.ino_for_node_id("D").unwrap().unwrap();
+
+        // A local file with an un-pushed edit.
+        let f = p.create(d_ino, "f.txt").unwrap();
+        p.write(f.ino, 0, b"my local edit").unwrap();
+        p.flush(f.ino).unwrap();
+        let f_id = p.node_id_for(f.ino).unwrap().unwrap();
+
+        // The server sends a DIFFERENT manifest for that same node → dirty_local.
+        let mut ch = upsert_change(&f_id, Some("D"), "f.txt");
+        ch.manifest = Some(vec![ChunkRef {
+            hash: "0".repeat(64),
+            offset: 0,
+            length: 7,
+        }]);
+        // The narrowest true thing: the handler must NAME this outcome, because `retry_deferred`
+        // branches on the variant. Reported as `Clean` it becomes "progress" there, and reported
+        // as `Clean { displaced_pending: true }` it becomes a full-tree resync on every
+        // conflicting edit — which would overwrite the very local edit the skip exists to keep.
+        let sn = change_to_sync(&ch).unwrap();
+        assert_eq!(
+            apply_upsert(&p, sn, None, &mut deferred).unwrap(),
+            Applied::SkippedDirtyLocal,
+            "an un-pushed local edit is SKIPPED, not applied, deferred, or displaced"
+        );
+
+        let signaled = apply_change(&p, &ch, None, &mut deferred).unwrap();
+        assert!(!signaled, "a dirty-local skip is not a reconcile signal");
+        assert!(
+            deferred.is_empty(),
+            "a dirty-local skip is not buffered for retry either"
+        );
+        assert!(
+            !raise_reconcile_floor(&p, signaled),
+            "nothing diverged, so no floor"
+        );
+        assert!(
+            !p.needs_resync().unwrap(),
+            "a conflicting local edit must NOT trigger a full-tree resync"
+        );
+        let size = p.getattr(f.ino).unwrap().size as u32;
+        assert_eq!(
+            p.read(f.ino, 0, size).unwrap(),
+            b"my local edit",
+            "the local edit is preserved untouched"
+        );
     }
 }
 

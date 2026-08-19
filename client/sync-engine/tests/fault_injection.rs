@@ -510,6 +510,11 @@ impl HermeticEngine {
     /// end-of-pull, the pull ITSELF triggers the full-tree reconcile (`reconcile_full` here =
     /// `pull_snapshot` in production). So the harness exercises the same self-healing path
     /// production runs — convergence is NOT propped up by an externally-injected reconcile.
+    ///
+    /// That claim was only ever true of the DIRECT path until 2026-08-19: the retry path's
+    /// `displaced_pending` was dropped on the floor here exactly as it was in production. Both
+    /// now read it (see [`RetryOutcome`]). One fidelity gap remains and is deliberate — the
+    /// `NotFound`-only deferral, documented on `retry_deferred` and on `BACKSTOP_NEEDED`.
     fn pull_changes(
         provider: &SqliteProvider,
         cloud: &MockCloud,
@@ -570,11 +575,11 @@ impl HermeticEngine {
                 if let Some(limit) = interrupt_after {
                     if applied >= limit {
                         // mid-pull crash: flush what we can defer-resolve, then stop.
-                        let dropped = retry_deferred(provider, &mut deferred);
+                        let retry = retry_deferred(provider, &mut deferred);
                         let r = Self::settle_reconcile(
                             provider,
                             cloud,
-                            needs_reconcile || dropped,
+                            needs_reconcile || retry.diverged(),
                             allow_clear,
                         );
                         return (cursor, r);
@@ -582,8 +587,13 @@ impl HermeticEngine {
                 }
             }
         }
-        let dropped = retry_deferred(provider, &mut deferred);
-        let r = Self::settle_reconcile(provider, cloud, needs_reconcile || dropped, allow_clear);
+        let retry = retry_deferred(provider, &mut deferred);
+        let r = Self::settle_reconcile(
+            provider,
+            cloud,
+            needs_reconcile || retry.diverged(),
+            allow_clear,
+        );
         (cursor.max(cloud.head_seq), r)
     }
 
@@ -642,28 +652,57 @@ impl HermeticEngine {
     }
 }
 
+/// Mirror of production's `sync_engine::RetryOutcome` — the TWO signals a retry pass produces.
+/// It was a bare `bool` (`dropped` only) until 2026-08-19, faithfully reproducing the very defect
+/// the harness exists to catch: the harness's `retry_deferred` discarded `ApplyOutcome` wholesale
+/// while the direct path beside it read `displaced_pending`, so no seed could ever observe a
+/// displacement on the deferred-retry path. Compare `test/support/fake_s3.rb` (CLAUDE.md §14e) —
+/// a double written from the implementation rather than from the contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RetryOutcome {
+    dropped: bool,
+    displaced_pending: bool,
+}
+impl RetryOutcome {
+    fn diverged(&self) -> bool {
+        self.dropped || self.displaced_pending
+    }
+}
+
 /// Re-apply deferred upserts whose parent was missing, looping until no further progress
-/// (a parent applied this round may unblock a child). Returns `true` if any node remained
-/// unresolvable at the fixed point and had to be dropped — the caller then reconciles from
-/// the full tree (production `pull_snapshot`) rather than silently losing it. Mirrors the
-/// production `sync_engine::retry_deferred` return contract.
-fn retry_deferred(provider: &SqliteProvider, deferred: &mut Vec<SyncNode>) -> bool {
+/// (a parent applied this round may unblock a child). Reports `dropped` if any node remained
+/// unresolvable at the fixed point, and `displaced_pending` if an apply here clobbered a local
+/// node with a pending outbox entry — the caller then reconciles from the full tree (production
+/// `pull_snapshot`) rather than silently losing it. Mirrors the production
+/// `sync_engine::retry_deferred` CONTRACT (both signals), not merely its old return type.
+///
+/// **Known fidelity gap, deliberately not closed here:** production also defers on
+/// `InvalidArgument` (a would-be cycle); this harness `panic!`s on anything but `NotFound`, so it
+/// never exercises that arm. Widening it surfaces real convergence failures in the randomized
+/// sweep and is a separate change.
+fn retry_deferred(provider: &SqliteProvider, deferred: &mut Vec<SyncNode>) -> RetryOutcome {
+    let mut out = RetryOutcome::default();
     let mut progress = true;
     while progress && !deferred.is_empty() {
         progress = false;
         let mut still: Vec<SyncNode> = Vec::new();
         for n in deferred.drain(..) {
             match provider.apply_remote(&n) {
-                Ok(_) => progress = true,
+                Ok(outcome) => {
+                    // BUG #1: a dirty-local skip applies nothing, so it is not progress (and is
+                    // not a divergence either — production says the same).
+                    progress |= !outcome.dirty_local;
+                    out.displaced_pending |= outcome.displaced_pending;
+                }
                 Err(fs_provider::FsError::NotFound) => still.push(n),
                 Err(other) => panic!("retry_deferred unexpected error: {other}"),
             }
         }
         *deferred = still;
     }
-    let dropped = !deferred.is_empty();
+    out.dropped = !deferred.is_empty();
     deferred.clear();
-    dropped
+    out
 }
 
 thread_local! {
@@ -691,6 +730,33 @@ thread_local! {
     /// when it sees that signal — production now ACTUALLY self-heals rather than silently losing
     /// the node. So this counter is the residual where the delta needs the (now-real) reconcile;
     /// silent loss is impossible (it would panic the assertion).
+    ///
+    /// **2026-08-19 (F-51) — the counter did NOT move, and why that is the interesting part.**
+    /// Production's `retry_deferred` was discarding `displaced_pending`, and so was this file's
+    /// (`Ok(_) => progress = true`). Honouring it in both raises the reconcile rate *in
+    /// production*, and the expectation was that this counter would rise with it. Measured before
+    /// and after at the default 150 seeds × 200 ops: **50/150 both times.** Probed rather than
+    /// argued — an `eprintln` on every `displaced_pending` seen inside this file's `retry_deferred`
+    /// fired **zero** times across the whole sweep.
+    ///
+    /// The reason is one layer below the signal: this harness defers on `NotFound` **only**
+    /// (production also defers a would-be cycle, `InvalidArgument`), and a node whose parent is
+    /// absent locally cannot collide with a local node under that same absent parent. Reaching the
+    /// collision therefore needs a local write landing between the parent's apply and the retry —
+    /// and a single-threaded pull has no such window. So the sweep cannot *generate* the case at
+    /// all; it is not that its assertions would miss the result.
+    ///
+    /// AND IT IS WIDER THAN A MISSING COLLISION, which review instrumentation established and this
+    /// comment previously understated. The wording above implies retries succeed and merely fail to
+    /// collide. They do not succeed: across 150 seeds this `retry_deferred` is entered with a
+    /// non-empty buffer **30** times and applies a deferred node successfully **ZERO** times —
+    /// every buffered node stays `NotFound` and is dropped. So the whole `Ok` arm of this harness's
+    /// retry, including the `progress |= !outcome.dirty_local` beside it, is **dead across every
+    /// seed**. Do not cite this sweep as coverage of the retry path at all; only the deterministic
+    /// test below covers it. `deferred_retry_that_displaces_a
+    /// _pending_node_signals_reconcile` pins it deterministically instead. Widening the deferral
+    /// to `InvalidArgument` would let the sweep reach it, and is a separate change — it is
+    /// expected to surface real convergence failures, and it WOULD move this number.
     static BACKSTOP_NEEDED: std::cell::RefCell<u64> = const { std::cell::RefCell::new(0) };
 }
 
@@ -1357,6 +1423,81 @@ fn bug_move_out_then_delete_parent_aborts_changelog_pull() {
 
     eprintln!(
         "BUG #2: old raw-seq-order path would have aborted on NotFound: {old_path_would_abort}"
+    );
+}
+
+/// **F-51 — the harness's own blind spot, pinned deterministically.**
+///
+/// A buffered upsert that APPLIES on retry can still clobber a local node holding a pending
+/// outbox entry. `retry_deferred` here discarded the whole `ApplyOutcome` (`Ok(_) => progress =
+/// true`) while the direct path two functions up read `displaced_pending` — the same asymmetry
+/// production had, faithfully reproduced, so no seed of the randomized sweep could observe it.
+///
+/// Deterministic on purpose: the sweep is **green today with the bug present** and therefore
+/// cannot demonstrate that honouring the signal carries any weight. It also cannot GENERATE this
+/// case — its `retry_deferred` defers on `NotFound` alone, and a node whose parent is absent
+/// cannot collide with a local node under that same absent parent, so reaching the collision
+/// needs a local write between the parent's apply and the retry, which a single-threaded pull has
+/// no window for. (The sweep's terminal assertion IS signal-independent — it diffs the whole tree
+/// against the cloud and panics "SILENT LOSS" — so it would go red if it could ever build the
+/// scenario. It cannot; that is the weaker half of the `FakeS3` shape, not the same half.)
+///
+/// So this drives `retry_deferred` on a hand-built buffer, which is exactly its input contract:
+/// R arrived on an earlier page while its parent D was still absent, D landed, the user created
+/// `D/x` locally in the meantime, and now the retry runs.
+#[test]
+fn deferred_retry_that_displaces_a_pending_node_signals_reconcile() {
+    let (p, _d) = device();
+    let cloud = MockCloud::new();
+
+    // D exists locally, with a LOCAL file `D/x` whose create is still queued (un-pushed).
+    let d = p.mkdir(ROOT_INO, "D").unwrap();
+    let d_id = p.node_id_for(d.ino).unwrap().unwrap();
+    let f = p.create(d.ino, "x").unwrap();
+    p.write(f.ino, 0, b"local work").unwrap();
+    p.flush(f.ino).unwrap();
+    let f_id = p.node_id_for(f.ino).unwrap().unwrap();
+    assert!(
+        p.outbox_list()
+            .unwrap()
+            .iter()
+            .any(|(id, op)| id == &f_id && op == "upsert"),
+        "precondition: the local file's create is queued (un-pushed)"
+    );
+
+    // The buffered remote node: a DIFFERENT node_id claiming (D, "x").
+    let mut deferred = vec![SyncNode {
+        node_id: "remote-R".into(),
+        parent_node_id: Some(d_id),
+        name: "x".into(),
+        kind: Kind::File,
+        manifest_id: None,
+        chunks: vec![],
+        version_id: Some("vR".into()),
+        mode: 0o644,
+        mtime: 0,
+        symlink_target: None,
+    }];
+
+    let retry = retry_deferred(&p, &mut deferred);
+    assert!(
+        !retry.dropped,
+        "the parent is present now, so nothing was dropped — `dropped` alone cannot carry this"
+    );
+    assert!(
+        retry.displaced_pending,
+        "the retry clobbered a pending local node and must SAY SO"
+    );
+    assert!(
+        p.ino_for_node_id(&f_id).unwrap().is_none(),
+        "the local file really was swept out of the tree"
+    );
+
+    // And the harness's caller composes it the way production does.
+    HermeticEngine::settle_reconcile(&p, &cloud, retry.diverged(), false);
+    assert!(
+        p.needs_resync().unwrap(),
+        "the sticky reconcile floor must be raised, or the displaced node is lost for good"
     );
 }
 

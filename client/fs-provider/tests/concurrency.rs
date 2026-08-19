@@ -141,3 +141,204 @@ fn chunkstore_put_is_idempotent_dedup() {
     assert!(store.has(hash));
     assert_eq!(store.get(hash).unwrap(), b"first");
 }
+
+// ---------------------------------------------------------------------------
+// Lock-order regression: `staging` must be a LEAF lock.
+//
+// The mount thread and the sync thread share one `Arc<SqliteProvider>`
+// (`sync-engine/src/daemon.rs` puts the FUSE session on its own thread), so both of the
+// provider's mutexes are contended by design. `getattr` on an inode that is open for
+// write used to take `staging` and then, still holding it, `conn`; every caller of
+// `purge_inode_state` (`unlink`, `rmdir`, `rename`, `apply_remote`) holds `conn` at
+// function scope and then takes `staging`. That is a textbook ABBA inversion and it
+// wedges the mount — only a remount clears it.
+//
+// **These tests must never `join()` their workers.** `std::thread::JoinHandle` has no
+// timed join, so joining a deadlocked thread hangs the runner forever, and
+// `.github/workflows/rust-client.yml` runs this suite on the single registered
+// self-hosted mac. Instead each worker bumps an `AtomicU64` and the test thread watches
+// both counters: when neither moves for `FROZEN_TICKS` consecutive samples the test
+// PANICS (a red test, seconds long) rather than hanging. Wedged workers stay detached
+// and die with the test binary.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use fs_provider::{Kind, SqliteProvider, SyncNode};
+
+const TICK: Duration = Duration::from_millis(50);
+/// Neither side moving for this many consecutive samples (2 s) is a deadlock, not a
+/// slow machine — the reproduced wedge happens in well under one second.
+const FROZEN_TICKS: u32 = 40;
+const DEADLINE: Duration = Duration::from_secs(30);
+/// Iterations each side must complete before the pairing counts as proven live.
+const TARGET: u64 = 200;
+
+/// Sample two progress counters until both pass `TARGET`, panicking if they freeze
+/// together (deadlock) or the deadline expires. Never touches the worker threads.
+fn watch_progress(label: &str, a: &AtomicU64, b: &AtomicU64, stop: &AtomicBool) {
+    let start = Instant::now();
+    let (mut last_a, mut last_b) = (u64::MAX, u64::MAX);
+    let mut frozen = 0u32;
+    loop {
+        thread::sleep(TICK);
+        let (na, nb) = (a.load(Ordering::Relaxed), b.load(Ordering::Relaxed));
+        if na >= TARGET && nb >= TARGET {
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+        if na == last_a && nb == last_b {
+            frozen += 1;
+            if frozen >= FROZEN_TICKS {
+                stop.store(true, Ordering::Relaxed);
+                panic!(
+                    "deadlocked ({label}): getattr={na} {label}={nb} — both counters frozen for {:?}",
+                    TICK * FROZEN_TICKS
+                );
+            }
+        } else {
+            frozen = 0;
+        }
+        (last_a, last_b) = (na, nb);
+        if start.elapsed() > DEADLINE {
+            stop.store(true, Ordering::Relaxed);
+            panic!(
+                "timed out ({label}) after {:?}: getattr={na} {label}={nb}",
+                start.elapsed()
+            );
+        }
+    }
+}
+
+/// A file created and written but **never flushed** — so it stays in the staging map and
+/// every `getattr` on it takes the staged-size path. Returns its inode.
+fn permanently_staged(p: &SqliteProvider, name: &str) -> u64 {
+    let f = p.create(ROOT, name).unwrap();
+    p.write(f.ino, 0, b"open for write").unwrap();
+    f.ino
+}
+
+/// `getattr` on a staged inode (staging -> conn) against `unlink` (conn -> staging).
+#[test]
+fn getattr_on_staged_inode_does_not_deadlock_against_unlink() {
+    let p = Arc::new(provider());
+    let ino = permanently_staged(&p, "staged.bin");
+
+    let (gets, unlinks) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    {
+        let (p, gets, stop) = (Arc::clone(&p), Arc::clone(&gets), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // Staged length, not the committed row's zero.
+                assert_eq!(p.getattr(ino).unwrap().size, b"open for write".len() as u64);
+                gets.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+    {
+        let (p, unlinks, stop) = (Arc::clone(&p), Arc::clone(&unlinks), Arc::clone(&stop));
+        thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let name = format!("churn-{i}.bin");
+                let f = p.create(ROOT, &name).unwrap();
+                p.write(f.ino, 0, b"bytes").unwrap();
+                p.flush(f.ino).unwrap();
+                p.unlink(ROOT, &name).unwrap();
+                unlinks.fetch_add(1, Ordering::Relaxed);
+                i += 1;
+            }
+        });
+    }
+
+    watch_progress("unlink", &gets, &unlinks, &stop);
+}
+
+/// The same inversion via `rename`'s displaced-destination purge.
+#[test]
+fn getattr_on_staged_inode_does_not_deadlock_against_rename_replace() {
+    let p = Arc::new(provider());
+    let ino = permanently_staged(&p, "staged.bin");
+
+    let (gets, renames) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    {
+        let (p, gets, stop) = (Arc::clone(&p), Arc::clone(&gets), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                p.getattr(ino).unwrap();
+                gets.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+    {
+        let (p, renames, stop) = (Arc::clone(&p), Arc::clone(&renames), Arc::clone(&stop));
+        thread::spawn(move || {
+            // A destination that always exists, so every rename DISPLACES a node and
+            // therefore reaches `purge_inode_state` with a non-empty ino list.
+            write_file(&p, ROOT, "dst.bin", b"old");
+            while !stop.load(Ordering::Relaxed) {
+                write_file(&p, ROOT, "src.bin", b"new");
+                p.rename(ROOT, "src.bin", ROOT, "dst.bin").unwrap();
+                renames.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    watch_progress("rename", &gets, &renames, &stop);
+}
+
+/// The sync thread's face of it: `apply_remote` reaches `purge_inode_state` through the
+/// **name-collision sweep**, not a direct removal. Two remote node ids alternate under one
+/// name, so each apply displaces the other and the swept list is never empty (an empty
+/// list early-returns before the staging lock and would prove nothing).
+#[test]
+fn getattr_on_staged_inode_does_not_deadlock_against_apply_remote_collision() {
+    let p = Arc::new(provider());
+    let ino = permanently_staged(&p, "staged.bin");
+    // A local row under the contested name, so the very first apply sweeps something.
+    write_file(&p, ROOT, "collide.txt", b"local");
+
+    let remote = |id: &str| SyncNode {
+        node_id: id.to_string(),
+        parent_node_id: None, // root
+        name: "collide.txt".to_string(),
+        kind: Kind::File,
+        manifest_id: None,
+        chunks: Vec::new(),
+        version_id: None,
+        mode: 0o644,
+        mtime: 1,
+        symlink_target: None,
+    };
+
+    let (gets, applies) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    {
+        let (p, gets, stop) = (Arc::clone(&p), Arc::clone(&gets), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                p.getattr(ino).unwrap();
+                gets.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+    {
+        let (p, applies, stop) = (Arc::clone(&p), Arc::clone(&applies), Arc::clone(&stop));
+        let (a, b) = (remote("remote-a"), remote("remote-b"));
+        thread::spawn(move || {
+            let mut flip = false;
+            while !stop.load(Ordering::Relaxed) {
+                p.apply_remote(if flip { &a } else { &b }).unwrap();
+                applies.fetch_add(1, Ordering::Relaxed);
+                flip = !flip;
+            }
+        });
+    }
+
+    watch_progress("apply_remote", &gets, &applies, &stop);
+}

@@ -7,6 +7,12 @@
 //   resolve_conflict_keep / resolve_conflict_split
 // args use camelCase: serverUrl, email, password, mountpoint, nodeId, versionId.
 
+// Root-relative like the other modules' "/maker-shared.js" — tauri.conf.json serves src/ as the
+// frontend root. It does NOT disturb the load order window.MakerUI depends on: a dependency is
+// evaluated before its importer, and the <script type="module"> tags still run in document order,
+// so main.js is still fully evaluated before library.js and the rest.
+import { accountArgs, accountAfter, fetchConflicts, signedIn, SIGNED_OUT_HINT } from "/session.js";
+
 const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const val = (id) => $(id).value.trim();
@@ -87,13 +93,19 @@ const setFieldError = (input, errEl, msg) => {
   }
 };
 
-// The account the daemon is currently mounted for, snapshotted at sign-in. browse /
-// file_versions / conflict commands read THIS, not the live form fields — otherwise editing
-// the sign-in form after mounting would silently retarget those commands at a different
-// account than the one that's mounted. Null until a successful mount; cleared on unmount.
-let activeAccount = null;
+// The account signed in on this device, snapshotted from the form at sign-in. browse /
+// file_versions / the conflict commands read THIS, and so does every maker_* command in the
+// other surface modules (via window.MakerUI.args) — never the live form fields, or editing the
+// sign-in form afterwards would silently retarget them at a different account.
+//
+// IT OUTLIVES THE MOUNT. It is set on a successful sign-in and replaced by the next one; nothing
+// else touches it, and unmounting in particular does NOT clear it. It used to, which restored
+// exactly the hazard the paragraph above describes — see src/session.js for the whole argument.
+// Null before the first sign-in of this process, and args() then answers null so the commands
+// refuse rather than aiming at index.html's dev defaults.
+let signedInAccount = null;
 const args = () =>
-  activeAccount ?? { serverUrl: val("server"), email: val("email") };
+  accountArgs(signedInAccount, { serverUrl: val("server"), email: val("email") });
 
 // ---- status pill -------------------------------------------------------------
 
@@ -200,8 +212,14 @@ $("mountBtn").onclick = async () => {
         password: $("password").value,
         mountpoint: val("mount"),
       });
-      // Pin the commands to the account we just mounted, so later form edits can't retarget.
-      activeAccount = { serverUrl: val("server"), email: val("email") };
+      // Pin the commands to the account we just signed in as, so later form edits can't
+      // retarget them. This is the ONLY thing that changes the account — a re-sign-in with
+      // different credentials is the explicit account switch.
+      signedInAccount = accountAfter(signedInAccount, {
+        type: "signed-in",
+        serverUrl: val("server"),
+        email: val("email"),
+      });
       toast($("connToast"), result, "ok");
       await refreshStatus();
       loadFiles();
@@ -218,7 +236,10 @@ $("unmountBtn").onclick = async () => {
   await withBusy($("unmountBtn"), "Unmounting…", async () => {
     try {
       const result = await invoke("sync_stop");
-      activeAccount = null; // no mount → fall back to live form fields
+      // Deliberately a NO-OP on the account: unmounting stops the drive, it does not sign the
+      // device out, and the whole maker catalog goes on working without a mount. Clearing it
+      // here is what sent all 64 catalog calls at the sign-in form's dev defaults.
+      signedInAccount = accountAfter(signedInAccount, { type: "unmounted" });
       toast($("connToast"), result, "ok");
     } catch (e) {
       toast($("connToast"), errText(e), "err");
@@ -246,6 +267,12 @@ const showFilesError = (msg) => {
 
 const loadFiles = async () => {
   $("filesHint").textContent = "";
+  if (!signedIn(signedInAccount)) {
+    setFilesState(
+      `<div class="state"><span class="glyph">🔒</span>Sign in above to browse the synced drive.</div>`
+    );
+    return;
+  }
   // skeleton loading state
   setFilesState(`<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`);
 
@@ -509,13 +536,12 @@ document.addEventListener("keydown", (e) => {
 
 const pollConflicts = async () => {
   if (activeConflict) return; // a prompt is already up
-  let list;
-  try {
-    list = await invoke("conflicts", args());
-  } catch {
-    return; // not signed in yet, etc.
-  }
-  conflictQueue = list || [];
+  // Runs on a 5 s interval from boot, with no user action — so it is the one caller that must
+  // not ask at all when signed out. fetchConflicts issues no invoke in that case and answers
+  // null; null also covers a transient bridge error, where the queue is left as it was.
+  const list = await fetchConflicts({ invoke, account: signedInAccount });
+  if (!list) return;
+  conflictQueue = list;
   if (conflictQueue.length) showConflict(conflictQueue[0], 0, conflictQueue.length);
 };
 
@@ -523,7 +549,13 @@ const pollConflicts = async () => {
 
 // Shared with library.js (kept on window to avoid a bundler/import graph; main.js
 // is loaded first, so MakerUI exists before library.js's event handlers fire).
-window.MakerUI = { invoke, $, val, toast, withBusy, fmtSize, fmtWhen, relWhen, args };
+// `signedIn()` is how the other surfaces render an explicit signed-out state instead of showing
+// the raw Tauri deserialization error a null `args()` produces.
+window.MakerUI = {
+  invoke, $, val, toast, withBusy, fmtSize, fmtWhen, relWhen, args,
+  signedIn: () => signedIn(signedInAccount),
+  SIGNED_OUT_HINT,
+};
 
 refreshStatus();
 setInterval(refreshStatus, 3000);
