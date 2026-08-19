@@ -911,7 +911,7 @@ unsafe extern "system" fn fetch_data_callback(
     let state = &*state;
 
     // F-53: register this transfer as in-flight for the whole callback. The guard's `Drop`
-    // deregisters on EVERY exit below — the teardown bail, the three resolve failures, the
+    // deregisters on EVERY exit below — the teardown bail, the two identity/ino resolve failures, the
     // empty-plan branch, a mid-stream read or `CfExecute` failure, the cancel, and the clean
     // finish. The predecessor tracked *cancelled keys* and cleaned up at only three of those, so
     // the rest leaked permanently and truncated a later read. Nothing here may `return` before

@@ -580,6 +580,13 @@ impl TransferRegistry {
     ///
     /// A second registration for a key already present **replaces** it, so the newcomer starts
     /// un-cancelled and can never inherit a stale flag.
+    ///
+    /// `#[must_use]` is load-bearing, not lint hygiene: the guard's whole mechanism is its `Drop`,
+    /// so `let _ = state.transfers.register(k);` deregisters INSTANTLY and leaves the transfer
+    /// uncancellable — with every test in this file still green, because the registry's own
+    /// semantics are unchanged. Found in review; the attribute is what makes that spelling a
+    /// compile-time warning rather than a silent regression.
+    #[must_use = "the returned guard deregisters on drop — bind it for the life of the callback"]
     pub fn register(
         self: &std::sync::Arc<Self>,
         key: i64,
