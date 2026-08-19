@@ -23,7 +23,6 @@
 //! target on macOS (`cargo check --target x86_64-pc-windows-gnu`) + the `cfapi-windows` CI job.
 //! Gaps flagged `LIMITATION:`/`PHASE 2:`.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,14 +66,24 @@ struct CfState {
     /// the new-file capture branch (Phase 2b). The close callback only gets the full on-disk
     /// path, so it needs the root to map back into the `Provider` tree.
     root: PathBuf,
-    /// Echo guard: paths we just converted to placeholders ourselves, each stamped with the
-    /// time we inserted it. Our own `CfConvertToPlaceholder` triggers another close, which would
-    /// otherwise re-enter the new-file branch; a fresh entry short-circuits that re-entry exactly
-    /// once. The timestamp makes it **self-healing**: if the convert-triggered close never
-    /// arrives (so the entry is never consumed), a later genuine edit at the same path finds the
-    /// entry stale (≥5 s old), drops it, and is captured normally — bounding any leak to a 5 s
-    /// window instead of permanently suppressing the next real change.
-    self_writes: Mutex<HashMap<String, std::time::Instant>>,
+    /// Echo guard: paths we just converted to placeholders ourselves. Our own
+    /// `CfConvertToPlaceholder` triggers another close, which would otherwise re-enter the
+    /// new-file branch; a fresh mark short-circuits that re-entry exactly once.
+    ///
+    /// A [`crate::SelfOps`] — the same tested type as `self_removes` below, keyed by the same
+    /// [`crate::normalize_path_key`], with the same self-healing TTL
+    /// ([`crate::SelfOps::ECHO_TTL`]): if the convert-triggered close never arrives (so the mark
+    /// is never consumed), a later genuine edit at the same path finds it stale, drops it, and is
+    /// captured normally — bounding any leak to that window instead of permanently suppressing
+    /// the next real change. This was an open-coded duplicate of `SelfOps` (same key function,
+    /// same TTL as a bare literal, same remove-on-hit) — two copies free to drift, and the last
+    /// untested copy of the logic.
+    ///
+    /// **A SEPARATE `SelfOps` FROM `self_removes`, DELIBERATELY — do not share one.** They guard
+    /// different callbacks that can name the SAME path: sharing would let a daemon-initiated
+    /// *remove* mark be consumed by this *convert-echo* check, silently disabling the push-loop
+    /// guard `self_removes` exists to be.
+    self_writes: crate::SelfOps,
     /// Set the instant teardown begins (before `CfDisconnectSyncRoot`). While true, callbacks
     /// still **mirror** the change into the provider/outbox (so a local edit/delete/rename made
     /// right before unmount is not lost), but **skip the re-entrant CfAPI calls**
@@ -326,7 +335,7 @@ pub fn mount_full(
         hydrate,
         connection_key: Mutex::new(None),
         root: root.to_path_buf(),
-        self_writes: Mutex::new(HashMap::new()),
+        self_writes: crate::SelfOps::new(),
         shutting_down: shutting_down.clone(),
         path_index,
         cancelled_transfers: Mutex::new(std::collections::HashSet::new()),
@@ -1396,25 +1405,16 @@ unsafe extern "system" fn notify_file_close_callback(
 /// The convert itself fires another close on the same path; the `self_writes` echo guard
 /// short-circuits that one re-entry so we don't create a duplicate node.
 unsafe fn capture_new_file(state: &CfState, path: &str) {
-    // Echo guard (self-healing): if we just converted this path AND the entry is fresh
-    // (<5 s old), this close is the convert echo — consume it and skip exactly once. If the
-    // entry is stale (≥5 s, e.g. the convert-triggered close never arrived), drop it and fall
-    // through so a genuine edit isn't wrongly suppressed. Bounds any leak to a 5 s window.
-    // MINOR-fix: key `self_writes` by the NORMALIZED path (case/separator-insensitive), so an
-    // insert from one call site and a lookup from another (the watcher's `root.join(rel)` form vs
-    // the close callback's `VolumeDosName + NormalizedPath` form) collide — otherwise the guard was
-    // effectively dead for any path whose two spellings differed (e.g. subdir files).
-    let self_key = crate::normalize_path_key(path);
-    {
-        let mut seen = state.self_writes.lock().unwrap();
-        if let Some(&inserted) = seen.get(&self_key) {
-            seen.remove(&self_key);
-            if inserted.elapsed() < std::time::Duration::from_secs(5) {
-                eprintln!("cfapi: new file {path} — echo of our own convert, suppressed");
-                return; // fresh — the convert echo; suppress
-            }
-            // stale — fall through and capture normally
-        }
+    // Echo guard (self-healing): if we just converted this path AND the mark is fresh, this close
+    // is the convert echo — `take` consumes it and we skip exactly once. A stale mark is dropped
+    // and we fall through, so a genuine edit isn't wrongly suppressed. `SelfOps` keys by the
+    // NORMALIZED path (case/separator-insensitive), so a `mark` from one call site and a `take`
+    // from another (the watcher's `root.join(rel)` form vs the close callback's
+    // `VolumeDosName + NormalizedPath` form) collide — otherwise the guard is effectively dead for
+    // any path whose two spellings differ (e.g. subdir files).
+    if state.self_writes.take(path) {
+        eprintln!("cfapi: new file {path} — echo of our own convert, suppressed");
+        return; // fresh — the convert echo; suppress
     }
 
     // Map the absolute on-disk path back into the library tree.
@@ -1533,11 +1533,7 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
     // Convert the real on-disk file into a placeholder carrying our identity so future closes
     // take the edit path (content-compare). Mark in-sync — the bytes are already correct locally
     // and the sync loop will push them. Guard the echo (our convert fires another close).
-    state
-        .self_writes
-        .lock()
-        .unwrap()
-        .insert(self_key.clone(), std::time::Instant::now());
+    state.self_writes.mark(path);
     let identity = FileIdentity::from_node_id(&node_id);
     let path_w = path_wide(Path::new(path));
     match CreateFileW(
@@ -1575,14 +1571,14 @@ unsafe fn capture_new_file(state: &CfState, path: &str) {
                 Err(e) => {
                     eprintln!("cfapi: new file CfConvertToPlaceholder(node={node_id}) failed: {e}");
                     // The convert didn't fire its own close, so drop the echo guard we inserted.
-                    state.self_writes.lock().unwrap().remove(&self_key);
+                    let _ = state.self_writes.take(path);
                 }
             }
             let _ = CloseHandle(handle);
         }
         Err(e) => {
             eprintln!("cfapi: new file open(node={node_id}) failed: {e}");
-            state.self_writes.lock().unwrap().remove(&self_key);
+            let _ = state.self_writes.take(path);
         }
     }
 }
