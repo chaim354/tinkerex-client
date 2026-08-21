@@ -1,0 +1,237 @@
+name: Install app on runners
+
+# Stage the freshly-built desktop app onto the three SELF-HOSTED machines (one each for
+# linux / macOS / windows) so each box is always running the newest `client/maker-app`
+# build when it exercises the live-mount E2E against the Unraid-deployed server.
+#
+# Mirrors the project's deploy philosophy (docs/DEPLOY.md): build CENTRALLY, the boxes
+# PULL — no on-box build. `build-app.yml` bundles the installers on GitHub-HOSTED runners
+# and uploads them as artifacts (`maker-app-linux` / `-macos` / `-windows`); this workflow
+# runs AFTER it on the matching SELF-HOSTED runner, downloads that OS's artifact, and
+# installs it idempotently (replacing any previously-staged app).
+#
+# IMPORTANT: this only STAGES the binary. It must NOT mount a filesystem or leave a
+# sync daemon running — these same machines run the live-mount E2E (nightly.yml /
+# cross-os-e2e.yml) and must stay usable. We install/replace the app bundle and stop.
+#
+# Triggers:
+#   * workflow_run — automatically after a SUCCESSFUL `build-app.yml` run (stages all OSes).
+#   * workflow_dispatch — manual staging; an `os` input targets one machine (all/linux/macos/windows)
+#     and `run_id` lets you stage a specific older build run instead of the latest.
+#
+#   gh workflow run install-app-on-runners.yml --ref main                 # latest build, all OSes
+#   gh workflow run install-app-on-runners.yml --ref main -f os=windows   # one machine
+#   gh workflow run install-app-on-runners.yml --ref main -f run_id=123…  # a specific build run
+
+on:
+  workflow_run:
+    workflows: ["Build app"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Which self-hosted machine to stage (all / linux / macos / windows)'
+        type: choice
+        default: all
+        options: [all, linux, macos, windows]
+      run_id:
+        description: 'build-app.yml run id to pull artifacts from (blank = latest successful)'
+        type: string
+        default: ''
+
+# Serialize per-ref so a newer staging run supersedes an in-flight older one on the single
+# self-hosted boxes (same pattern as ci.yml). Don't cancel in-progress: an install that's
+# mid-replace shouldn't be killed and leave a half-staged app.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# gh run download needs read access to artifacts/actions of the source workflow run.
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  # Compute which OS legs to run AND resolve the source build run id once, so every install
+  # job pulls from the SAME build. On workflow_run we only proceed if the build succeeded.
+  prepare:
+    runs-on: [self-hosted, linux]
+    # On a workflow_run trigger, skip entirely unless the build it chained off SUCCEEDED.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      run_id: ${{ steps.set.outputs.run_id }}
+    steps:
+      - id: set
+        env:
+          # workflow_run → the build run that just finished. dispatch → the input (or blank = latest).
+          OS: ${{ github.event.inputs.os || 'all' }}
+          WR_RUN_ID: ${{ github.event.workflow_run.id }}
+          INPUT_RUN_ID: ${{ github.event.inputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          lin='{"os_label":"linux","runner":"linux","artifact":"maker-app-linux"}'
+          mac='{"os_label":"macos","runner":"macos","artifact":"maker-app-macos"}'
+          win='{"os_label":"windows","runner":"windows","artifact":"maker-app-windows"}'
+          case "$OS" in
+            linux)   inc="[$lin]" ;;
+            macos)   inc="[$mac]" ;;
+            windows) inc="[$win]" ;;
+            *)       inc="[$lin,$mac,$win]" ;;
+          esac
+          echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
+          echo "include = $inc"
+
+          # Resolve the build run id: workflow_run gives it directly; dispatch uses the input,
+          # else leave blank and let the install job fall back to the latest successful build.
+          run_id="${WR_RUN_ID:-}"
+          if [ -z "$run_id" ]; then run_id="${INPUT_RUN_ID:-}"; fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "build run_id = ${run_id:-<latest successful>}"
+
+  install:
+    needs: prepare
+    name: Stage (${{ matrix.os_label }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    # Target the real self-hosted box for this OS (labels per ci/runners/README.md).
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Set the repo explicitly so `gh run list/download` resolves it from the env instead of
+      # probing the local git checkout — the self-hosted Windows runner's repo dir is owned by
+      # NETWORK SERVICE while the runner user differs, which trips git's "dubious ownership"
+      # guard and aborts gh. No-op on the macOS/Linux runners.
+      GH_REPO: ${{ github.repository }}
+      ARTIFACT: ${{ matrix.artifact }}
+      BUILD_RUN_ID: ${{ needs.prepare.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+
+      # Where each OS stages the installer artifact (under the runner work dir). `runner.*`
+      # isn't available in job-level env, so export it here for the rest of the job.
+      - name: Resolve the staging dir
+        shell: bash
+        run: echo "STAGE_DIR=${{ runner.temp }}/maker-app-staged" >> "$GITHUB_ENV"
+
+      # ---- pull the matching artifact (cross-workflow) --------------------------------
+      # `gh run download` handles the cross-workflow case cleanly (download-artifact@v4
+      # would need run-id + github-token for a different run anyway). If BUILD_RUN_ID is
+      # blank (a dispatch with no run_id), resolve the latest SUCCESSFUL build-app run.
+      - name: Download the ${{ matrix.os_label }} installer artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          rid="${BUILD_RUN_ID:-}"
+          if [ -z "$rid" ]; then
+            echo "No run id given — resolving the latest successful 'Build app' run…"
+            rid="$(gh run list --workflow build-app.yml --status success \
+                     --limit 1 --json databaseId --jq '.[0].databaseId')"
+            [ -n "$rid" ] || { echo "No successful build-app run found"; exit 1; }
+          fi
+          echo "Pulling artifact '$ARTIFACT' from build-app run $rid"
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR"
+          gh run download "$rid" -n "$ARTIFACT" -D "$STAGE_DIR"
+          echo "Downloaded into $STAGE_DIR:"
+          ls -la "$STAGE_DIR"
+
+      # ---- per-OS install (idempotent, no mount/daemon) -------------------------------
+
+      # LINUX: prefer the .deb (apt resolves runtime libs). Fall back to staging the
+      # .AppImage at a stable path. Neither launches the app or mounts anything.
+      - name: Install on Linux (.deb via apt, else stage .AppImage)
+        if: matrix.os_label == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find "$STAGE_DIR" -maxdepth 1 -name '*.deb' | head -n1 || true)"
+          appimage="$(find "$STAGE_DIR" -maxdepth 1 -name '*.AppImage' | head -n1 || true)"
+          if [ -n "$deb" ]; then
+            echo "Installing $deb (apt resolves deps; reinstall replaces the previous version)"
+            # --reinstall + apt's same-or-older handling keeps this idempotent across re-stages.
+            sudo apt-get update
+            sudo apt-get install -y --reinstall --allow-downgrades "$deb"
+            echo "Installed maker-app from .deb"
+          elif [ -n "$appimage" ]; then
+            dest="$HOME/.local/bin/maker-app.AppImage"
+            mkdir -p "$(dirname "$dest")"
+            install -m 0755 "$appimage" "$dest"   # install replaces atomically → idempotent
+            echo "Staged AppImage at $dest"
+          else
+            echo "No .deb or .AppImage in the artifact"; exit 1
+          fi
+          # Linux installers carry no Gatekeeper/SmartScreen gate — nothing to bypass.
+
+      # macOS: unzip the .app.zip into /Applications, replacing any existing copy, then
+      # strip the com.apple.quarantine xattr so the UNSIGNED app launches without the
+      # "developer cannot be verified" Gatekeeper prompt (docs/building-the-app.md §6).
+      - name: Install on macOS (unzip .app.zip → /Applications, de-quarantine)
+        if: matrix.os_label == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip="$(find "$STAGE_DIR" -maxdepth 1 -name '*.app.zip' | head -n1 || true)"
+          [ -n "$zip" ] || { echo "No .app.zip in the artifact"; exit 1; }
+          work="$(mktemp -d)"
+          ditto -x -k "$zip" "$work"          # ditto preserves the bundle (vs plain unzip)
+          app="$(find "$work" -maxdepth 1 -name '*.app' | head -n1)"
+          [ -n "$app" ] || { echo "No .app inside $zip"; exit 1; }
+          name="$(basename "$app")"
+          dest="/Applications/$name"
+          # Replace any previously-staged copy → idempotent. Quit it first if it's running
+          # (don't leave the app/daemon up — these boxes run the live-mount E2E).
+          osascript -e "tell application \"$name\" to quit" >/dev/null 2>&1 || true
+          pkill -f "/Applications/$name/Contents/MacOS/" 2>/dev/null || true
+          rm -rf "$dest"
+          ditto "$app" "$dest"
+          rm -rf "$work"
+          # UNSIGNED-app bypass: clear the quarantine flag so Gatekeeper allows it.
+          xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
+          echo "Staged $dest (de-quarantined)"
+
+      # WINDOWS: silent .msi install (msiexec /qn). REINSTALL flags make re-running replace
+      # the previously-staged app in place → idempotent. The MSI itself is the install; the
+      # unsigned-binary SmartScreen gate is an INTERACTIVE-launch prompt only (it does not
+      # block a silent msiexec install), so there's nothing to bypass for staging. We do NOT
+      # launch the app, so no SmartScreen prompt and no mount/daemon is started.
+      - name: Install on Windows (silent .msi, else silent NSIS .exe)
+        if: matrix.os_label == 'windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Get-ChildItem -Path $env:STAGE_DIR -Filter *.msi -File | Select-Object -First 1
+          $log = Join-Path $env:STAGE_DIR 'install.log'
+          if ($msi) {
+            Write-Host "Silently installing $($msi.FullName)"
+            # /qn = no UI; REINSTALL=ALL REINSTALLMODE=vomus forces an in-place replace so
+            # re-staging the same-or-older build is idempotent (not a "already installed" no-op).
+            $args = @('/i', "`"$($msi.FullName)`"", '/qn', '/norestart',
+                      'REINSTALL=ALL', 'REINSTALLMODE=vomus', '/l*v', "`"$log`"")
+            $p = Start-Process msiexec.exe -ArgumentList $args -Wait -PassThru
+            # 0 = success, 3010 = success but reboot suggested. Anything else = failure.
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              Write-Host "msiexec failed ($($p.ExitCode)); tail of ${log}:"
+              if (Test-Path $log) { Get-Content $log -Tail 40 }
+              exit $p.ExitCode
+            }
+            Write-Host "Installed maker-app from MSI (exit $($p.ExitCode))"
+          } else {
+            $exe = Get-ChildItem -Path $env:STAGE_DIR -Filter *.exe -File | Select-Object -First 1
+            if (-not $exe) { Write-Error "No .msi or NSIS .exe in the artifact"; exit 1 }
+            Write-Host "Silently installing NSIS $($exe.FullName)"
+            # Tauri's NSIS installer accepts /S (silent). It overwrites the prior install → idempotent.
+            $p = Start-Process $exe.FullName -ArgumentList '/S' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Write-Error "NSIS install failed ($($p.ExitCode))"; exit $p.ExitCode }
+            Write-Host "Installed maker-app from NSIS (exit $($p.ExitCode))"
+          }
+          # We never launch the app, so the unsigned-binary SmartScreen prompt (an
+          # interactive-launch gate) never fires and no mount/daemon is started.
+
+      - name: Staging summary
+        if: always()
+        shell: bash
+        run: echo "maker-app staged on the ${{ matrix.os_label }} self-hosted runner from build run ${BUILD_RUN_ID:-<latest>}."

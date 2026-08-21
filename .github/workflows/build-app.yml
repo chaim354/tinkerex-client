@@ -1,0 +1,225 @@
+name: Build app
+
+# Cross-OS Tauri desktop-app build → downloadable installers.
+#
+# Builds client/maker-app (the file-sync Tauri app) per-OS into runnable installers and
+# uploads them as workflow artifacts (and, on a tag, attaches them to a draft GitHub
+# Release). Dispatch it on demand and download the result:
+#
+#   gh workflow run build-app.yml --ref <branch>                 # all three OSes
+#   gh workflow run build-app.yml --ref <branch> -f os=macos     # one OS only
+#   gh workflow run build-app.yml --ref <branch> -f crate=client/maker-app
+#
+# then, when it finishes:
+#   gh run download <run-id> -n maker-app-macos                  # or -windows / -linux
+#
+# See docs/building-the-app.md for the full dispatch → download → install walkthrough and
+# the signing/notarization caveats (unsigned artifacts run with a Gatekeeper/SmartScreen
+# bypass; distributable builds need paid certs).
+#
+# Runs on our SELF-HOSTED runners ([self-hosted, macos|windows|linux]) — GitHub-hosted
+# runners are billed by the minute (macOS 10×, Windows 2×) and this was the ONLY workflow
+# still using them; self-hosted runners are free (per GitHub billing docs), so per the
+# repo policy (CLAUDE.md §"CI") all jobs run self-hosted. We only *bundle* the app here; we
+# never mount a filesystem, so the interactive-session caveats that gate the live-mount jobs
+# (rust-client.yml / nightly.yml) do not apply. The per-OS dep-install steps below are
+# idempotent (apt/choco no-op if already present), safe to re-run on a persistent runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Which OS to build (all / macos / windows / linux)'
+        type: choice
+        default: all
+        options: [all, macos, windows, linux]
+      crate:
+        description: 'Path to the Tauri app crate to build (must contain src-tauri/tauri.conf.json)'
+        type: string
+        default: client/maker-app
+      version:
+        description: 'Override app version (blank = committed dev version). `app-v*` tag builds always use the tag.'
+        type: string
+        default: ''
+  push:
+    # On a version tag, build all three and attach the installers to a draft Release.
+    tags:
+      - 'app-v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # needed only for the draft-Release step on tag builds
+
+jobs:
+  prepare:
+    # Build the matrix from the `os` input. On tag/push (no input) build all three. This
+    # filtering can't live in the build job's `if` (a job-level `if` can't read `matrix`),
+    # so we compute the include-list here and the build job consumes it via fromJSON.
+    runs-on: [self-hosted, linux]
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          OS: ${{ github.event.inputs.os || 'all' }}
+        shell: bash
+        run: |
+          mac='{"os_label":"macos","runner":"macos","artifact":"maker-app-macos","bundles":"dmg,app"}'
+          win='{"os_label":"windows","runner":"windows","artifact":"maker-app-windows","bundles":"msi,nsis"}'
+          lin='{"os_label":"linux","runner":"linux","artifact":"maker-app-linux","bundles":"deb,appimage"}'
+          case "$OS" in
+            macos)   inc="[$mac]" ;;
+            windows) inc="[$win]" ;;
+            linux)   inc="[$lin]" ;;
+            *)       inc="[$mac,$win,$lin]" ;;
+          esac
+          echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
+          echo "include = $inc"
+
+  build:
+    needs: prepare
+    name: Bundle (${{ matrix.os_label }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    env:
+      # The crate to build. workflow_dispatch lets you point it at another Tauri crate
+      # (e.g. a second UI app) without editing this file; tag/push builds the default.
+      APP_CRATE: ${{ github.event.inputs.crate || 'client/maker-app' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # ---- per-OS filesystem + GUI build deps -----------------------------------------
+      # Each OS compiles only its own mount backend (target-gated in sync-engine):
+      #   Linux = FUSE (fuser → libfuse), Windows = CfAPI/WinFsp, macOS = WebDAV (no FUSE).
+      # We install what the *build* needs on each — at build time only; the installed app
+      # pulls runtime libs itself (the .deb declares them; macOS/Windows are self-contained).
+
+      - name: Linux build deps (Tauri/webkit2gtk + FUSE headers)
+        if: matrix.os_label == 'linux'
+        run: |
+          sudo apt-get update
+          # Tauri's GTK/webkit stack + the FUSE dev headers fuser links against on Linux.
+          # (Ubuntu 24.04 ships webkit2gtk 4.1; libfuse-dev = the standard fuse.pc, so no
+          # pkg-config alias dance like macOS FUSE-T needs.)
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            libgtk-3-dev libfuse-dev pkg-config fuse
+
+      - name: Windows build deps (WinFsp + LLVM/libclang)
+        if: matrix.os_label == 'windows'
+        shell: powershell
+        run: |
+          # The default Windows backend is CfAPI (driverless Cloud Filter — no driver). But
+          # sync-engine still compiles fs-winfsp transitively, whose winfsp-sys runs bindgen
+          # against the WinFsp SDK headers and needs libclang. windows-latest ships LLVM at
+          # C:\Program Files\LLVM. WinFsp itself we install (SDK headers for the build; the
+          # runtime DLL is only needed if a user actually mounts via the winfsp-backend
+          # feature — the default CfAPI build does not need winfsp-x64.dll at runtime).
+          choco install -y --no-progress winfsp llvm
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      # macOS needs NOTHING filesystem-related: the app mounts via native WebDAV at runtime,
+      # and `fuser` is cfg(target_os = "linux") so it isn't compiled here. (Verified locally:
+      # the .app bundles on macOS with zero FUSE-T / pkg-config setup.) Xcode CLT (codesign,
+      # hdiutil for the .dmg) are preinstalled on macos-latest.
+
+      # ---- Tauri CLI + cargo cache ----------------------------------------------------
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.APP_CRATE }}/src-tauri/target
+          # Key on OS + lockfile so a dep bump invalidates; restore-keys fall back to the
+          # latest cache for this OS+crate.
+          key: ${{ matrix.os_label }}-cargo-${{ hashFiles(format('{0}/src-tauri/Cargo.lock', env.APP_CRATE)) }}
+          restore-keys: |
+            ${{ matrix.os_label }}-cargo-
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      # Stamp the release version into Cargo.toml + tauri.conf.json BEFORE bundling so the
+      # WKWebView cache-bust (src-tauri/src/lib.rs, keyed off CARGO_PKG_VERSION) fires on every
+      # update. On an `app-v*` tag the version IS the tag; a manual dispatch may pass `version`;
+      # otherwise we build at the committed dev version (same-version rebuilds won't auto-evict).
+      - name: Stamp app version (tag → version, or dispatch input)
+        shell: bash
+        working-directory: ${{ env.APP_CRATE }}
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF:-}" in
+            refs/tags/app-v*) V="${GITHUB_REF#refs/tags/app-v}" ;;
+            *)                V="${VERSION_INPUT:-}" ;;
+          esac
+          if [[ -z "$V" ]]; then
+            echo "No tag/input version — building at the committed dev version."
+            echo "(Same-version rebuilds won't trigger the on-update cache eviction.)"
+            exit 0
+          fi
+          if [[ ! -f src-tauri/scripts/set-app-version.sh ]]; then
+            echo "::warning::no set-app-version.sh under ${APP_CRATE}/src-tauri — skipping version stamp"
+            exit 0
+          fi
+          bash src-tauri/scripts/set-app-version.sh "$V"
+
+      # ---- bundle ---------------------------------------------------------------------
+      # No beforeBuildCommand / npm install — the frontend is static HTML served from
+      # src/, embedded into the binary. So this is a pure `cargo tauri build`.
+      - name: Build + bundle the app
+        working-directory: ${{ env.APP_CRATE }}
+        run: cargo tauri build --ci --bundles ${{ matrix.bundles }}
+
+      # Collect every produced installer into one flat dir for upload. The bundle layout
+      # is target/release/bundle/<kind>/<file>; globbing handles version-stamped names.
+      - name: Stage installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${APP_CRATE}/src-tauri/target/release/bundle"
+          dst="dist-installers"
+          mkdir -p "$dst"
+          # .app is a directory bundle → zip it so it survives upload as a single file.
+          if [ -d "$src/macos" ]; then
+            for app in "$src"/macos/*.app; do
+              [ -e "$app" ] || continue
+              ( cd "$(dirname "$app")" && zip -qry - "$(basename "$app")" ) > "$dst/$(basename "$app").zip"
+            done
+          fi
+          # Everything else is already a single file: .dmg .msi .exe .deb .AppImage
+          find "$src" -maxdepth 2 -type f \
+            \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \
+               -o -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp {} "$dst/" \;
+          echo "Staged installers:"
+          ls -la "$dst"
+
+      - name: Upload installers as a workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist-installers/*
+          if-no-files-found: error
+          retention-days: 14
+
+      # ---- optional: attach to a draft Release on a tag build -------------------------
+      - name: Attach installers to a draft GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/app-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: dist-installers/*
+          fail_on_unmatched_files: true

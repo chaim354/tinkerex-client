@@ -1,0 +1,271 @@
+name: Rust client
+
+# FAST per-PR gate on the always-on runners (macOS + Linux), with the Windows build gated on
+# Windows-affecting changes. Each job runs ONLY when its component changed (auto path-gating),
+# and `workflow_dispatch` lets you run exactly one slice on demand to shorten the iteration loop:
+#   gh workflow run rust-client.yml --ref <branch> -f target=cfapi   # only the Windows/CfAPI jobs
+#   gh workflow run rust-client.yml --ref <branch> -f target=linux   # only the FUSE/Linux build
+#   gh workflow run rust-client.yml --ref <branch> -f target=mac     # only the Mac hermetic+webdav
+#   gh workflow run rust-client.yml --ref <branch> -f target=engine  # only the server integration
+#   gh workflow run rust-client.yml --ref <branch> -f target=all
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    paths:
+      - 'client/**'
+      - '.github/workflows/rust-client.yml'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which slice to run'
+        type: choice
+        default: all
+        options: [all, mac, linux, engine, windows, cfapi, cfapi-conf, two-device]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Which runner families exist for this run. See ci/preflight.sh — this is a DECLARATION (the repo
+  # variable CI_RUNNERS), not an API call, because a workflow GITHUB_TOKEN cannot list runners.
+  preflight:
+    runs-on: [self-hosted, macos]
+    outputs:
+      macos:   ${{ steps.p.outputs.macos }}
+      linux:   ${{ steps.p.outputs.linux }}
+      windows: ${{ steps.p.outputs.windows }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - id: p
+        name: Resolve the declared runner fleet
+        env:
+          CI_RUNNERS: ${{ vars.CI_RUNNERS }}
+        run: ci/preflight.sh | tee -a "$GITHUB_OUTPUT"
+      - name: Report what is available, and what was therefore skipped
+        env:
+          CI_RUNNERS: ${{ vars.CI_RUNNERS }}
+        run: ci/preflight.sh --summary >> "$GITHUB_STEP_SUMMARY"
+
+  changes:
+    # Decide which jobs run. workflow_dispatch -> the chosen target; PR -> native git-diff by
+    # component; push to main -> the full build matrix (no live smoke). No GitHub API / 3rd-party
+    # action, so no token-permission surprises.
+    #
+    # RUNS ON macos, NOT linux. This job is `git diff` plus bash — it has no Linux dependency — and
+    # every other job in this workflow `needs:` it, INCLUDING mac-tests, which targets the runner
+    # that is actually online. So a linux label here took the whole workflow down with the Linux
+    # box, and moving it is what revives the hermetic Rust suite (fs-provider,
+    # sync-client, fs-cfapi, fs-fskit, the windows-gnu FFI cross-check, the native macOS build).
+    # NO TEST COUNT HERE, deliberately: this comment's point is WHICH suites revive, not how many
+    # tests they hold, and docs/STATUS.md section 6 already records why a count written in two
+    # places becomes a count that is wrong in one of them. It carried "192" until 2026-08-19,
+    # by which time the answer was 203.
+    runs-on: [self-hosted, macos]
+    outputs:
+      mac: ${{ steps.f.outputs.mac }}
+      linux: ${{ steps.f.outputs.linux }}
+      engine: ${{ steps.f.outputs.engine }}
+      windows: ${{ steps.f.outputs.windows }}
+      smoke: ${{ steps.f.outputs.smoke }}
+      conf: ${{ steps.f.outputs.conf }}
+      twodev: ${{ steps.f.outputs.twodev }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false, fetch-depth: 0 }
+      - id: f
+        name: Decide which jobs run
+        env:
+          TARGET: ${{ github.event.inputs.target }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          mac=false; linux=false; engine=false; windows=false; smoke=false; conf=false; twodev=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            case "${TARGET:-all}" in
+              all)           mac=true; linux=true; engine=true; windows=true; smoke=true ;;
+              mac)           mac=true ;;
+              linux)         linux=true ;;
+              engine)        engine=true ;;
+              windows|cfapi) windows=true; smoke=true; mac=true ;;
+              cfapi-conf)    windows=true; conf=true; mac=true ;;  # the rigorous CfAPI round-trip
+              two-device)    twodev=true; windows=true ;;          # two REAL mounts, A<->B (FUSE + CfAPI)
+            esac
+          elif [ "$EVENT" = "push" ]; then
+            mac=true; linux=true; engine=true; windows=true   # full build matrix; smoke on-demand
+          else
+            # PR: gate per component off the diff. Foundational crates (fs-provider, sync-client,
+            # sync-engine) fan out to everything; leaf adapters only run their own platform.
+            if [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+              mac=true; linux=true; engine=true; windows=true
+            else
+              files=$(git diff --name-only "$BASE" HEAD); echo "$files"
+              grep -qE '^client/(fs-webdav|fs-cfapi|fs-fskit|fs-provider|sync-client|sync-engine)/' <<<"$files" && mac=true
+              grep -qE '^client/(fs-fuse|sync-engine|fs-provider|sync-client)/'             <<<"$files" && linux=true
+              grep -qE '^client/(sync-engine|sync-client|fs-provider)/'                     <<<"$files" && engine=true
+              grep -qE '^client/(fs-cfapi|fs-winfsp|sync-engine|fs-provider|sync-client)/'  <<<"$files" && windows=true
+              grep -qE '^\.github/workflows/rust-client\.yml$|^client/test-conformance/'    <<<"$files" && { mac=true; linux=true; engine=true; windows=true; }
+              # smoke stays off on auto PRs: it needs an interactive Windows session (see below).
+            fi
+          fi
+          for k in mac linux engine windows smoke conf twodev; do echo "$k=${!k}" >> "$GITHUB_OUTPUT"; done
+          echo "RESULT mac=$mac linux=$linux engine=$engine windows=$windows smoke=$smoke conf=$conf twodev=$twodev"
+
+  mac-tests:
+    # The fastest box: every hermetic Rust test (all cross-platform) + the CfAPI Windows-FFI
+    # cross-check + the native macOS mount build. clean: false keeps target/ warm.
+    needs: [preflight, changes]
+    if: ${{ needs.changes.outputs.mac == 'true' }}
+    runs-on: [self-hosted, macos]
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Hermetic crate tests (fs-provider, sync-client, fs-cfapi, fs-fskit, fs-webdav)
+        run: |
+          cargo test --manifest-path client/fs-provider/Cargo.toml
+          cargo test --manifest-path client/sync-client/Cargo.toml
+          cargo test --manifest-path client/fs-cfapi/Cargo.toml
+          # fs-webdav was BUILT below and never TESTED, so its inline suite — including the
+          # two-connection concurrency guards — had never run on any runner. Near-free: this
+          # job already compiles the crate.
+          cargo test --manifest-path client/fs-webdav/Cargo.toml
+          # fs-fskit: pure logic + the FFI bridge dispatch (the Swift .appex is
+          # account-gated and not built here — see client/fs-fskit/BUILD.md).
+          cargo test --manifest-path client/fs-fskit/Cargo.toml --features ffi
+      - name: Cross-check the CfAPI Windows FFI (catches most cfg(windows) breakage)
+        run: cargo check --target x86_64-pc-windows-gnu --manifest-path client/fs-cfapi/Cargo.toml
+      - name: Native macOS build (fs-webdav mount + sync-engine bins)
+        run: |
+          cargo build --manifest-path client/fs-webdav/Cargo.toml
+          cargo build --manifest-path client/sync-engine/Cargo.toml --bins
+
+  linux-build:
+    # The Linux-only FUSE mount path (fuser is cfg(target_os = "linux")). sync-engine pulls the
+    # inert fs-winfsp here transitively, so no separate fs-winfsp build is needed.
+    needs: [preflight, changes]
+    if: ${{ needs.preflight.outputs.linux == 'true' && needs.changes.outputs.linux == 'true' }}
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: FUSE dev headers
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold libfuse-dev pkg-config
+      - name: Build fs-fuse + sync-engine bins (Linux mount path)
+        run: |
+          cargo build --manifest-path client/fs-fuse/Cargo.toml
+          cargo build --manifest-path client/sync-engine/Cargo.toml --bins
+
+  # engine-integration IS DELIBERATELY ABSENT. It was the one job of this workflow's eight that
+  # boots a real Rails server, so the Stage 1 split kept it in chaim354/tinkerex as
+  # client-contract.yml rather than moving it here -- that repo has bin/rails; this one does not.
+  # Restoring it here would either duplicate that gate or fail for want of a Rails app.
+
+  windows-build:
+    # The real Windows mount adapters (fs-cfapi + fs-winfsp) + sync-engine wiring — the only place
+    # winfsp-sys (msvc) and the cfg(windows) daemon code actually link. LLVM/WinFsp preinstalled by
+    # ci/runners/setup-windows.ps1. This is the headless-capable Windows gate.
+    needs: [preflight, changes]
+    if: ${{ needs.preflight.outputs.windows == 'true' && needs.changes.outputs.windows == 'true' }}
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build fs-cfapi (lib + maker-cfapi)
+        run: cargo build --manifest-path client/fs-cfapi/Cargo.toml --bins
+      - name: Build fs-winfsp (WinFsp adapter)
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: cargo build --manifest-path client/fs-winfsp/Cargo.toml --bins
+      - name: Build sync-engine on Windows (CfApiMount + WinfspMount + maker-cfsyncd)
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: cargo build --manifest-path client/sync-engine/Cargo.toml --bins
+
+  windows-smoke:
+    # The LIVE CfAPI write-path proof. NOTE: CfAPI/Cloud Files needs an INTERACTIVE user session;
+    # the runner-as-service runs in Session 0 (NETWORK SERVICE), where the mount enumerates empty.
+    # So this is on-demand only (target=windows/cfapi/all) and continue-on-error — it does NOT gate.
+    # To make it pass, run the Windows runner in an interactive login session (see ci/runners/README).
+    needs: [preflight, changes, windows-build]
+    if: ${{ needs.preflight.outputs.windows == 'true' && needs.changes.outputs.smoke == 'true' }}
+    continue-on-error: true
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Live CfAPI smoke (register -> enumerate -> hydrate -> new/edit/delete/rename)
+        shell: powershell
+        env:
+          SERVER_URL: http://192.168.1.95
+        run: ./client/test-conformance/cfapi-smoke.ps1
+
+  cfapi-conformance:
+    # The rigorous live CfAPI round-trip (on-demand: target=cfapi-conf). Many files of varied
+    # sizes (incl. > chunk size), nested dirs, create/edit/delete/rename churn — asserted
+    # byte-for-byte by hydrating every file on a fresh device. Same interactive-session caveat as
+    # the smoke; continue-on-error (does not gate). Also runs nightly (nightly.yml).
+    needs: [preflight, changes, windows-build]
+    if: ${{ needs.preflight.outputs.windows == 'true' && needs.changes.outputs.conf == 'true' }}
+    continue-on-error: true
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Live CfAPI conformance (varied sizes / nested dirs / churn, byte-for-byte)
+        shell: powershell
+        env:
+          SERVER_URL: http://192.168.1.95
+        run: ./client/test-conformance/cfapi-conformance.ps1
+
+  two-device-fuse-linux:
+    # On-demand (target=two-device): TWO real FUSE mounts on the Linux runner, a file passed
+    # THROUGH one mount read byte-for-byte THROUGH the other (A<->B), incl. new/nested/delete/
+    # rename/multi-chunk. Self-contained (boots its own memory Rails server). continue-on-error:
+    # the script exits 0 with a BLOCKED notice if /dev/fuse / allow_other isn't available.
+    needs: [preflight, changes]
+    if: ${{ needs.preflight.outputs.linux == 'true' && needs.changes.outputs.twodev == 'true' }}
+    continue-on-error: true
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: System deps (FUSE + allow_other)
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold libfuse-dev fuse pkg-config
+          grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+      - name: Prepare the dev database (SQLite)
+        run: bin/rails db:prepare
+      - name: Two real FUSE mounts, A<->B byte-for-byte through the mounts
+        run: client/test-conformance/two-device-fuse.sh
+
+  two-device-cfapi-windows:
+    # On-demand (target=two-device): TWO real CfAPI sync roots on the Windows runner, a file
+    # passed THROUGH one mount read byte-for-byte THROUGH the other (A<->B). Needs an INTERACTIVE
+    # session (Session-0 enumerates empty) + the deployed server → continue-on-error; passes only
+    # on the interactive self-hosted Windows runner.
+    needs: [preflight, changes, windows-build]
+    if: ${{ needs.preflight.outputs.windows == 'true' && needs.changes.outputs.twodev == 'true' }}
+    continue-on-error: true
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Two real CfAPI sync roots, A<->B byte-for-byte through the mounts
+        shell: powershell
+        env:
+          SERVER_URL: http://192.168.1.95
+        run: ./client/test-conformance/two-device-cfapi.ps1

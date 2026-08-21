@@ -1,0 +1,243 @@
+name: Cross-OS E2E (3-machine convergence)
+
+# The cross-MACHINE, cross-OS convergence test: three SEPARATE self-hosted runners (Windows,
+# macOS, Linux) pass a file to each other THROUGH their real native mounts, all against ONE
+# SHARED server. The canonical scenario:
+#
+#   seed → win-push → mac-pull-1 → linux-edit → { mac-pull-2, win-pull-2 }
+#
+#   Windows writes a file → macOS pulls it → Linux edits it → macOS AND Windows pull the edit,
+#   asserting byte-for-byte at each hop.
+#
+# This is the layer ABOVE nightly.yml's single-box two-device jobs: there, two devices share ONE
+# machine; here, three devices are three DIFFERENT machines handing tokens/url/tag between jobs via
+# `needs:` + job outputs. Each leg does ONE mount + ONE op (push / pull / edit) and reuses the
+# two-device scripts' mount/daemon/poll patterns + their BLOCKED self-detection (a missing mount
+# prerequisite or an unreachable server → exit 0 with a BLOCKED notice, never a false red).
+#
+# workflow_dispatch + nightly schedule only — NOT on the per-PR gate. All legs continue-on-error.
+# Trigger: Actions tab → "Run workflow", or `gh workflow run cross-os-e2e.yml --ref <branch>`.
+# Prereqs to go green: the SHARED server reachable from all three runners (the mac runner must be
+# able to route to the deployed segment), Linux /dev/fuse access, and INTERACTIVE login sessions on
+# the macOS + Windows runners (see ci/runners/README.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: "Shared server URL all three machines hit"
+        required: false
+        default: "http://192.168.1.95"
+      email:
+        description: "Pre-created CONFIRMED account email the seed logs in with (the prod server has no signup seam — create it via `kamal app exec` first; password is the seed's fixed one)"
+        required: false
+        default: "crossos-e2e@maker.test"
+  # THE DAILY CRON IS OFF UNTIL THE FLEET EXISTS, and this is not tidiness. `seed` is the ONE job
+  # here with no preflight gate, so on a box where only macOS is registered the cron would fire
+  # daily, seed a real account and real files into the LIVE server at 192.168.1.95, and then skip
+  # win-push / linux-edit / win-pull-2 for want of runners -- writing to production every morning
+  # for a test that can never reach its assertions. Re-enable the moment linux and windows runners
+  # are registered here and CI_RUNNERS lists them; `workflow_dispatch` still runs it on demand.
+  # schedule:
+  #   - cron: '30 8 * * *'   # 08:30 UTC daily (after nightly.yml's 08:00)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SERVER_URL: ${{ github.event.inputs.server_url || 'http://192.168.1.95' }}
+  SEED_EMAIL: ${{ github.event.inputs.email || 'crossos-e2e@maker.test' }}
+
+jobs:
+  # Which runner families exist for this run. See ci/preflight.sh — a DECLARATION (the repo variable
+  # CI_RUNNERS), not an API call, because a workflow GITHUB_TOKEN cannot list runners.
+  # Which runner families exist for this run. See ci/preflight.sh — a DECLARATION (the repo variable
+  # CI_RUNNERS), not an API call, because a workflow GITHUB_TOKEN cannot list runners.
+  #
+  # This matters most on a SCHEDULED workflow, which this one is (08:30 UTC daily). Before the gate,
+  # the cron fired every day into a void: every leg queued, GitHub cancelled them 24h later, and the
+  # run history filled with `cancelled` at 24h0m0s. Now a scheduled run completes in seconds and says
+  # on its own page which coverage it could not run.
+  preflight:
+    runs-on: [self-hosted, macos]
+    outputs:
+      macos:   ${{ steps.p.outputs.macos }}
+      linux:   ${{ steps.p.outputs.linux }}
+      windows: ${{ steps.p.outputs.windows }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - id: p
+        name: Resolve the declared runner fleet
+        env:
+          CI_RUNNERS: ${{ vars.CI_RUNNERS }}
+        run: ci/preflight.sh | tee -a "$GITHUB_OUTPUT"
+      - name: Report what is available, and what was therefore skipped
+        env:
+          CI_RUNNERS: ${{ vars.CI_RUNNERS }}
+        run: ci/preflight.sh --summary >> "$GITHUB_STEP_SUMMARY"
+
+  # 1. SEED — register a FRESH unique test user + pair THREE devices (windows/mac/linux) into one
+  #    library, emit the shared server url, the three device tokens, and a unique test_tag as job
+  #    outputs. If the server is unreachable, the seed example exits 3 → this job reports BLOCKED
+  #    (continue-on-error keeps it green) and the downstream legs self-BLOCK on the empty tokens.
+  #
+  # RUNS ON macos, NOT linux: this is curl + `cargo run --example`, and every leg below needs it,
+  # so a linux label here hung the entire workflow on a box that no longer exists.
+  #
+  # NOTE the server-reachability caveat this does not fix: seed curls the deployed server at
+  # $SERVER_URL and treats an unreachable one as BLOCKED (exit 0, clean skip). From the Mac,
+  # `curl http://192.168.1.95/up` returns 404 — kamal-proxy routes by Host header, so a bare-IP
+  # request matches no route. Do not claim cross-OS reachability from this runner without
+  # re-testing with the right Host.
+  seed:
+    needs: preflight
+    runs-on: [self-hosted, macos]
+    continue-on-error: true
+    outputs:
+      server_url: ${{ steps.seed.outputs.server_url }}
+      test_tag:   ${{ steps.seed.outputs.test_tag }}
+      tok_win:    ${{ steps.seed.outputs.tok_win }}
+      tok_mac:    ${{ steps.seed.outputs.tok_mac }}
+      tok_linux:  ${{ steps.seed.outputs.tok_linux }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Reachability + register/pair three devices (emit tokens/url/tag as outputs)
+        id: seed
+        run: |
+          echo "server_url=$SERVER_URL" >> "$GITHUB_OUTPUT"
+          if ! curl -sf --max-time 8 "$SERVER_URL/up" >/dev/null 2>&1; then
+            echo "BLOCKED: shared server $SERVER_URL is unreachable from the seed (macos) runner."
+            echo "         Bring the deployed server up + ensure the runner can route to it, then re-run."
+            exit 0
+          fi
+          set +e
+          SEED="$(SERVER_URL=$SERVER_URL EMAIL=$SEED_EMAIL cargo run --quiet --manifest-path client/sync-engine/Cargo.toml --example pair_three_devices 2>&1)"
+          code=$?
+          set -e
+          echo "$SEED"
+          if [ "$code" -ne 0 ]; then
+            echo "BLOCKED: seed (register/pair) failed (rc=$code) — server reachable but the API call failed."
+            exit 0
+          fi
+          tag="$(echo "$SEED"   | sed -n 's/^TEST_TAG=//p')"
+          win="$(echo "$SEED"   | sed -n 's/^DEVICE_WIN_TOKEN=//p')"
+          mac="$(echo "$SEED"   | sed -n 's/^DEVICE_MAC_TOKEN=//p')"
+          linux="$(echo "$SEED" | sed -n 's/^DEVICE_LINUX_TOKEN=//p')"
+          if [ -z "$tag" ] || [ -z "$win" ] || [ -z "$mac" ] || [ -z "$linux" ]; then
+            echo "BLOCKED: could not parse all of tag/win/mac/linux from the seed output."
+            exit 0
+          fi
+          echo "test_tag=$tag"  >> "$GITHUB_OUTPUT"
+          echo "tok_win=$win"   >> "$GITHUB_OUTPUT"
+          echo "tok_mac=$mac"   >> "$GITHUB_OUTPUT"
+          echo "tok_linux=$linux" >> "$GITHUB_OUTPUT"
+          echo "seeded: tag=$tag, three device tokens emitted"
+
+  # 2. WIN-PUSH — Windows writes a tagged file THROUGH the CfAPI mount, waits for the push, emits
+  #    the expected v1 sha. BLOCKED if CfAPI can't run (Session-0 / interactive-session wall).
+  win-push:
+    needs: [preflight, seed]
+    if: ${{ needs.preflight.outputs.windows == 'true' }}
+    runs-on: [self-hosted, windows]
+    continue-on-error: true
+    outputs:
+      expected_sha: ${{ steps.push.outputs.EXPECTED_SHA }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Windows write THROUGH the CfAPI mount → push to the shared server
+        id: push
+        shell: powershell
+        env:
+          SERVER_URL: ${{ needs.seed.outputs.server_url }}
+          TOK_WIN:    ${{ needs.seed.outputs.tok_win }}
+          TEST_TAG:   ${{ needs.seed.outputs.test_tag }}
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: ./client/test-conformance/cross-os/win-push.ps1
+
+  # 3. MAC-PULL-1 — macOS mounts WebDAV, polls until the windows-written file reads byte-for-byte ==
+  #    the v1 sha, asserts. BLOCKED if the server is unroutable or the mount won't come up (needs an
+  #    interactive desktop session).
+  mac-pull-1:
+    needs: [preflight, seed, win-push]
+    runs-on: [self-hosted, macos]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: macOS pull #1 — read the windows-written file byte-for-byte through the WebDAV mount
+        env:
+          SERVER_URL:   ${{ env.SERVER_URL }}
+          TOK_MAC:      ${{ needs.seed.outputs.tok_mac }}
+          TEST_TAG:     ${{ needs.seed.outputs.test_tag }}
+          EXPECTED_SHA: ${{ needs.win-push.outputs.expected_sha }}
+          STEP_LABEL:   "pull-1 (windows write)"
+        run: client/test-conformance/cross-os/mac-pull.sh
+
+  # 4. LINUX-EDIT — Linux mounts FUSE, polls until the v1 file is present, EDITs it THROUGH the
+  #    mount to v2, waits for the push, emits the v2 sha. BLOCKED if /dev/fuse is unavailable.
+  linux-edit:
+    needs: [preflight, seed, win-push, mac-pull-1]
+    if: ${{ needs.preflight.outputs.linux == 'true' }}
+    runs-on: [self-hosted, linux]
+    continue-on-error: true
+    outputs:
+      expected_sha: ${{ steps.edit.outputs.EXPECTED_SHA }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System deps (FUSE + allow_other)
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold libfuse-dev fuse pkg-config
+          grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+      - name: Linux edit THROUGH the FUSE mount → push the v2 edit
+        id: edit
+        env:
+          TOK_LINUX:    ${{ needs.seed.outputs.tok_linux }}
+          TEST_TAG:     ${{ needs.seed.outputs.test_tag }}
+          EXPECTED_SHA: ${{ needs.win-push.outputs.expected_sha }}
+        run: client/test-conformance/cross-os/linux-edit.sh
+
+  # 5a. MAC-PULL-2 — macOS re-mounts, polls until the EDITED content is present byte-for-byte.
+  mac-pull-2:
+    needs: [preflight, seed, linux-edit]
+    runs-on: [self-hosted, macos]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: macOS pull #2 — read the linux-EDITED file byte-for-byte through the WebDAV mount
+        env:
+          TOK_MAC:      ${{ needs.seed.outputs.tok_mac }}
+          TEST_TAG:     ${{ needs.seed.outputs.test_tag }}
+          EXPECTED_SHA: ${{ needs.linux-edit.outputs.expected_sha }}
+          STEP_LABEL:   "pull-2 (linux edit)"
+        run: client/test-conformance/cross-os/mac-pull.sh
+
+  # 5b. WIN-PULL-2 — Windows re-mounts, polls until the EDITED content is present byte-for-byte.
+  win-pull-2:
+    needs: [preflight, seed, linux-edit]
+    if: ${{ needs.preflight.outputs.windows == 'true' }}
+    runs-on: [self-hosted, windows]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Windows pull #2 — read the linux-EDITED file byte-for-byte through the CfAPI mount
+        shell: powershell
+        env:
+          SERVER_URL:   ${{ env.SERVER_URL }}
+          TOK_WIN:      ${{ needs.seed.outputs.tok_win }}
+          TEST_TAG:     ${{ needs.seed.outputs.test_tag }}
+          EXPECTED_SHA: ${{ needs.linux-edit.outputs.expected_sha }}
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: ./client/test-conformance/cross-os/win-pull.ps1
