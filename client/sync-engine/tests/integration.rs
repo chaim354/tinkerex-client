@@ -623,6 +623,14 @@ fn best_effort_lock_coordinates_connected_devices() {
     let (ca, cb, _cloud) = two_devices(&url); // A = "device-A", B = "device-B"
     let node = format!("lock-{}", uniq());
 
+    // CREATE THE NODE FIRST. This test used to lock `node` without ever creating it, and passed --
+    // because /v1/nodes/:id/lock had no existence check at all, so locking a made-up id returned a
+    // normal 200 and wrote a lock row for a node that never was. The server now refuses a lock on
+    // anything that is not a LIVE node (404), so this test was relying on that defect. A lock test
+    // should lock a real file regardless; the missing mkdir was the bug here too.
+    ca.mkdir(&node, None, &format!("lock-target-{}", uniq()), 0o755, 0)
+        .expect("create the node this test locks");
+
     // A acquires the lock.
     let a = ca.lock(&node).expect("A lock");
     assert!(a.held && a.by_me, "A holds its own lock");
