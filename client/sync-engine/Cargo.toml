@@ -33,6 +33,12 @@ libc = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 fs-winfsp = { path = "../fs-winfsp" }
 # CfAPI is the driverless successor to WinFsp (the OneDrive model). Both compile on
-# Windows; the active backend is chosen at the call site (WinfspMount stays the default
-# until CfApiMount is proven on real hardware — see docs/plan-windows-cfapi-migration.md).
+# Windows; the active backend is chosen at the CALL SITE, and the call site is the Tauri app:
+# maker-app/src-tauri/src/lib.rs sets `type Mount = sync_engine::CfApiMount` by DEFAULT, with
+# WinfspMount behind `--features winfsp-backend` (kept for one release post-flip).
+# CfAPI IS THE SHIPPING DEFAULT -- the flip happened after a live smoke test and a byte-for-byte
+# verification on real hardware. This comment claimed the opposite ("WinfspMount stays the default
+# until CfApiMount is proven on real hardware") until 2026-08-25; it predated the flip and was
+# found by an audit, not by anything going red -- a stale comment cannot fail a build.
+# See docs/plan-windows-cfapi-migration.md.
 fs-cfapi = { path = "../fs-cfapi" }

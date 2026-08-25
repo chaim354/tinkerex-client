@@ -185,8 +185,10 @@ impl DaemonConfig {
 }
 
 /// A running FUSE mount + its two background loops (Linux). Drop (or
-/// [`stop`](Self::stop)) unmounts and tears the loops down. macOS uses [`WebdavMount`],
-/// Windows uses [`WinfspMount`].
+/// [`stop`](Self::stop)) unmounts and tears the loops down. macOS uses [`WebdavMount`];
+/// Windows uses [`CfApiMount`] by default, with [`WinfspMount`] behind the Tauri app's
+/// `winfsp-backend` feature. (This line named `WinfspMount` alone until 2026-08-25, which
+/// predated the CfAPI flip.)
 #[cfg(target_os = "linux")]
 pub struct Daemon {
     stop: Arc<AtomicBool>,
