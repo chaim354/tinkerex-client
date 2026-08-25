@@ -172,8 +172,14 @@ pub fn errno(err: &FsError) -> i32 {
         FsError::NameTooLong => 63,    // ENAMETOOLONG (macOS value)
         FsError::WouldBlock => 35,     // EAGAIN (macOS value)
         FsError::NotSupported => 1,    // EPERM
-        // A still-missing chunk after a hydrate attempt (or no hydrator) → EIO.
-        FsError::ChunkMissing(_) => 5, // EIO
+        // A write/truncate past MAX_FILE_SIZE, or an overflowing offset → EFBIG, matching
+        // the errno fs-fuse returns, rather than a generic EIO.
+        FsError::FileTooLarge => 27, // EFBIG
+        // A still-missing chunk after a hydrate attempt (or no hydrator) → EIO. A chunk that
+        // IS present but fails its content hash is also EIO: the read cannot be served, and
+        // the distinction (missing → hydrate, corrupt → fail loudly) is the provider's, not
+        // something the C ABI can express to Swift.
+        FsError::ChunkMissing(_) | FsError::ChunkCorrupt(_) => 5, // EIO
         FsError::Db(_) | FsError::Io(_) => 5, // EIO
     }
 }
