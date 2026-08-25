@@ -2,22 +2,40 @@
 
 Project context for an AI coding agent (Claude Code) and human developers.
 
-> ## READ THIS FIRST: this file was inherited, not audited
+> **Provenance.** This file was seeded from `chaim354/tinkerex`'s CLAUDE.md on 2026-08-25 (that
+> repo only ever recorded the *Rails-side* view of these crates) and **audited against this
+> repository's code the same day**. Every inherited claim held: the crate roles, `fs-cfapi` as the
+> Windows default, the `winfsp-backend` opt-out, the FSKit stub, the FUSE-T/macOS-26 note, the
+> per-OS build gotchas, Apache-2.0 across the crates, and all six conformance scripts. What the
+> seed was missing — the workspace layout, the real test counts, the four CI workflows — is filled
+> in below, and **two stale comments found in `sync-engine` are recorded in §0.**
 >
-> **Everything below was extracted from `chaim354/tinkerex` CLAUDE.md on 2026-08-25** and has
-> **NOT been verified against this repository's current code.** It was written while these crates
-> lived inside the Rails repo, and it is a *partial* description — the maker app's CLAUDE.md only
-> ever recorded what a Rails-side task needed to know about the client. Crate-level invariants,
-> the Tauri app's own structure, and anything learned since extraction are **not here**.
->
-> **Treat every rule below as a lead, not as ground truth.** Verify against the code before
-> relying on one. As each area is verified, rewrite it in place and delete this warning for that
-> section.
->
-> Existing per-crate docs are more current than this file and should be read first:
-> `client/fs-fuse/BUILD.md`, `client/fs-cfapi/BUILD.md`, `client/fs-winfsp/BUILD.md`,
-> `client/fs-fskit/BUILD.md`, `client/maker-app/README.md`, `client/maker-app/SETUP.md`,
-> `client/test-conformance/README.md`.
+> Still thin, and honestly so: this file describes the crates from the *outside*. Crate-internal
+> invariants (what `fs-provider`'s SQLite schema guarantees, how `sync-engine` orders a pull) are
+> not here. The per-crate `BUILD.md`/`README.md` files are more current on their own subjects.
+
+## 0. Orientation — what will trip you up
+
+1. **THERE IS NO CARGO WORKSPACE.** Eleven crates, eleven `Cargo.toml` files, **no `[workspace]`
+   root** — so there is no `cargo test --all`, no shared `Cargo.lock`, and no shared `target/`.
+   Every command is `cd client/<crate> && cargo …`. Every cheatsheet line below reflects that; it
+   is not a stylistic choice you can shorten.
+2. **`fs-cfapi` IS the shipping Windows mount, and two comments in `sync-engine` still say
+   otherwise.** `maker-app/src-tauri/src/lib.rs:102-107` sets `type Mount = sync_engine::CfApiMount`
+   by default, with `WinfspMount` behind `--features winfsp-backend`, and its comment records the
+   flip as done "after the live smoke + byte-for-byte" verification. But
+   **`sync-engine/Cargo.toml` still says "WinfspMount stays the default until CfApiMount is proven
+   on real hardware", and `sync-engine/src/daemon.rs:189` still says "Windows uses `WinfspMount`."**
+   Both are stale. Believe the Tauri app; the sync-engine comments describe the pre-flip world.
+   *(Found by this audit, 2026-08-25. Left in place because editing them was outside its scope.)*
+3. **`cargo test` in `client/fs-fuse` FAILS ON macOS, by design, and that is not a broken
+   checkout.** `fuser`'s build script probes pkg-config for `fuse`, and FUSE-T ships `fuse-t.pc`
+   instead — the alias fix is in `client/fs-fuse/BUILD.md`. The other crates test clean on macOS.
+   (`BUILD.md` says `fuser` 0.14; the manifest pins 0.17. Minor, but it is the file you will be
+   reading while fixing this.)
+4. **`fs-webdav` is deliberately NOT target-gated**, unlike the other mount crates. It is a WebDAV
+   *server* over `fs-provider` — "works on any OS with a WebDAV client" — and only the
+   `mount_webdav` call is macOS-specific. Do not "fix" it into a `cfg(target_os = "macos")` block.
 
 ---
 
@@ -25,28 +43,24 @@ Project context for an AI coding agent (Claude Code) and human developers.
 
 The **client half** of a local-first file sync engine: Rust crates plus a Tauri desktop app.
 Extracted from `chaim354/tinkerex` on 2026-08-20 with its own history (166 commits via
-`git filter-repo`), its own CI, and its own runner registration. The `client/` path prefix inside
-this repo was kept deliberately.
+`git filter-repo`), its own CI, and its own runner. The `client/` path prefix was kept deliberately.
 
 | crate | role |
 |---|---|
 | `fs-provider` | Local SQLite tree + FastCDC chunk store. The core: `stat`/`readdir`/`open` answer from local metadata, so **the WAN is never in the metadata path**. |
-| `fs-fuse` | Linux mount adapter (`fuser`) |
-| `fs-cfapi` | Windows mount adapter — **the default**, driverless Cloud Filter API |
-| `fs-winfsp` | Windows alternative behind a feature flag; mounts a **drive letter**, not a path |
-| `fs-webdav` | macOS mount adapter (native `mount_webdav`) |
-| `fs-fskit` | macOS FSKit bridge — **not a shipping mount path**: the Rust side builds and unit-tests, but the Swift extension that would actually mount it is **stubbed pending a paid Apple Developer membership** |
-| `sync-client` | HTTP client for the sync server's v1 API |
-| `sync-engine` | The daemon: `push` / `pull` / `hydrate` / `sync_once` |
-| `maker-app` | The Tauri desktop app |
-| `maker-app-core`, `juicefs-backend` | **Leftovers from the abandoned mount path, reference only** — see §4 |
-| `test-conformance` | Battle-tested external tools driven against our real mounts |
+| `fs-fuse` | Linux mount (`fuser`). Gated to `cfg(target_os = "linux")` **by its consumer**, `sync-engine` — its own manifest is unconditional. |
+| `fs-cfapi` | Windows mount — **the shipping default**. Driverless Cloud Filter API; mount point is a folder, not a drive letter. "Replaces the GPL-WinFsp path." |
+| `fs-winfsp` | Windows legacy, behind the Tauri app's `winfsp-backend` feature, "kept for one release post-flip". Mounts a **drive letter**. Needs `winfsp-x64.dll` on PATH — the crate deliberately does not enable winfsp-sys's `system` feature, so it builds with bundled headers. |
+| `fs-webdav` | macOS mount (native `mount_webdav`). Cross-platform by construction — see §0.4. |
+| `fs-fskit` | macOS FSKit bridge — **not a shipping mount path**. The Rust side builds and unit-tests; the Swift extension is **stubbed pending a paid Apple Developer membership**. |
+| `sync-client` | HTTP client for the sync server's v1 API. |
+| `sync-engine` | The daemon: `push` / `pull` / `hydrate` / `sync_once`, plus the per-OS mount selection. |
+| `maker-app` | The Tauri desktop app (crate lives at `maker-app/src-tauri`). |
+| `maker-app-core`, `juicefs-backend` | **Leftovers from the abandoned mount path, reference only** — §4. |
+| `test-conformance` | Battle-tested external tools driven against our real mounts. |
 
 All three shipping mounts are live over the same `Provider` and verified byte-for-byte against a
 real deployed server.
-
----
-
 ## 2. Architecture
 
 > **A remote-mounted filesystem does NOT work over the WAN.** rclone/JuiceFS mount = synchronous
@@ -95,15 +109,23 @@ per-object presigned URLs.
   is greyed out. That is why macOS ships WebDAV.
 
 ---
+---
 
 ## 5. Build and run
 
-Deps are **strictly target-gated** so each OS compiles only its own.
+**No workspace (§0.1) — every command is per-crate.** Measured on macOS, 2026-08-25:
+
+| crate | `cargo test` |
+|---|---|
+| `fs-provider` | **83 passing** across 6 test binaries (chunking, posix, convergence, concurrency, caching) |
+| `sync-engine` | **92 passing** |
+| `sync-client` | **37 passing** |
+| `fs-webdav` | **8 passing** |
+| `fs-fuse` | **build failure on macOS by design** — §0.3 |
 
 ```sh
-# Crate tests (hermetic)
-(cd client/fs-provider && cargo test)   # chunking / posix / convergence / concurrency / caching
-(cd client/sync-client && cargo test)
+(cd client/fs-provider && cargo test)
+(cd client/sync-client  && cargo test)
 
 # sync-engine integration needs a running sync server (skips cleanly without one).
 # The server is chaim354/tinkerex-sync, NOT the maker app -- the maker app has not served
@@ -128,36 +150,40 @@ client/test-conformance/pjdfstest-fuse.sh     # pjdfstest POSIX map <-> FUSE (Li
 ```
 
 **Per-OS gotchas:**
-- **macOS** → WebDAV. `fs-fuse` on macOS needs FUSE-T plus an `osxfuse`→`fuse-t` pkg-config alias
-  and an rpath — see `client/fs-fuse/BUILD.md`.
-- **Linux** → FUSE. `auto_unmount` needs `user_allow_other` in `/etc/fuse.conf` plus `/dev/fuse`
-  access.
-- **Windows** → CfAPI by default. WinFsp needs LLVM/libclang to build and `winfsp-x64.dll` on
-  PATH at runtime.
+- **macOS** → WebDAV. `fs-fuse` needs FUSE-T plus an `osxfuse`→`fuse-t` pkg-config alias and an
+  rpath — `client/fs-fuse/BUILD.md` (§0.3).
+- **Linux** → FUSE. `auto_unmount` needs `user_allow_other` in `/etc/fuse.conf` plus `/dev/fuse`.
+- **Windows** → CfAPI (§0.2). WinFsp needs LLVM/libclang to build and `winfsp-x64.dll` on PATH.
 
 **TWO-DEVICE REAL-MOUNT E2E LIVES PARTLY IN THE OTHER REPO, DELIBERATELY.**
 `two-device-fuse.sh` and `two-device-webdav-macos.sh` boot their **own local Rails server** (they
 `cd` upward to find `bin/rails`), so they must be run **from the maker app repo's root** even
-though the scripts live here — which is also why that repo's `nightly.yml` keeps those two legs,
-via a checkout-and-symlink trick that file documents. `two-device-cfapi.ps1` targets the
-**deployed** server, needs no local Rails, and lives entirely in this repo's CI.
+though the scripts live here — which is why that repo's `nightly.yml` keeps those legs.
+`two-device-cfapi.ps1` targets the **deployed** server, needs no local Rails, and lives entirely in
+this repo's CI.
 
 ---
 
-## 6. CI
+## 6. CI — four workflows, and most of them cannot run
 
-- **SELF-HOSTED runners only — never GitHub-hosted.** Every job uses
-  `runs-on: [self-hosted, linux|macos|windows]`. GitHub bills *only* hosted runners
-  (`ubuntu/macos/windows-latest`; macOS 10×, Windows 2×). **Never add `*-latest`.**
-- **This repo has ONE registered runner: `charless-MBP-maker-mac` (macOS, ARM64), as of
-  2026-08-24.** That is what made the `Rust client` workflow start actually running (~90 s)
-  instead of queueing forever. **Verify rather than trusting that date** —
-  `gh api repos/:owner/:repo/actions/runners` with an **admin-scoped** token (it 403s from inside
-  Actions, since `administration` is not a permission a workflow `GITHUB_TOKEN` can hold).
-- **`flasher-maker-linux` and `CHAIMDESK-maker-windows` are registered NOWHERE.** Linux and
-  Windows coverage is **skipped, not passing.** A job matching no online runner does not fail — it
-  queues 24 h at 0 elapsed and is auto-cancelled, which once left a PR UNSTABLE for five weeks.
-  Gate such jobs on a repo variable rather than letting them queue.
+- **SELF-HOSTED runners only, never `*-latest`.** GitHub bills only hosted runners; self-hosted are
+  free. Verified: no `*-latest` appears in any workflow here.
+
+| workflow | trigger | runner |
+|---|---|---|
+| `rust-client.yml` | push, PR, dispatch (one slice on demand) | macOS — **the only one that actually runs** |
+| `build-app.yml` | push, dispatch | `[self-hosted, linux]` |
+| `install-app-on-runners.yml` | `workflow_run`, dispatch | `[self-hosted, linux]` |
+| `cross-os-e2e.yml` | dispatch only — **its nightly schedule is commented out**, gated on `CI_RUNNERS` | all three OSes, `continue-on-error` |
+
+- **ONE runner is registered: `charless-MBP-maker-mac` (macOS, ARM64), online.** Verify rather than
+  trust: `gh api repos/chaim354/tinkerex-client/actions/runners`, with an **admin-scoped** token —
+  `administration` is not a permission a workflow `GITHUB_TOKEN` can hold, so it 403s from inside
+  Actions.
+- **Consequence: the three linux/windows workflows queue-and-cancel rather than fail.** A job
+  matching no online runner sits 24 h at 0 elapsed and is auto-cancelled, which reads as UNSTABLE,
+  not red — the failure mode that once left a PR stuck for five weeks in the other repo. **Linux
+  and Windows coverage is skipped, not passing.**
 - Self-hosted machines are **persistent**: make dep-install steps idempotent and do not assume the
   clean toolchain of a hosted image.
 
@@ -167,8 +193,8 @@ via a checkout-and-symlink trick that file documents. `two-device-cfapi.ps1` tar
 
 | repo | role |
 |---|---|
-| `chaim354/tinkerex-sync` | The **sync server** these crates sync against — chunk/version/changelog engine. Runs as the `sync` Kamal accessory. |
-| `chaim354/tinkerex` | The **maker app** (Rails) — projects, inventory, model library. Owns `docs/sync-protocol.md`, the normative wire spec. It is a *sibling client* of the sync server, not this repo's server. |
+| `chaim354/tinkerex-sync` | The **sync server** these crates sync against — chunk/version/changelog engine, 26-endpoint v1 API. Runs as the `sync` Kamal accessory. Has its own CLAUDE.md. |
+| `chaim354/tinkerex` | The **maker app** (Rails) — projects, inventory, model library. Owns `docs/sync-protocol.md`, the normative wire spec. A *sibling client* of the sync server, not this repo's server. |
 
-Clone siblings alongside this one (`../tinkerex`, `../tinkerex-sync`) — that is the convention
-both repos' CI uses.
+Clone siblings alongside this one (`../tinkerex`, `../tinkerex-sync`) — the convention both repos'
+CI uses.
