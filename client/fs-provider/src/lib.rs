@@ -32,6 +32,14 @@ use staging::StagingArea;
 
 pub const ROOT_INO: u64 = 1;
 
+/// An upper bound on a single file's logical size (its highest written byte offset + 1).
+/// The staging buffer is materialized in memory, so an absurd write offset (a buggy/hostile
+/// client, or `offset + len` overflowing) would otherwise demand a petabyte allocation and
+/// **abort the whole process** (SIGABRT) — taking the mount daemon down. 16 TiB is far above
+/// any real maker file (multi-GB CAD/3D), so a write/truncate beyond it is a bug, rejected
+/// with `FileTooLarge` (EFBIG) instead of attempted.
+pub const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024; // 16 TiB
+
 /// POSIX `NAME_MAX`: the maximum length, **in bytes**, of a single path component. A
 /// longer name fails with `ENAMETOOLONG` (pjdfstest `<op>/02.t`). The kernel enforces this
 /// per component (bytes, not chars), so we mirror it on every node-creating/-renaming path.
@@ -81,6 +89,19 @@ fn escape_like(s: &str) -> String {
 /// mtime bump. Nanos resolution matches what build tools and the future CfAPI/File-Provider
 /// metadata want; stored as i64 (a `bigint` on the wire/server — unix-nanos in 2026
 /// overflow a 32-bit int).
+/// Map a chunk-store read error to the right `FsError`: `InvalidData` (the verifying read's
+/// hash-mismatch) is *corruption* (→ `ChunkCorrupt`, EIO), anything else (typically
+/// `NotFound`) means the chunk isn't local yet (→ `ChunkMissing`, which the mount read-path
+/// hydrates + retries). Conflating the two would either mask corruption as a hydratable miss
+/// (silently re-fetching forever / serving wrong bytes) or treat a real miss as fatal.
+fn map_chunk_err(e: std::io::Error, hash: &str) -> FsError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        FsError::ChunkCorrupt(hash.to_string())
+    } else {
+        FsError::ChunkMissing(hash.to_string())
+    }
+}
+
 fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -305,8 +326,18 @@ pub enum FsError {
     /// Mapped to `ENAMETOOLONG` by the adapters.
     #[error("file name too long")]
     NameTooLong,
+    /// A write/truncate would push a file past [`MAX_FILE_SIZE`] (or `offset + len` overflows).
+    /// Rejected (EFBIG) rather than attempting a petabyte staging allocation that would abort
+    /// the process. Maps to `EFBIG` in the adapters (catch-all → EIO is also acceptable).
+    #[error("file too large")]
+    FileTooLarge,
     #[error("chunk missing: {0}")]
     ChunkMissing(String),
+    /// A chunk's stored bytes no longer hash to its content-address key — bitrot, a torn
+    /// write, or a wrong download. Surfaced (not silently assembled) so a corrupt read fails
+    /// loudly instead of returning wrong file content. The mount adapters map this to `EIO`.
+    #[error("chunk corrupt: {0}")]
+    ChunkCorrupt(String),
     #[error("locked (would block)")]
     WouldBlock,
     /// The operation targets a node kind the sync engine deliberately does not model —
@@ -594,10 +625,13 @@ impl SqliteProvider {
         let mut out = Vec::new();
         for row in rows {
             let (hash, len) = row?;
+            // Verifying read: a chunk whose bytes no longer hash to its key is *corruption*
+            // (EIO), distinct from a chunk that isn't present yet (ChunkMissing → hydrate).
+            // Returning the bytes unchecked would reconstruct a corrupt file silently.
             let bytes = self
                 .store
-                .get(&hash)
-                .map_err(|_| FsError::ChunkMissing(hash))?;
+                .get_verified(&hash)
+                .map_err(|e| map_chunk_err(e, &hash))?;
             // Trust the manifest length; chunk store returns the whole chunk.
             out.extend_from_slice(&bytes[..len.min(bytes.len())]);
         }
@@ -645,8 +679,8 @@ impl SqliteProvider {
             }
             let bytes = self
                 .store
-                .get(&hash)
-                .map_err(|_| FsError::ChunkMissing(hash))?;
+                .get_verified(&hash)
+                .map_err(|e| map_chunk_err(e, &hash))?;
             let bytes = &bytes[..c_len.min(bytes.len())];
             // Overlap of [c_off, c_end) with [offset, req_end), copied into the output buffer.
             let copy_start = c_off.max(offset);
@@ -2035,6 +2069,17 @@ impl Provider for SqliteProvider {
             Kind::Dir => return Err(FsError::IsADirectory),
             Kind::Symlink => return Err(FsError::InvalidArgument),
         }
+        // Cap the resulting end offset with checked arithmetic BEFORE either staging
+        // path runs: both `write_at` and `seed_and_write_at` splice, which resizes the
+        // in-memory buffer, so an absurd or overflowing `offset + len` would attempt a
+        // petabyte allocation and SIGABRT the process, taking the mount down. Reject
+        // with EFBIG instead, and do it here so a rejected write leaves staging
+        // untouched. (Checked before the splice rather than around `buf` as originally
+        // written -- main moved the buffer mutation behind `Staging`.)
+        offset
+            .checked_add(data.len() as u64)
+            .filter(|&e| e <= MAX_FILE_SIZE)
+            .ok_or(FsError::FileTooLarge)?;
         // Already open for write → splice straight in, under one lock hold.
         if !self.staged.write_at(ino, offset, data) {
             // Not staged yet. Seed with the current committed content so partial writes to
@@ -2052,7 +2097,12 @@ impl Provider for SqliteProvider {
     }
 
     fn flush(&self, ino: u64) -> Result<()> {
-        let buf = match self.staged.take(ino) {
+        // SNAPSHOT the staged buffer; do NOT take it yet. If anything below fails (a chunk
+        // `put` to a full or unreachable store, the DB transaction), the staged edit must
+        // survive so it can be retried -- otherwise a failed flush silently DROPS the
+        // user's write while the node keeps its old content, and apps rarely retry a failed
+        // flush. It is released only after `tx.commit()` is durable, and only if unchanged.
+        let buf = match self.staged.snapshot(ino) {
             Some(b) => b,
             None => return Ok(()), // nothing staged
         };
@@ -2108,6 +2158,10 @@ impl Provider for SqliteProvider {
             Self::enqueue(&tx, &node_id, "upsert")?;
         }
         tx.commit()?;
+        // Commit is durable, so the staged buffer can now be released -- but only if it is
+        // still the bytes we committed. A writer that landed after the snapshot above left a
+        // NEWER buffer, and dropping that would lose an unflushed write.
+        self.staged.release_if_unchanged(ino, &buf);
         Ok(())
     }
 
@@ -2132,6 +2186,12 @@ impl Provider for SqliteProvider {
                 Some(Kind::Symlink) => return Err(FsError::InvalidArgument),
                 Some(Kind::File) => {}
             }
+        }
+        // Cap the target size: a grow-truncate to an absurd size materializes a zero-filled
+        // staging buffer of that length — the same petabyte-allocation SIGABRT as a wild
+        // write offset. Reject with EFBIG before allocating. (Shrink/zero is always fine.)
+        if size > MAX_FILE_SIZE {
+            return Err(FsError::FileTooLarge);
         }
         // If the file is already open for write, resize the live staging buffer in
         // place; the eventual `flush`/`release` commits the new length. Shrinking here

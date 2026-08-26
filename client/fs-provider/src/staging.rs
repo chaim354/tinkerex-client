@@ -86,8 +86,13 @@ impl StagingArea {
         self.buffers.lock().unwrap().insert(ino, bytes);
     }
 
-    /// Remove and return the staged buffer — the `flush` path. `None` means "nothing
-    /// staged", which its caller treats as success, not as an error.
+    /// Remove and return the staged buffer. `None` means "nothing staged".
+    ///
+    /// **No longer the `flush` path, deliberately.** `flush` snapshots, commits, and only
+    /// then calls [`Self::release_if_unchanged`]: taking up front loses the user's write if
+    /// anything between the take and the commit fails. Kept as a primitive and unit-tested,
+    /// but currently uncalled -- if you reach for it in `flush`, read that method first.
+    #[allow(dead_code)]
     pub(crate) fn take(&self, ino: u64) -> Option<Vec<u8>> {
         self.buffers.lock().unwrap().remove(&ino)
     }
@@ -129,6 +134,28 @@ impl StagingArea {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Release the staged buffer for `ino` **only if it still byte-matches `committed`**.
+    ///
+    /// `flush` snapshots the buffer, commits that snapshot, and only then releases it — it
+    /// must not `take` up front, or a failure between the two (a chunk `put` to a full or
+    /// unreachable store, the DB transaction) silently DROPS the user's write while the node
+    /// keeps its old content. Apps rarely retry a failed flush, so that is real data loss.
+    ///
+    /// The equality check is what makes the deferral safe under concurrency: a writer that
+    /// landed after the snapshot left a NEWER buffer, and releasing unconditionally would
+    /// discard that unflushed write. Single-writer-per-file is the normal case; this makes
+    /// the concurrent one safe rather than lossy. Returns whether the buffer was released.
+    pub(crate) fn release_if_unchanged(&self, ino: u64, committed: &[u8]) -> bool {
+        let mut map = self.buffers.lock().unwrap();
+        match map.get(&ino) {
+            Some(buf) if buf.as_slice() == committed => {
+                map.remove(&ino);
+                true
+            }
+            _ => false,
         }
     }
 

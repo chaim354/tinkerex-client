@@ -5,6 +5,7 @@
 //! GET and uploads via presigned PUT; it implements this same trait, so the
 //! [`Provider`](crate::Provider) doesn't change.
 
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,6 +15,26 @@ static TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 /// A content-addressed blob store. `hash` is the hex SHA-256 of `data`.
 pub trait ChunkStore: Send + Sync {
     fn get(&self, hash: &str) -> std::io::Result<Vec<u8>>;
+
+    /// Like [`get`](Self::get), but **verifies** the returned bytes hash to the requested
+    /// key before handing them back. The store is content-addressed (key = hex SHA-256 of
+    /// the bytes), so this is the integrity backbone: bitrot, a torn write that survived a
+    /// crash, or a wrong/garbled presigned download all produce bytes whose hash no longer
+    /// matches the key, and this returns `InvalidData` instead of letting corrupt bytes flow
+    /// into a reconstructed file. The default re-hashes after `get`; a backend that verifies
+    /// natively (e.g. an S3 checksum) may override. Hot-path callers that have already
+    /// verified (or explicitly opt out) can still use the plain `get`.
+    fn get_verified(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        let bytes = self.get(hash)?;
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != hash {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("chunk integrity check failed: expected {hash}, got {actual}"),
+            ));
+        }
+        Ok(bytes)
+    }
     /// Idempotent: storing a hash that already exists is a no-op (this is the dedup).
     fn put(&self, hash: &str, data: &[u8]) -> std::io::Result<()>;
     fn has(&self, hash: &str) -> bool;

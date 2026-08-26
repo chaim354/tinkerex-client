@@ -367,7 +367,10 @@ fn read_on_a_directory_is_eisdir() {
 fn write_on_a_directory_is_eisdir_and_leaves_it_a_directory() {
     let p = provider();
     let d = p.mkdir(ROOT, "d").unwrap();
-    assert!(matches!(p.write(d.ino, 0, b"x"), Err(FsError::IsADirectory)));
+    assert!(matches!(
+        p.write(d.ino, 0, b"x"),
+        Err(FsError::IsADirectory)
+    ));
     // A failed write must not have staged content that a later flush turns into a manifest.
     p.flush(d.ino).unwrap();
     assert_eq!(p.getattr(d.ino).unwrap().kind, Kind::Dir);
@@ -407,7 +410,10 @@ fn read_on_a_symlink_is_einval() {
     // a read() on a symlink ino is a structural misuse → EINVAL (not the target bytes).
     let p = provider();
     let l = p.symlink(ROOT, "l", b"the/target").unwrap();
-    assert!(matches!(p.read(l.ino, 0, 16), Err(FsError::InvalidArgument)));
+    assert!(matches!(
+        p.read(l.ino, 0, 16),
+        Err(FsError::InvalidArgument)
+    ));
 }
 
 // ---- readdir target-kind errnos --------------------------------------------------------
