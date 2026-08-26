@@ -1,5 +1,13 @@
 # UI audit — maker-app (Tauri client)
 
+> **HISTORICAL — kept for the reasoning, not as a description of the code.**
+> This audits `client/maker-app/src` as it stood on 2026-06-12, when the whole UI lived in
+> one file. `main` has since split CSS/JS and added accessible loading/empty/error states
+> (`ff3d468`), then built the Library, Projects, Inventory, BOM, Preview and Settings
+> surfaces on top. The findings below are largely ADDRESSED; the rework branch that
+> accompanied this audit was superseded and not merged. Read it for *why* the structure
+> changed, and do not treat any "current stack" claim here as current.
+
 _Audit date: 2026-06-12. Scope: the desktop client frontend at `client/maker-app/src`._
 
 ## 1. Current stack & structure
