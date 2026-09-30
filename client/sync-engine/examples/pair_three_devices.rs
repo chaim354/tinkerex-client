@@ -62,8 +62,19 @@ fn main() {
     };
 
     // Each brand-new device enrolls by logging in with the SAME account credentials (the
-    // Dropbox model — each device authenticates independently; no pairing codes).
+    // Dropbox model — each device authenticates independently; no pairing codes). Against the
+    // sync server (SYNC_IT_ADMIN_TOKEN set) there is no password login: each joins as a sibling
+    // device through the first device's credential instead.
     let join = |name: &str| -> String {
+        if sync_client::admin_token_configured() {
+            return match c_win.create_device(name) {
+                Ok(d) => d.device_token,
+                Err(e) => {
+                    eprintln!("create_device {name} failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+        }
         let mut c = ServerClient::new(&server);
         match c.device_login(&email, password, name) {
             Ok(r) => r.device_token,

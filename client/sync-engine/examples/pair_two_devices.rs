@@ -50,20 +50,32 @@ fn main() {
     };
 
     // Brand-new device B enrolls by logging in with the SAME account credentials (the Dropbox
-    // model — each device authenticates independently; no pairing codes).
-    let mut cb = ServerClient::new(&server);
-    let reg_b = match cb.device_login(&email, password, "device-B") {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("B device_login failed (bad credentials/unconfirmed/locked?): {e}");
-            std::process::exit(1);
+    // model — each device authenticates independently; no pairing codes). Against the sync
+    // server (SYNC_IT_ADMIN_TOKEN set) there is no password login: B joins as a sibling device
+    // through A's credential instead.
+    let reg_b_token = if sync_client::admin_token_configured() {
+        match ca.create_device("device-B") {
+            Ok(d) => d.device_token,
+            Err(e) => {
+                eprintln!("B create_device failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let mut cb = ServerClient::new(&server);
+        match cb.device_login(&email, password, "device-B") {
+            Ok(r) => r.device_token,
+            Err(e) => {
+                eprintln!("B device_login failed (bad credentials/unconfirmed/locked?): {e}");
+                std::process::exit(1);
+            }
         }
     };
 
     // Machine-parseable lines for the test scripts. Keep these stable.
     println!("PAIR_EMAIL={email}");
     println!("DEVICE_A_TOKEN={}", reg_a.device_token);
-    println!("DEVICE_B_TOKEN={}", reg_b.device_token);
+    println!("DEVICE_B_TOKEN={}", reg_b_token);
 
     // The human-readable confirmation goes to STDOUT (not stderr): the PowerShell harness runs
     // with `$ErrorActionPreference='Stop'`, which treats ANY native-command stderr output as a

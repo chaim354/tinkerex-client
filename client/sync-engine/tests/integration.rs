@@ -411,6 +411,13 @@ fn re_push_of_identical_content_dedups_and_stays_consistent() {
 
 #[test]
 fn device_login_adds_a_device_to_an_existing_library() {
+    // `/v1/devices/login` is the maker app's route: the sync server (chaim354/tinkerex-sync) has
+    // no password accounts, so under SYNC_IT_ADMIN_TOKEN this test has nothing to prove there.
+    // A printed notice rather than a silent pass: the run's log says it did not run.
+    if sync_client::admin_token_configured() {
+        eprintln!("SKIPPED device_login_adds_a_device_to_an_existing_library: SYNC_IT_ADMIN_TOKEN is set (the sync server has no password login)");
+        return;
+    }
     let url = server_url!();
     let email = format!("login-{}@example.com", uniq());
     let password = "correct horse battery staple";
