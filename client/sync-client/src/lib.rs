@@ -62,6 +62,40 @@ pub struct RegisterResponse {
     pub head_seq: i64,
 }
 
+/// `GET /v1/devices/whoami`: the identity behind the current device token and the library's
+/// current `head_seq` (a joining device's starting changelog cursor).
+#[derive(Debug, Deserialize)]
+pub struct WhoAmI {
+    pub user_id: i64,
+    pub device_id: i64,
+    pub head_seq: i64,
+}
+
+/// What `POST /v1/admin/libraries` answers on the sync server (chaim354/tinkerex-sync).
+#[derive(Debug, Deserialize)]
+struct ProvisionedLibrary {
+    user_id: i64,
+    device_id: i64,
+    device_token: String,
+}
+
+/// The env var that switches `enroll` to the sync server's admin door — see `enroll`.
+pub const ADMIN_TOKEN_ENV: &str = "SYNC_IT_ADMIN_TOKEN";
+
+/// Whether `SYNC_IT_ADMIN_TOKEN` is set: the suites ask this to pick the sync server's routes
+/// (a sibling device via `create_device`) over the maker app's password login.
+pub fn admin_token_configured() -> bool {
+    admin_token_from_env().is_some()
+}
+
+/// `SYNC_IT_ADMIN_TOKEN`, if set and non-blank.
+fn admin_token_from_env() -> Option<String> {
+    std::env::var(ADMIN_TOKEN_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Decode an optional base64 string field into raw bytes — used for symlink targets,
 /// which are raw (possibly non-UTF8) path bytes the server carries base64'd over JSON.
 /// Absent/null → `None`; a malformed base64 string surfaces as a deserialize error.
@@ -459,18 +493,65 @@ impl ServerClient {
 
     /// TEST/DEV convenience: create a confirmed account (via the signup seam) then enroll
     /// this device via `device_login`. A near drop-in for the old `register` bootstrap.
+    ///
+    /// AGAINST THE SYNC SERVER (chaim354/tinkerex-sync) THERE IS NO SIGNUP SEAM AND NO PASSWORD
+    /// LOGIN — `/v1/test/users` and `/v1/devices/login` are the maker app's routes, which that
+    /// server has never served, so every server-backed suite and example that enrolled this way
+    /// could only ever have run against the maker app. Its door is `POST /v1/admin/libraries`,
+    /// gated by an operator token (the same `SYNC_ADMIN_TOKEN` the maker app provisions with).
+    /// When `SYNC_IT_ADMIN_TOKEN` is set, enrolment goes through that door instead
+    /// (`provision_library`): a fresh library per email, `head_seq` read back from `whoami`.
+    /// The password is then unused — the sync server has no account to check it against.
     pub fn enroll(
         &mut self,
         email: &str,
         password: &str,
         device_name: &str,
     ) -> Result<RegisterResponse> {
+        if let Some(admin) = admin_token_from_env() {
+            return self.provision_library(&admin, email, device_name);
+        }
         // Best-effort: in dev/test the gated `/v1/test/users` seam creates a confirmed
         // account; on a production server that seam is off (404) and the account is
         // expected to already exist (e.g. pre-created via `kamal app exec`). Either way
         // the device-login below is the real auth — only its failure is fatal.
         let _ = self.create_test_user(email, password);
         self.device_login(email, password, device_name)
+    }
+
+    /// Provision a brand-new library on the sync server through its admin door and hold the
+    /// first device's token. A repeat call for the same email answers 409 `email_taken` there —
+    /// the door never mints a second credential onto an existing library — so callers that need
+    /// a second device on the same library use `create_device`, as `two_devices` does.
+    pub fn provision_library(
+        &mut self,
+        admin_token: &str,
+        email: &str,
+        device_name: &str,
+    ) -> Result<RegisterResponse> {
+        let resp = self
+            .http
+            .post(self.url("/v1/admin/libraries"))
+            .header("Authorization", format!("Bearer {admin_token}"))
+            .json(&serde_json::json!({ "email": email, "name": device_name }))
+            .send()?;
+        let p: ProvisionedLibrary = Self::json(resp)?;
+        self.token = Some(p.device_token.clone());
+        let who = self.whoami()?;
+        Ok(RegisterResponse {
+            user_id: p.user_id,
+            device_id: p.device_id,
+            device_token: p.device_token,
+            head_seq: who.head_seq,
+        })
+    }
+
+    /// `GET /v1/devices/whoami` for the current token.
+    pub fn whoami(&self) -> Result<WhoAmI> {
+        let resp = self
+            .authed(self.http.get(self.url("/v1/devices/whoami")))?
+            .send()?;
+        Self::json(resp)
     }
 
     /// Register another device for the current user (returns a new device token).
@@ -918,5 +999,112 @@ mod tests {
         assert_eq!(resp.results[0].size, Some(12));
         assert_eq!(resp.results[1].kind, "dir");
         assert_eq!(resp.results[1].size, None);
+    }
+
+    /// A one-shot HTTP stub for the two requests `provision_library` makes, in order: the admin
+    /// door (asserting the OPERATOR bearer) and whoami (asserting the freshly minted DEVICE
+    /// bearer). Anything else, or the wrong bearer, answers 500 so the test fails on the response
+    /// rather than hanging.
+    fn provisioning_stub(admin: &'static str, minted: &'static str) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let expectations = [
+                (
+                    "POST /v1/admin/libraries",
+                    admin,
+                    format!("{{\"user_id\":42,\"device_id\":7,\"device_token\":\"{minted}\"}}"),
+                    "201 Created",
+                ),
+                (
+                    "GET /v1/devices/whoami",
+                    minted,
+                    "{\"user_id\":42,\"device_id\":7,\"head_seq\":9}".to_string(),
+                    "200 OK",
+                ),
+            ];
+            for (want_line, want_bearer, body, status) in expectations {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut bearer_ok = false;
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end().to_string();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line
+                        .strip_prefix("authorization: ")
+                        .or_else(|| line.strip_prefix("Authorization: "))
+                    {
+                        bearer_ok = v == format!("Bearer {want_bearer}");
+                    }
+                    if let Some(v) = line
+                        .strip_prefix("content-length: ")
+                        .or_else(|| line.strip_prefix("Content-Length: "))
+                    {
+                        content_length = v.parse().unwrap_or(0);
+                    }
+                }
+                let mut discard = vec![0u8; content_length];
+                reader.read_exact(&mut discard).unwrap();
+                let ok = request_line.starts_with(want_line) && bearer_ok;
+                let (status, body) = if ok {
+                    (status, body)
+                } else {
+                    (
+                        "500 Internal Server Error",
+                        format!("unexpected {request_line:?} bearer_ok={bearer_ok}"),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn provision_library_takes_the_admin_door_then_reads_head_seq_from_whoami() {
+        let base = provisioning_stub("op-token", "minted-device-token");
+        let mut c = ServerClient::new(&base);
+        let reg = c
+            .provision_library("op-token", "fresh@example.com", "device-A")
+            .expect("provisioning");
+        assert_eq!(reg.user_id, 42);
+        assert_eq!(reg.device_id, 7);
+        assert_eq!(reg.device_token, "minted-device-token");
+        assert_eq!(
+            reg.head_seq, 9,
+            "head_seq comes from whoami, not the admin response"
+        );
+        assert_eq!(
+            c.token.as_deref(),
+            Some("minted-device-token"),
+            "the client now holds the minted token"
+        );
+    }
+
+    #[test]
+    fn a_blank_admin_token_env_means_the_maker_path() {
+        // The only test that touches this env var, so no other test can observe the window.
+        std::env::set_var(ADMIN_TOKEN_ENV, "   ");
+        assert!(admin_token_from_env().is_none(), "blank is unset");
+        std::env::set_var(ADMIN_TOKEN_ENV, " op-token ");
+        assert_eq!(
+            admin_token_from_env().as_deref(),
+            Some("op-token"),
+            "trimmed"
+        );
+        std::env::remove_var(ADMIN_TOKEN_ENV);
+        assert!(admin_token_from_env().is_none());
     }
 }

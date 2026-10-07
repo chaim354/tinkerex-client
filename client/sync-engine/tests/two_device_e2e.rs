@@ -190,12 +190,21 @@ fn register_and_pair(url: &str) -> (DeviceCtx, DeviceCtx) {
     let a = DeviceCtx::new("A", url, reg_a.device_token);
 
     // Brand-new device B enrolls by logging in with the SAME account credentials (the Dropbox
-    // model — each device authenticates independently; no pairing codes).
-    let mut cb = ServerClient::new(url);
-    let reg_b: RegisterResponse = cb
-        .device_login(&email, password, "device-B")
-        .expect("B logs in");
-    let b = DeviceCtx::new("B", url, reg_b.device_token);
+    // model — each device authenticates independently; no pairing codes). Against the sync
+    // server (SYNC_IT_ADMIN_TOKEN set) there is no password login: B joins as a sibling device
+    // through A's own credential, which is the route every client has there.
+    let b_token = if sync_client::admin_token_configured() {
+        ca.create_device("device-B")
+            .expect("B joins as a sibling device")
+            .device_token
+    } else {
+        let mut cb = ServerClient::new(url);
+        let reg_b: RegisterResponse = cb
+            .device_login(&email, password, "device-B")
+            .expect("B logs in");
+        reg_b.device_token
+    };
+    let b = DeviceCtx::new("B", url, b_token);
 
     (a, b)
 }
@@ -231,11 +240,7 @@ fn canonical_roundtrip_a_writes_b_reads_b_edits_a_reads() {
         .provider
         .lookup(b_proj.ino, "lamp.scad")
         .expect("B sees lamp.scad");
-    assert_eq!(
-        b.read_hydrated(bf.ino),
-        v1,
-        "B reads A's v1 byte-for-byte"
-    );
+    assert_eq!(b.read_hydrated(bf.ino), v1, "B reads A's v1 byte-for-byte");
 
     // --- 3. Device B edits the file through its provider and pushes.
     let v2: Vec<u8> =
@@ -671,11 +676,7 @@ fn hydrated_file_reads_offline_on_b() {
     // B hydrates ONLINE (chunks land in B's local cache).
     b.initial_sync();
     let bf = b.provider.lookup(ROOT_INO, "offline.bin").unwrap();
-    assert_eq!(
-        b.read_hydrated(bf.ino),
-        body,
-        "online read after hydrate"
-    );
+    assert_eq!(b.read_hydrated(bf.ino), body, "online read after hydrate");
 
     // Now go OFFLINE: re-hydrate must touch nothing (all cached) and the read still serves bytes.
     let node_id = b.node_id(bf.ino);

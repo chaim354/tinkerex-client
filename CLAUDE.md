@@ -119,18 +119,46 @@ per-object presigned URLs.
 |---|---|
 | `fs-provider` | **83 passing** across 6 test binaries (chunking, posix, convergence, concurrency, caching) |
 | `sync-engine` | **92 passing** |
-| `sync-client` | **37 passing** |
+| `sync-client` | **39 passing** (2026-09-30; was 37) |
 | `fs-webdav` | **8 passing** |
 | `fs-fuse` | **build failure on macOS by design** — §0.3 |
+
+**The server-backed `sync-engine` suites run against `chaim354/tinkerex-sync` only with two env
+knobs, and until 2026-09-30 could not run against it at all.** Every suite and example enrolled
+through `ServerClient::enroll` → `POST /v1/test/users` + `POST /v1/devices/login`, which are the
+MAKER APP's routes; the sync server never served them, so the line this file used to carry here
+("the server is chaim354/tinkerex-sync") described a run nobody could have made. Now:
+`SYNC_IT_ADMIN_TOKEN=<the server's SYNC_ADMIN_TOKEN>` switches `enroll` to the sync server's own
+door (`POST /v1/admin/libraries`, one fresh library per email, `head_seq` read back from
+`whoami`), and a second device joins as a sibling through `create_device` instead of a password
+login. The server must be booted with **`SYNC_VERIFY_FINALIZE=0`**: these suites move chunk bytes
+through `SharedDirIO`, never the server's store, and finalize's default verify refuses a commit
+whose bytes it cannot see. Measured against the Rust server (tinkerex-sync `crates/tinkerex-sync`,
+booted by the maker repo's `SYNC_IMPL=rust bin/sync-server`), Linux, 2026-09-30:
+
+| suite | result |
+|---|---|
+| `integration` | 25 passing |
+| `fault_injection` | 11 passing |
+| `two_device_e2e` | 9 passing |
+| `parallel_hydration` | 8 passing |
+| `offline_availability` | 5 passing |
+| `adversarial_sync`, `concurrency_load`, `multifiletype_conformance` | 4 passing each |
+| `scale`, `reconcile_sweep` | 1 passing each |
+
+`device_login_adds_a_device_to_an_existing_library` prints SKIPPED under the admin token: password
+login is the maker app's, and the run's log says so rather than passing silently.
 
 ```sh
 (cd client/fs-provider && cargo test)
 (cd client/sync-client  && cargo test)
 
 # sync-engine integration needs a running sync server (skips cleanly without one).
-# The server is chaim354/tinkerex-sync, NOT the maker app -- the maker app has not served
-# /v1/commit since embedded chunk was retired on 2026-08-25.
-(cd client/sync-engine && SYNC_IT_SERVER_URL=http://localhost:3002 cargo test --test integration)
+# Against chaim354/tinkerex-sync (the Rust binary or the Ruby host), boot it with
+# SYNC_VERIFY_FINALIZE=0 and pass its admin token -- see the paragraph above.
+(cd client/sync-engine && SYNC_IT_SERVER_URL=http://localhost:3002 SYNC_IT_ADMIN_TOKEN=... cargo test --test integration)
+# Against the maker app (which serves /v1/test/users + /v1/devices/login), no admin token:
+(cd client/sync-engine && SYNC_IT_SERVER_URL=http://localhost:3000 cargo test --test integration)
 
 # Live cross-stack demos (SERVER_URL points at a running sync server, default port 3002)
 (cd client/sync-client && SERVER_URL=http://localhost:3002 cargo run --example e2e)
@@ -193,7 +221,7 @@ this repo's CI.
 
 | repo | role |
 |---|---|
-| `chaim354/tinkerex-sync` | The **sync server** these crates sync against — chunk/version/changelog engine, 26-endpoint v1 API. Runs as the `sync` Kamal accessory. Has its own CLAUDE.md. |
+| `chaim354/tinkerex-sync` | The **sync server** these crates sync against — chunk/version/changelog engine, 26-endpoint v1 API. Runs as the `sync` Kamal accessory. Has its own CLAUDE.md. Being rewritten in Rust (`crates/tinkerex-sync` there, graded by a recorded corpus); its `/cable` accepts this client's `LibraryChannel` subscription with no `Origin` header, which the Ruby host refused — so the nudge starts working for the daemon at that cutover. |
 | `chaim354/tinkerex` | The **maker app** (Rails) — projects, inventory, model library. Owns `docs/sync-protocol.md`, the normative wire spec. A *sibling client* of the sync server, not this repo's server. |
 
 Clone siblings alongside this one (`../tinkerex`, `../tinkerex-sync`) — the convention both repos'
