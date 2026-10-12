@@ -4,6 +4,20 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Maker — Sync</title>
+    <!-- No-FOUC theme shim: apply the saved theme BEFORE styles paint. Keep in sync
+         with theme.js's THEMES allow-list (and Rust Prefs::THEMES). -->
+    <script>
+      (function () {
+        try {
+          var THEMES = ["default", "hacker", "woodworker", "craftmom"];
+          var t = localStorage.getItem("maker.theme");
+          if (THEMES.indexOf(t) === -1) t = "default";
+          document.documentElement.setAttribute("data-theme", t);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "default");
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -178,6 +192,19 @@
       <!-- ===== Settings (file-layer controls) ===== -->
       <div id="viewSettings" class="hidden">
         <section class="card">
+          <h2>Theme</h2>
+          <p class="muted">Pick a look for the app. Applies instantly and is remembered on
+            this device. Only the Default theme follows your system light/dark setting.</p>
+          <div id="themeGrid" class="theme-grid" role="radiogroup" aria-label="App theme"></div>
+          <div class="theme-sample" aria-hidden="true">
+            <span class="theme-sample-aa">Aa</span>
+            <span class="pill on"><span class="dot"></span>sample</span>
+            <button class="primary" type="button" tabindex="-1">Primary</button>
+            <span class="badge">badge</span>
+          </div>
+        </section>
+
+        <section class="card">
           <h2>Bandwidth &amp; hydration</h2>
           <p class="muted">These tune the sync daemon. They're saved per account and take effect
             the next time you sign in (they're set when the drive mounts).</p>
@@ -289,6 +316,7 @@
       </div>
     </div>
 
+    <script type="module" src="/theme.js"></script>
     <script type="module" src="/main.js"></script>
     <script type="module" src="/library.js"></script>
     <script type="module" src="/maker-shared.js"></script>

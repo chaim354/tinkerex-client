@@ -19,6 +19,14 @@
   --ok-bg: #e7f6ec;
   --hover: #f4f6fb;
   --focus: #2563eb;
+  --fav: #f5b301;          /* favorite star (was hard-coded in .fav.on) */
+
+  /* typography (themes may swap the typeface) */
+  --font-ui: system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, monospace;
+
+  /* card depth (themes may add a soft shadow, e.g. craftmom) */
+  --shadow: none;
 
   /* spacing scale */
   --s1: 0.25rem;
@@ -48,10 +56,101 @@
   }
 }
 
+/* ============================================================================
+ * Themes — each re-binds the primitive tokens under a [data-theme="…"] scope.
+ * `default` (or no attribute) keeps :root + the prefers-color-scheme dark block,
+ * so only the default theme follows the OS light/dark setting. The other three
+ * are intentionally fixed-mode (a "hacker" theme that flips to light is wrong).
+ * Theme names + the allow-list mirror theme.js (JS) and Prefs::THEMES (Rust).
+ * ========================================================================== */
+
+/* default — no overrides; :root above is the source of truth. */
+
+[data-theme="hacker"] {
+  --bg: #0a0e0a;
+  --card: #0f140f;
+  --line: #1f2a1f;
+  --ink: #b6ffb6;
+  --muted: #5fa05f;
+  --accent: #2fff6a;
+  --accent-hover: #57ff8a;
+  --accent-ink: #001400;
+  --ok: #2fff6a;
+  --warn: #ffd166;
+  --off: #3f5f3f;
+  --err: #ff5f56;
+  --err-bg: #2a0f0f;
+  --ok-bg: #08220f;
+  --hover: #132013;
+  --focus: #2fff6a;
+  --fav: #ffe066;
+  --font-ui: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+  --font-mono: ui-monospace, monospace;
+  --r-sm: 2px;
+  --r-md: 3px;
+  --r-lg: 4px;
+  --shadow: none;
+}
+
+[data-theme="woodworker"] {
+  --bg: #f3e9dc;
+  --card: #fbf4ea;
+  --line: #d9c4a9;
+  --ink: #3a2a1a;
+  --muted: #7a5c40;
+  --accent: #a0522d;
+  --accent-hover: #8a431f;
+  --accent-ink: #fff6ee;
+  --ok: #5a7d33;
+  --warn: #b5651d;
+  --off: #b29a7d;
+  --err: #9a3b2a;
+  --err-bg: #f3ddd4;
+  --ok-bg: #e6eed9;
+  --hover: #efe3d2;
+  --focus: #a0522d;
+  --fav: #c8902a;
+  --font-ui: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-mono: ui-monospace, monospace;
+  --r-sm: 8px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --shadow: 0 1px 3px rgba(58, 42, 26, 0.14);
+}
+
+[data-theme="craftmom"] {
+  --bg: #fff5fa;
+  --card: #ffffff;
+  --line: #ffe0ec;
+  --ink: #5a4a55;
+  --muted: #b08aa0;
+  --accent: #ff8fb1;
+  --accent-hover: #f56f99;
+  --accent-ink: #ffffff;
+  --ok: #43b581;
+  --warn: #d99a2b;
+  --off: #d9b7c8;
+  --err: #d6336c;
+  --err-bg: #ffe3ed;
+  --ok-bg: #e3f7ee;
+  --hover: #fff0f6;
+  --focus: #ff8fb1;
+  --fav: #ff7eb6;
+  --font-ui: "Quicksand", "Comic Sans MS", system-ui, sans-serif;
+  --font-mono: ui-monospace, monospace;
+  --r-sm: 14px;
+  --r-md: 18px;
+  --r-lg: 24px;
+  --shadow: 0 2px 10px rgba(255, 143, 177, 0.18);
+}
+
+/* per-theme polish (scoped so it can't leak between themes) */
+[data-theme="hacker"] .pill.on { text-shadow: 0 0 6px var(--accent); }
+
 * { box-sizing: border-box; }
 
 body {
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family: var(--font-ui);
   margin: 0;
   background: var(--bg);
   color: var(--ink);
@@ -84,6 +183,7 @@ h2 {
   border-radius: 12px;
   padding: 1.1rem 1.2rem;
   margin-bottom: var(--s4);
+  box-shadow: var(--shadow);
 }
 
 label {
@@ -193,7 +293,7 @@ button.danger { color: var(--err); border-color: var(--err); }
 
 .muted { color: var(--muted); font-size: 0.85rem; }
 .err { color: var(--err); }
-.code { font-family: ui-monospace, monospace; }
+.code { font-family: var(--font-mono); }
 .hidden { display: none !important; }
 
 /* ---- tabs ---- */
@@ -282,7 +382,7 @@ button.danger { color: var(--err); border-color: var(--err); }
 .codebox-wrap { margin-top: 0.6rem; display: flex; gap: var(--s2); align-items: stretch; }
 .codebox {
   flex: 1;
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 1.5rem;
   letter-spacing: 0.15em;
   padding: 0.6rem 0.9rem;
@@ -438,7 +538,7 @@ button.danger { color: var(--err); border-color: var(--err); }
   background: var(--hover); color: var(--muted); margin-top: var(--s1);
 }
 .fav { position: absolute; top: var(--s1); right: var(--s2); cursor: pointer; font-size: 1rem; color: var(--off); }
-.fav.on { color: #f5b301; }
+.fav.on { color: var(--fav); }
 
 /* ---- collections + tasks board ---- */
 .lib-coll-list { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s3); }
@@ -571,6 +671,67 @@ button.active { background: var(--accent); color: var(--accent-ink); border-colo
 .prev-status.busy { background: var(--hover); color: var(--warn); }
 .prev-status.err { background: var(--err-bg); color: var(--err); }
 .prev-error { font-size: 0.75rem; margin-top: 0.2rem; }
+
+/* ---- theme picker (Settings) ---- */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--s3);
+  margin-top: var(--s3);
+}
+.theme-swatch {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  text-align: left;
+  padding: var(--s2) var(--s3);
+  border: 2px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--card);
+  color: var(--ink);
+  cursor: pointer;
+}
+.theme-swatch:hover { border-color: var(--accent); }
+.theme-swatch[aria-checked="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.theme-swatch .preview {
+  flex: none;
+  display: inline-flex;
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: var(--r-sm);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+}
+.theme-swatch .preview i {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  display: inline-block;
+}
+.theme-swatch .sw-label { display: flex; flex-direction: column; min-width: 0; }
+.theme-swatch .sw-name { font-weight: 600; font-size: 0.86rem; }
+.theme-swatch .sw-note {
+  font-size: 0.74rem; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.theme-sample {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  flex-wrap: wrap;
+  margin-top: var(--s4);
+  padding: var(--s3);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.theme-sample .theme-sample-aa { font-size: 1.4rem; font-weight: 700; }
 
 /* picker rows used by the shared maker file picker */
 .picker-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
