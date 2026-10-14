@@ -52,12 +52,14 @@ permissions:
   contents: read
 
 jobs:
+  # Every job: never a fork, nor a workflow_run off a fork's run -- runs on self-hosted runners.
+
   # Compute which OS legs to run AND resolve the source build run id once, so every install
   # job pulls from the SAME build. On workflow_run we only proceed if the build succeeded.
   prepare:
     runs-on: [self-hosted, linux]
     # On a workflow_run trigger, skip entirely unless the build it chained off SUCCEEDED.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository) && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       run_id: ${{ steps.set.outputs.run_id }}
@@ -98,6 +100,7 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     # Target the real self-hosted box for this OS (labels per ci/runners/README.md).
     runs-on: [self-hosted, "${{ matrix.runner }}"]
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository) }}
     env:
       GH_TOKEN: ${{ github.token }}
       # Set the repo explicitly so `gh run list/download` resolves it from the env instead of
