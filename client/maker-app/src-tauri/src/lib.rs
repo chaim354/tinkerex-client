@@ -665,8 +665,9 @@ fn sync_login(
         Ok(endpoint) => endpoint, // already enrolled on this device — reuse it, never re-login
         Err(_not_signed_in) => {
             let mut client = ServerClient::new(&server_url);
+            // The name other devices see in conflict prompts and lock badges.
             let reg = client
-                .device_login(&email, &password, "maker-app")
+                .device_login(&email, &password, "Tinkerex desktop")
                 .map_err(|e| login_error_text(&e))?;
             // A library with nothing to sync is an Err carrying the sentence the form shows,
             // and saves nothing: the next sign-in asks the server again.

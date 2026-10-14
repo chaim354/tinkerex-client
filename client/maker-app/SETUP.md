@@ -7,7 +7,7 @@ chosen per platform:
 
 - **macOS:** **WebDAV** — the app serves the tree over localhost and mounts it with the
   built-in `/sbin/mount_webdav`. **No FUSE, no kext, no FSKit** (FUSE-T can't mount on
-  macOS 26). The drive shows in Finder under *Locations* as "Maker". This is the default
+  macOS 26). The drive shows in Finder under *Locations* as "Tinkerex". This is the default
   and it just works.
 - **Linux:** **FUSE** (`fuser`) — mounts natively.
 - **Windows:** **CfAPI** (driverless Cloud Filter — the default; no WinFsp/GPL driver, no
