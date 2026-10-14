@@ -239,7 +239,7 @@ this repo's CI.
 
 | repo | role |
 |---|---|
-| `chaim354/tinkerex-sync` | The **sync server** these crates sync against — chunk/version/changelog engine, 26-endpoint v1 API. Runs as the `sync` Kamal accessory. Has its own CLAUDE.md. Being rewritten in Rust (`crates/tinkerex-sync` there, graded by a recorded corpus); its `/cable` accepts this client's `LibraryChannel` subscription with no `Origin` header, which the Ruby host refused — so the nudge starts working for the daemon at that cutover. |
+| `chaim354/tinkerex-sync` | The **sync server** these crates sync against — chunk/version/changelog engine, 26-endpoint v1 API. Runs as the `sync` Kamal accessory. Has its own CLAUDE.md. **Production runs its Rust binary since 2026-10-07** (`crates/tinkerex-sync` there, graded by a recorded corpus; the Ruby host is the rollback target until that repo's Phase 6). Its `/cable` accepts this client's `LibraryChannel` subscription with no `Origin` header, which the Ruby host refused — so the daemon's nudge works now: measured at the cutover with this repo's `nudge` example, **6.6 / 5.2 / 8.0 ms** over three runs (before: `404` on connect and the 2 s poll). Devices reach it through the door `sync.tinkerex.{local,home}`; since D1 (2026-10-13) the desktop app is told that address by the maker app's login answer. |
 | `chaim354/tinkerex` | The **maker app** (Rails) — projects, inventory, model library. Owns `docs/sync-protocol.md`, the normative wire spec. A *sibling client* of the sync server, not this repo's server. |
 
 Clone siblings alongside this one (`../tinkerex`, `../tinkerex-sync`) — the convention both repos'
