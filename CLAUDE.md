@@ -21,7 +21,7 @@ Project context for an AI coding agent (Claude Code) and human developers.
    Every command is `cd client/<crate> && cargo …`. Every cheatsheet line below reflects that; it
    is not a stylistic choice you can shorten.
 2. **`fs-cfapi` IS the shipping Windows mount, and two comments in `sync-engine` still say
-   otherwise.** `maker-app/src-tauri/src/lib.rs:102-107` sets `type Mount = sync_engine::CfApiMount`
+   otherwise.** `maker-app/src-tauri/src/lib.rs:106-111` sets `type Mount = sync_engine::CfApiMount`
    by default, with `WinfspMount` behind `--features winfsp-backend`, and its comment records the
    flip as done "after the live smoke + byte-for-byte" verification. But
    **`sync-engine/Cargo.toml` still says "WinfspMount stays the default until CfApiMount is proven
@@ -55,7 +55,7 @@ Extracted from `chaim354/tinkerex` on 2026-08-20 with its own history (166 commi
 | `fs-fskit` | macOS FSKit bridge — **not a shipping mount path**. The Rust side builds and unit-tests; the Swift extension is **stubbed pending a paid Apple Developer membership**. |
 | `sync-client` | HTTP client for the sync server's v1 API. |
 | `sync-engine` | The daemon: `push` / `pull` / `hydrate` / `sync_once`, plus the per-OS mount selection. |
-| `maker-app` | The Tauri desktop app (crate lives at `maker-app/src-tauri`). |
+| `maker-app` | The Tauri desktop app, product name **Tinkerex**, identifier `com.tinkerex.desktop` since D1 (crate lives at `maker-app/src-tauri`; its on-disk data dir is still `maker-app`, a rename deferred on purpose). |
 | `maker-app-core`, `juicefs-backend` | **Leftovers from the abandoned mount path, reference only** — §4. |
 | `test-conformance` | Battle-tested external tools driven against our real mounts. |
 
@@ -119,9 +119,10 @@ per-object presigned URLs.
 |---|---|
 | `fs-provider` | **83 passing** across 6 test binaries (chunking, posix, convergence, concurrency, caching) |
 | `sync-engine` | **92 passing** |
-| `sync-client` | **39 passing** (2026-09-30; was 37) |
+| `sync-client` | **43 passing** (2026-10-13; was 39) |
 | `fs-webdav` | **8 passing** |
 | `fs-fuse` | **build failure on macOS by design** — §0.3 |
+| `maker-app/src-tauri` | **27 passing** (2026-10-13), plus `node --test client/maker-app/test` **26 passing** — neither runs in CI (§6) |
 
 **The server-backed `sync-engine` suites run against `chaim354/tinkerex-sync` only with two env
 knobs, and until 2026-09-30 could not run against it at all.** Every suite and example enrolled
@@ -149,9 +150,26 @@ booted by the maker repo's `SYNC_IMPL=rust bin/sync-server`), Linux, 2026-09-30:
 `device_login_adds_a_device_to_an_existing_library` prints SKIPPED under the admin token: password
 login is the maker app's, and the run's log says so rather than passing silently.
 
+**THE DESKTOP APP SIGNS IN TO THE MAKER APP AND SYNCS AGAINST THE GRANT IT IS HANDED (D1,
+2026-10-13).** It used to post `POST /v1/devices/login` to the typed URL and sync against that same
+URL, which no live server could answer: the maker app serves the login and no sync route, the sync
+server the reverse. The typed URL is now the Tinkerex (maker) server, whose login answer adds
+`library: {backend, syncable}` and, when syncable, `sync: {url, device_token, user_id, device_id,
+head_seq}` — a sibling device on the user's own sync-server library. `credentials.json` holds
+`{maker_token, sync_url, sync_token}` under the unchanged `(typed server, email)` key; sync-route
+commands resolve through `sync_endpoint`, the `maker_*` ones through `maker_endpoint`, and the
+local tree stays keyed by the typed server. **A legacy bare-string value still means "a sync token
+for the typed server" and is never rewritten** (the `tinkerex-sync device issue` workaround keeps
+working); an answer with neither field is an older server, read the same way; `syncable: false`
+mounts nothing and says why in one sentence. `http://` grant URLs are used as given: the LAN
+deployments are plain HTTP. `device_login` still keeps the MAKER token on its client. **The
+suites' two modes above are unchanged** — their maker-app mode does not follow the grant.
+
 ```sh
 (cd client/fs-provider && cargo test)
 (cd client/sync-client  && cargo test)
+(cd client/maker-app/src-tauri && cargo test)   # the desktop app's backend -- not in CI
+node --test client/maker-app/test               # its JS, from the repo root -- not in CI
 
 # sync-engine integration needs a running sync server (skips cleanly without one).
 # Against chaim354/tinkerex-sync (the Rust binary or the Ruby host), boot it with

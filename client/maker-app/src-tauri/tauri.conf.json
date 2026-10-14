@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "maker-app",
+  "productName": "Tinkerex",
   "version": "0.2.1",
-  "identifier": "com.chaim.maker-app",
+  "identifier": "com.tinkerex.desktop",
   "build": {
     "frontendDist": "../src"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "maker-app",
+        "title": "Tinkerex",
         "width": 800,
         "height": 600
       }

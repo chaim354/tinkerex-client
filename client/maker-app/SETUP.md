@@ -1,8 +1,9 @@
-# Run the Maker client (Tauri app) and mount a synced drive
+# Run the Tinkerex desktop app (Tauri) and mount a synced drive
 
-The app registers a device, mounts the local-first filesystem, and runs the sync
-daemon (push on save, pull on a `{head_seq}` nudge / poll, hydrate on read) — all
-in one process. The mount backend is chosen per platform:
+The app signs this device in to a Tinkerex server, mounts the local-first filesystem, and
+runs the sync daemon (push on save, pull on a `{head_seq}` nudge / poll, hydrate on read)
+against the sync server that sign-in names — all in one process. The mount backend is
+chosen per platform:
 
 - **macOS:** **WebDAV** — the app serves the tree over localhost and mounts it with the
   built-in `/sbin/mount_webdav`. **No FUSE, no kext, no FSKit** (FUSE-T can't mount on
@@ -10,19 +11,19 @@ in one process. The mount backend is chosen per platform:
   and it just works.
 - **Linux:** **FUSE** (`fuser`) — mounts natively.
 - **Windows:** **CfAPI** (driverless Cloud Filter — the default; no WinFsp/GPL driver, no
-  `winfsp-x64.dll`). The mount point is a **folder** (e.g. `%USERPROFILE%\MakerCF`), not a drive
+  `winfsp-x64.dll`). The mount point is a **folder** (e.g. `%USERPROFILE%\Tinkerex`), not a drive
   letter. The legacy WinFsp (drive-letter) backend is still available with
   `--features winfsp-backend`. (Live smoke + byte-for-byte conformance green — Phase 2b B5.)
   See the **Windows** section below for build/run + the two-device real-mount test.
 
-The backend lives in `src-tauri/src/lib.rs` (commands `sync_start`/`sync_stop`/
+The backend lives in `src-tauri/src/lib.rs` (commands `sync_login`/`sync_stop`/
 `sync_status`) via a per-OS `Mount` alias — `sync_engine::WebdavMount` on macOS,
 `sync_engine::Daemon` (FUSE) on Linux, `sync_engine::CfApiMount` on Windows.
 
-> **macOS build note:** at runtime macOS needs nothing FUSE-related (WebDAV is native).
-> But `cargo tauri dev` currently still *compiles* the FUSE `fuser` crate (used on Linux,
-> pulled in unconditionally), so the FUSE-T pkg-config alias below is needed to **build**
-> on macOS — not to run. (Follow-up: gate `fuser` out of macOS builds.)
+> **macOS build note:** macOS needs nothing FUSE-related, to build or to run. `fuser` is now a
+> Linux-only dependency of `sync-engine`, and the app crate builds and tests on macOS with no
+> FUSE-T and no pkg-config alias (measured 2026-10-13). The FUSE-T alias below matters only if
+> you build `client/fs-fuse` itself on macOS.
 
 ---
 
@@ -84,52 +85,57 @@ The backend lives in `src-tauri/src/lib.rs` (commands `sync_start`/`sync_stop`/
   https://github.com/macos-fuse-t/fuse-t/releases, **not** the `*-fskit` one). The app
   itself sidesteps all of this with WebDAV, so you can ignore it.
 
-### 2. Start the sync server (from the repo root, separate terminal)
+### 2. Have a Tinkerex server to sign in to
 
-```sh
-STORAGE_BACKEND=memory bin/rails server -p 3001
-```
-`memory` keeps chunk bytes in-process — fine for a single-box test. For real
-object storage, boot with `STORAGE_BACKEND=s3 …` instead (see CLAUDE.md §13).
+The app signs in to a **Tinkerex server** — the web app,
+[chaim354/tinkerex](https://github.com/chaim354/tinkerex) — with an account on it. When that
+server's `LIBRARY_BACKEND` is `chunk_remote`, its sign-in answer carries a grant for its sync
+server ([chaim354/tinkerex-sync](https://github.com/chaim354/tinkerex-sync)), and the app syncs
+against that directly. On `share` or `s3` there is nothing to sync: the app says so in one
+sentence and mounts nothing. This repo has no server to start; running one is that repo's
+business (its `docs/INSTALL.md`, and its CLAUDE.md §13 for a local pair).
 
 ### 3. Launch the app
 
 ```sh
 cd client/maker-app
-# macOS: keep PKG_CONFIG_PATH exported from step 1 in this shell
 cargo tauri dev
 ```
 First build pulls Tauri + the sync engine (a minute or two); then a window opens.
 There's no `npm install` — the frontend is plain HTML served from `src/`.
 
-### 4. Mount and test
+### 4. Sign in, mount and test
 
-In the window:
-1. **Sync server URL** — `http://localhost:3001` (default)
-2. **Account email** — any email; the *same* email is the *same* library across
-   devices.
-3. **Mount point** — a directory, e.g. `/tmp/MakerDrive` (created if missing).
-4. Click **Mount & sync**. Status flips to `mounted at /tmp/MakerDrive`.
+In the window (it opens empty):
+1. **Tinkerex server** — the server's address, as you would type it in a browser. The
+   password goes over whatever that address uses, so use an `https://` one where you can; a
+   LAN server's plain `http://` address works too.
+2. **Account email** and **password** — an account on that server; the *same* account is
+   the *same* library on every device.
+3. **Mount point** — a directory, `~/Tinkerex` by default (created if missing).
+4. Click **Sign in & sync**. Status flips to `mounted at …/Tinkerex`.
 
 Then, in Finder / a terminal:
 ```sh
-echo "hello maker" > /tmp/MakerDrive/notes.txt      # save → pushed to the server
-ls /tmp/MakerDrive
-cat /tmp/MakerDrive/notes.txt                        # read → hydrates from storage
+echo "hello tinkerex" > ~/Tinkerex/notes.txt      # save → pushed to the sync server
+ls ~/Tinkerex
+cat ~/Tinkerex/notes.txt                          # read → hydrates from storage
 ```
 Click **Unmount** to tear it down cleanly.
 
-> Local state (the SQLite tree + chunk cache) lives under
-> `$TMPDIR/maker-app/` — delete it to start fresh.
+> Local state (credentials, prefs, and each account's SQLite tree + chunk cache) lives under
+> the platform data dir's `maker-app/` — `~/Library/Application Support/maker-app/` on macOS,
+> `~/.local/share/maker-app/` on Linux (README.md has the details). Quit the app and delete it
+> to start fresh.
 
 ### Two-device demo (one box)
 
 Run a second instance pointed at a *different* mount point but the *same* email,
 and watch a file made in one appear in the other (nudge-driven, ~tens of ms):
 ```sh
-# second terminal (server + PKG_CONFIG_PATH already set)
+# second terminal
 cd client/maker-app && cargo tauri dev
-# mount this one at /tmp/MakerDrive2, same email → same library
+# mount this one at ~/Tinkerex2, same email → same library
 ```
 (For a pure-CLI version of the same thing without the GUI, use the `maker-syncd`
 binary — see CLAUDE.md §13.)
@@ -144,7 +150,9 @@ binary — see CLAUDE.md §13.)
 - **Mount button errors / nothing appears** — FUSE-T needs an interactive GUI
   session; it won't hold a mount from a headless/ssh context. Run the app from a
   normal desktop session. Check the `cargo tauri dev` console for daemon logs.
-- **`register failed`** — the server isn't up on the URL in the form (step 2).
+- **`login failed: …`** — the server isn't answering at the address in the form, or the
+  email/password is wrong (`401`). A sentence saying the server keeps its files in a shared
+  folder or a storage bucket means that server has nothing to sync (step 2).
 
 ---
 
@@ -152,8 +160,8 @@ binary — see CLAUDE.md §13.)
 
 **The mount path IS wired** (this section supersedes the older "not available yet" note). The
 default Windows backend is **CfAPI** (driverless Cloud Filter — no WinFsp/GPL driver; the mount
-point is a **folder**, e.g. `%USERPROFILE%\MakerCF`, not a drive letter). The app's
-`sync_start`/`sync_stop`/`sync_status` commands drive `sync_engine::CfApiMount` exactly as they
+point is a **folder**, `%USERPROFILE%\Tinkerex` by default, not a drive letter). The app's
+`sync_login`/`sync_stop`/`sync_status` commands drive `sync_engine::CfApiMount` exactly as they
 drive `Daemon`/`WebdavMount` on Linux/macOS. The legacy WinFsp (drive-letter) backend is still
 available with `--features winfsp-backend`.
 

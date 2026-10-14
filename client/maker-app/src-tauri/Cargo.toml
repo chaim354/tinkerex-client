@@ -1,8 +1,8 @@
 [package]
 name = "maker-app"
 version = "0.2.1"
-description = "A Tauri App"
-authors = ["you"]
+description = "The Tinkerex desktop app: signs in to a Tinkerex server and syncs a folder with its library"
+authors = ["Tinkerex contributors"]
 edition = "2021"
 license = "Apache-2.0"
 
