@@ -54,12 +54,46 @@ pub fn manifest_id(manifest: &[ChunkRef]) -> String {
     hex::encode(h.finalize())
 }
 
+/// What the maker app's `POST /v1/devices/login` answers (and what `provision_library` builds
+/// from the sync server's admin door). From `device_login`, `device_token` is the MAKER app's.
 #[derive(Debug, Deserialize)]
 pub struct RegisterResponse {
     pub user_id: i64,
     pub device_id: i64,
     pub device_token: String,
     pub head_seq: i64,
+    /// The sync-server grant the maker app brokers for this device (D1, 2026-10-13): where the
+    /// sync routes are and the token they accept. `None` BOTH from a server older than D1 (no
+    /// field at all) and from one whose library has nothing to sync (`sync: null`) — `library`
+    /// tells those two apart, because every D1 server sends it.
+    #[serde(default)]
+    pub sync: Option<SyncGrant>,
+    /// Which library backend the server runs and whether a device syncs against it. `None` only
+    /// from a server older than D1.
+    #[serde(default)]
+    pub library: Option<LibraryInfo>,
+}
+
+/// The `sync` object of a login answer: a SIBLING device on the user's own sync-server library,
+/// minted by the maker app with the user's bootstrap token and proven with `whoami` before it is
+/// handed out. `url` is the sync server as DEVICES reach it (the maker app's `SYNC_PUBLIC_URL`),
+/// never the internal alias the maker app itself dials.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncGrant {
+    pub url: String,
+    pub device_token: String,
+    pub user_id: i64,
+    pub device_id: i64,
+    pub head_seq: i64,
+}
+
+/// The `library` object of a login answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LibraryInfo {
+    /// The maker app's `LIBRARY_BACKEND`: `"share"`, `"s3"` or `"chunk_remote"`.
+    pub backend: String,
+    /// Whether a device syncs against this library — `chunk_remote` only, today.
+    pub syncable: bool,
 }
 
 /// `GET /v1/devices/whoami`: the identity behind the current device token and the library's
@@ -451,7 +485,15 @@ impl ServerClient {
     /// Enroll this device by logging in (the Dropbox model): POST /v1/devices/login with the
     /// user's email + password. The server authenticates via Devise (confirmed + unlocked
     /// account required) and returns a device token, which we store on the client. The
-    /// password is sent ONCE over TLS and never persisted — only the token is kept.
+    /// password is sent ONCE — over whatever the base URL's scheme is; use https where you can —
+    /// and never persisted, only the token is kept.
+    ///
+    /// That route and that token are the MAKER app's, and this client keeps the maker token:
+    /// it is the client for `/v1/maker/*`. Since D1 the answer also carries `sync` — the sync
+    /// server's address and a token it accepts — and the SYNC routes (`/v1/tree`,
+    /// `/v1/changes`, `/v1/commit`, versions, conflicts, locks) go to `sync.url` with that
+    /// token, through a second client the caller builds. `library` says whether there is
+    /// anything to sync at all; an answer with neither field is a server older than D1.
     pub fn device_login(
         &mut self,
         email: &str,
@@ -543,6 +585,9 @@ impl ServerClient {
             device_id: p.device_id,
             device_token: p.device_token,
             head_seq: who.head_seq,
+            // This IS the sync server: there is no maker app in between to broker a grant.
+            sync: None,
+            library: None,
         })
     }
 
@@ -1106,5 +1151,117 @@ mod tests {
         );
         std::env::remove_var(ADMIN_TOKEN_ENV);
         assert!(admin_token_from_env().is_none());
+    }
+
+    // ---- the login answer's shape (D1, 2026-10-13) ----
+    //
+    // The maker app's POST /v1/devices/login gained `library` (always) and `sync` (a grant on a
+    // syncable deployment, null otherwise). A server older than D1 sends neither, and must still
+    // parse: a client that refused the old answer could not sign in to the server it shipped with.
+
+    /// What every D1 login answer carries beside the pre-D1 four fields.
+    const NEW_LOGIN_ANSWER: &str = r#"{
+        "user_id":3,"device_id":11,"device_token":"maker-tok","head_seq":42,
+        "library":{"backend":"chunk_remote","syncable":true},
+        "sync":{"url":"https://sync.tinkerex.example","device_token":"sync-tok",
+                "user_id":8,"device_id":21,"head_seq":5}
+    }"#;
+
+    #[test]
+    fn an_old_login_answer_parses_with_no_grant_and_no_library() {
+        let reg: RegisterResponse = serde_json::from_str(
+            r#"{"user_id":3,"device_id":11,"device_token":"maker-tok","head_seq":42}"#,
+        )
+        .expect("the pre-D1 answer must still parse");
+        assert_eq!(reg.device_token, "maker-tok");
+        assert_eq!(reg.head_seq, 42);
+        assert!(reg.sync.is_none());
+        assert!(reg.library.is_none());
+    }
+
+    #[test]
+    fn a_new_login_answer_carries_the_library_and_the_sync_grant() {
+        let reg: RegisterResponse = serde_json::from_str(NEW_LOGIN_ANSWER).unwrap();
+        let library = reg.library.expect("library");
+        assert_eq!(library.backend, "chunk_remote");
+        assert!(library.syncable);
+        let grant = reg.sync.expect("sync grant");
+        assert_eq!(grant.url, "https://sync.tinkerex.example");
+        assert_eq!(grant.device_token, "sync-tok");
+        assert_eq!((grant.user_id, grant.device_id, grant.head_seq), (8, 21, 5));
+        // Two devices on two servers: the maker token is not the grant's.
+        assert_eq!(reg.device_token, "maker-tok");
+    }
+
+    #[test]
+    fn a_non_syncable_answer_parses_with_a_null_grant() {
+        let reg: RegisterResponse = serde_json::from_str(
+            r#"{"user_id":3,"device_id":11,"device_token":"maker-tok","head_seq":0,
+                "library":{"backend":"share","syncable":false},"sync":null}"#,
+        )
+        .unwrap();
+        assert!(reg.sync.is_none());
+        let library = reg.library.expect("library is sent on every deployment");
+        assert_eq!(library.backend, "share");
+        assert!(!library.syncable);
+    }
+
+    /// A one-request HTTP stub: answers `status` + `body` when the request line starts with
+    /// `want_line`, and 500 otherwise, so a wrong route fails on the response instead of hanging.
+    fn one_shot_stub(want_line: &'static str, status: &'static str, body: &'static str) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end().to_ascii_lowercase();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(v) = line.strip_prefix("content-length: ") {
+                    content_length = v.parse().unwrap_or(0);
+                }
+            }
+            let mut discard = vec![0u8; content_length];
+            reader.read_exact(&mut discard).unwrap();
+            let (status, body) = if request_line.starts_with(want_line) {
+                (status, body.to_string())
+            } else {
+                (
+                    "500 Internal Server Error",
+                    format!("unexpected {request_line:?}"),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            reader.get_mut().write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn device_login_keeps_the_maker_token_and_leaves_the_grant_to_the_caller() {
+        // This client is the MAKER app's client (`/v1/maker/*` takes the maker token); the
+        // sync routes go to `sync.url` through a client the caller builds from the grant.
+        let base = one_shot_stub("POST /v1/devices/login", "201 Created", NEW_LOGIN_ANSWER);
+        let mut c = ServerClient::new(&base);
+        let reg = c
+            .device_login("ada@example.com", "pw", "laptop")
+            .expect("login");
+        assert_eq!(
+            c.token(),
+            Some("maker-tok"),
+            "the client keeps the maker token"
+        );
+        assert_eq!(reg.sync.expect("grant").device_token, "sync-tok");
     }
 }
