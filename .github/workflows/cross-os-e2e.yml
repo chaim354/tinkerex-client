@@ -50,6 +50,8 @@ env:
   SEED_EMAIL: ${{ github.event.inputs.email || 'crossos-e2e@maker.test' }}
 
 jobs:
+  # Every job: never a fork -- runs on self-hosted runners (the same guard as chaim354/tinkerex).
+
   # Which runner families exist for this run. See ci/preflight.sh — a DECLARATION (the repo variable
   # CI_RUNNERS), not an API call, because a workflow GITHUB_TOKEN cannot list runners.
   # Which runner families exist for this run. See ci/preflight.sh — a DECLARATION (the repo variable
@@ -61,6 +63,7 @@ jobs:
   # on its own page which coverage it could not run.
   preflight:
     runs-on: [self-hosted, macos]
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     outputs:
       macos:   ${{ steps.p.outputs.macos }}
       linux:   ${{ steps.p.outputs.linux }}
@@ -94,6 +97,7 @@ jobs:
   seed:
     needs: preflight
     runs-on: [self-hosted, macos]
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     continue-on-error: true
     outputs:
       server_url: ${{ steps.seed.outputs.server_url }}
@@ -141,7 +145,7 @@ jobs:
   #    the expected v1 sha. BLOCKED if CfAPI can't run (Session-0 / interactive-session wall).
   win-push:
     needs: [preflight, seed]
-    if: ${{ needs.preflight.outputs.windows == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.preflight.outputs.windows == 'true' }}
     runs-on: [self-hosted, windows]
     continue-on-error: true
     outputs:
@@ -166,6 +170,7 @@ jobs:
   mac-pull-1:
     needs: [preflight, seed, win-push]
     runs-on: [self-hosted, macos]
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -184,7 +189,7 @@ jobs:
   #    mount to v2, waits for the push, emits the v2 sha. BLOCKED if /dev/fuse is unavailable.
   linux-edit:
     needs: [preflight, seed, win-push, mac-pull-1]
-    if: ${{ needs.preflight.outputs.linux == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.preflight.outputs.linux == 'true' }}
     runs-on: [self-hosted, linux]
     continue-on-error: true
     outputs:
@@ -209,6 +214,7 @@ jobs:
   mac-pull-2:
     needs: [preflight, seed, linux-edit]
     runs-on: [self-hosted, macos]
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -225,7 +231,7 @@ jobs:
   # 5b. WIN-PULL-2 — Windows re-mounts, polls until the EDITED content is present byte-for-byte.
   win-pull-2:
     needs: [preflight, seed, linux-edit]
-    if: ${{ needs.preflight.outputs.windows == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.preflight.outputs.windows == 'true' }}
     runs-on: [self-hosted, windows]
     continue-on-error: true
     steps:

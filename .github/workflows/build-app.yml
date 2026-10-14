@@ -54,11 +54,13 @@ permissions:
   contents: write   # needed only for the draft-Release step on tag builds
 
 jobs:
+  # Every job: never a fork -- runs on self-hosted runners (the same guard as chaim354/tinkerex).
   prepare:
     # Build the matrix from the `os` input. On tag/push (no input) build all three. This
     # filtering can't live in the build job's `if` (a job-level `if` can't read `matrix`),
     # so we compute the include-list here and the build job consumes it via fromJSON.
     runs-on: [self-hosted, linux]
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
@@ -86,6 +88,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: [self-hosted, "${{ matrix.runner }}"]
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     env:
       # The crate to build. workflow_dispatch lets you point it at another Tauri crate
       # (e.g. a second UI app) without editing this file; tag/push builds the default.
