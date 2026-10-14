@@ -3,13 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Maker — Sync</title>
+    <title>Tinkerex</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="wrap">
       <header>
-        <h1>Maker</h1>
+        <h1>Tinkerex</h1>
         <span id="statusPill" class="pill" role="status" aria-live="polite">
           <span class="dot"></span><span id="statusText">disconnected</span>
         </span>
@@ -28,16 +28,15 @@
       <!-- Connection -->
       <section class="card">
         <h2>Sign in to sync</h2>
-        <p class="muted">Sign in with your account email and password to enroll this device.
-          Each of your devices signs in independently — your password is sent once over TLS
-          and never stored; only a per-device token is kept on this machine.</p>
+        <p class="muted">Sign in with the account you use on the web. Your password is sent once and
+          never stored: this device keeps only its own token.</p>
 
-        <label for="server">Sync server URL</label>
-        <input id="server" value="http://localhost:3001" autocomplete="off" spellcheck="false" />
+        <label for="server">Tinkerex server</label>
+        <input id="server" placeholder="https://tinkerex.example.com" autocomplete="off" spellcheck="false" />
         <div class="field-err" id="serverErr"></div>
 
         <label for="email">Account email</label>
-        <input id="email" value="maker@example.com" autocomplete="off" spellcheck="false" />
+        <input id="email" placeholder="you@example.com" autocomplete="off" spellcheck="false" />
         <div class="field-err" id="emailErr"></div>
 
         <label for="password">Password</label>
@@ -45,7 +44,7 @@
         <div class="field-err" id="passwordErr"></div>
 
         <label id="mountLabel" for="mount">Mount point</label>
-        <input id="mount" value="/tmp/MakerDrive" autocomplete="off" spellcheck="false" />
+        <input id="mount" value="~/Tinkerex" autocomplete="off" spellcheck="false" />
         <div class="field-err" id="mountErr"></div>
 
         <div class="row">

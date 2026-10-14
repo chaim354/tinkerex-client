@@ -1,16 +1,19 @@
-//! Tauri backend for the Maker client.
+//! Tauri backend for the Tinkerex desktop app.
 //!
-//! Commands drive the native sync daemon. Auth is **token-persisted**: a device enrolls
-//! once via device-login (`sync_login`: email + password → a device token, authenticated by
-//! Devise on the server), the bearer token is saved under the app dir, and later starts
-//! reuse it — we never re-login. Every device of an account logs in independently (the
-//! Dropbox model); there are no pairing codes.
+//! Commands drive the native sync daemon. Auth is **token-persisted**: a device signs in
+//! once (`sync_login`: email + password → `POST /v1/devices/login` on the TINKEREX server the
+//! user typed, authenticated by Devise there), the credential is saved under the app dir, and
+//! later starts reuse it — we never re-login. Since D1 (2026-10-13) that login answers two
+//! devices' worth of credential: the maker app's own token, and a `sync` grant naming the sync
+//! server and a token it accepts. The sync routes go to the grant (`sync_endpoint`), the maker
+//! API to the typed server (`maker_endpoint`). Every device of an account logs in
+//! independently (the Dropbox model); there are no pairing codes.
 //!
 //! The mount backend is chosen per-OS — all expose the same `start`/`stop`/`is_running`/
 //! `mountpoint` API:
 //! - **macOS:** WebDAV + native `mount_webdav` (FUSE-T can't mount on macOS 26+).
 //! - **Linux:** FUSE (`fuser`).
-//! - **Windows:** WinFsp (drive letter; needs `winfsp-x64.dll` on the search path).
+//! - **Windows:** CfAPI (a sync-root folder, no driver); WinFsp behind `winfsp-backend`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -64,8 +67,9 @@ mod webview_cache {
 
     /// Run once on startup, before the window loads. Evicts the WKWebView disk cache iff the
     /// build version changed since the last launch (the update case), then records the current
-    /// version. `bundle_id` is the app identifier (`com.chaim.maker-app`); `version` is the
-    /// build's `tauri.conf.json` version (`CARGO_PKG_VERSION`, kept in lockstep).
+    /// version. `bundle_id` is the app identifier, read off `tauri.conf.json` by `run` (it was a
+    /// second, hard-coded copy until D1 renamed it); `version` is the build's `tauri.conf.json`
+    /// version (`CARGO_PKG_VERSION`, kept in lockstep).
     pub fn evict_if_version_changed(bundle_id: &str, version: &str) {
         let stamp = stamp_path();
         let last = std::fs::read_to_string(&stamp).ok();
@@ -112,9 +116,9 @@ type Mount = sync_engine::WinfspMount;
 #[derive(Default)]
 struct AppState(Mutex<Option<Mount>>);
 
-// ---- credential persistence (register/pair once, reuse the token) ------------------
+// ---- credential persistence (sign in once, reuse the credential) -------------------
 
-/// The durable per-user local-data directory for ALL persistent state — the device token
+/// The durable per-user local-data directory for ALL persistent state — the credentials
 /// (`credentials.json`), prefs (`prefs.json`), and every per-account `tree.db` + chunk
 /// cache. **Must not** live in the OS temp dir: `/tmp` is tmpfs on Linux (wiped at reboot)
 /// and `$TMPDIR` is purged after a few days on macOS. A wipe would destroy the device token
@@ -124,6 +128,7 @@ struct AppState(Mutex<Option<Mount>>);
 /// `~/.local/share` on Linux, `%LOCALAPPDATA%` on Windows), falling back to the temp dir
 /// only if it can't be determined (better than panicking).
 fn app_base() -> PathBuf {
+    // Still `maker-app`: renaming it is a migration of every account's state, deferred on purpose (D1).
     dirs::data_local_dir()
         .map(|d| d.join("maker-app"))
         .unwrap_or_else(|| legacy_app_base())
@@ -157,7 +162,7 @@ fn migrate_legacy_state() {
         ),
         // Cross-device rename (e.g. /tmp tmpfs -> $HOME) fails with EXDEV — fall back to a
         // recursive copy, then remove the old tree. If the copy fails, keep the old dir so
-        // the read-time fallback in `load_token`/`load_prefs` can still find the token.
+        // the read-time fallback in `credential_files`/`load_prefs` can still find the token.
         Err(_) => match copy_dir_all(&old_base, &new_base) {
             Ok(()) => {
                 let _ = std::fs::remove_dir_all(&old_base);
@@ -260,7 +265,27 @@ fn expand_mountpoint(input: &str) -> PathBuf {
 
 #[cfg(target_os = "windows")]
 fn expand_mountpoint(input: &str) -> PathBuf {
-    PathBuf::from(input) // a drive letter like "Z:" — no expansion
+    expand_user_profile(input, std::env::var("USERPROFILE").ok().as_deref())
+}
+
+/// The Windows half of `expand_mountpoint`, pure so it is tested on every OS. The sign-in
+/// form's Windows default is `%USERPROFILE%\Tinkerex` (D1), and nothing else would expand it —
+/// so a leading `%USERPROFILE%` (any case, as Windows reads it) becomes `profile`. Everything
+/// else passes through unchanged: a drive letter (`Z:`, WinFsp) or an absolute folder.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn expand_user_profile(input: &str, profile: Option<&str>) -> PathBuf {
+    const VAR: &str = "%USERPROFILE%";
+    match (input.get(..VAR.len()), profile) {
+        (Some(head), Some(profile)) if head.eq_ignore_ascii_case(VAR) => {
+            let rest = input[VAR.len()..].trim_start_matches(['\\', '/']);
+            if rest.is_empty() {
+                PathBuf::from(profile)
+            } else {
+                PathBuf::from(profile).join(rest)
+            }
+        }
+        _ => PathBuf::from(input),
+    }
 }
 
 fn creds_path() -> PathBuf {
@@ -268,7 +293,8 @@ fn creds_path() -> PathBuf {
 }
 
 /// Per-account local state dir (the SQLite tree + chunk cache), keyed by `(server, email)` —
-/// the same identity the saved token is keyed by. Without this the local tree.db is shared
+/// the same identity the saved credential is keyed by, where `server` is the TYPED server even
+/// when the sync routes go elsewhere (D1). Without this the local tree.db is shared
 /// across accounts, so mounting a *different* account shows the previous one's files (its
 /// changelog never deletes them). The key is SHA-256'd (a **stable** hash — unlike
 /// `DefaultHasher`, whose output changes across Rust releases and would silently remap an
@@ -293,38 +319,183 @@ fn creds_key(server: &str, email: &str) -> String {
     format!("{server}|{email}")
 }
 
-/// The saved device token for this (server, email), if this device has enrolled. Reads the
-/// durable creds file, falling back to the legacy temp-dir copy if a migration hasn't (or
-/// couldn't) move it yet.
-fn load_token(server: &str, email: &str) -> Option<String> {
-    let key = creds_key(server, email);
-    for path in [creds_path(), legacy_app_base().join("credentials.json")] {
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(tok) = map.get(&key).and_then(|v| v.as_str()) {
-                    return Some(tok.to_string());
-                }
-            }
-        }
-    }
-    None
+/// One account's sign-in on this device: the VALUE stored in `credentials.json` under
+/// `creds_key(typed server, email)` — the same key as before D1 (2026-10-13).
+///
+/// Two servers are involved since D1. The TYPED server is the Tinkerex (maker) app: its login
+/// mints `maker_token`, which its own `v1/maker/*` API takes. The sync routes live on the sync
+/// server, whose address and token arrive in that login's `sync` grant. On disk:
+///
+/// ```json
+/// { "maker_token": "…", "sync_url": "https://sync.example.com", "sync_token": "…" }
+/// ```
+///
+/// A LEGACY value — a bare string, the only shape before D1 — still loads, and is never
+/// rewritten: it means "a sync token for the typed server", which is exactly what pasting a
+/// token from `tinkerex-sync device issue` into this file produces.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Credential {
+    /// The maker app's device token. `None` only for a legacy bare string.
+    #[serde(default)]
+    maker_token: Option<String>,
+    /// Where the sync routes go: the grant's `url`, or the typed server for a legacy value.
+    sync_url: String,
+    /// The token the sync server accepts from this device.
+    sync_token: String,
 }
 
-fn save_token(server: &str, email: &str, token: &str) {
-    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(creds_path())
+/// What every command answers when this (server, email) has no saved credential.
+const NOT_SIGNED_IN: &str = "this device isn't signed in yet";
+
+/// Read one stored value: a bare string is the legacy shape, an object the record, and
+/// anything else is unreadable and treated as absent.
+fn credential_from_value(typed_server: &str, value: &serde_json::Value) -> Option<Credential> {
+    match value {
+        serde_json::Value::String(token) => Some(Credential {
+            maker_token: None,
+            sync_url: typed_server.to_string(),
+            sync_token: token.clone(),
+        }),
+        serde_json::Value::Object(_) => serde_json::from_value(value.clone()).ok(),
+        _ => None,
+    }
+}
+
+/// Where `credentials.json` is read from, in order: the durable app dir, then the temp-dir
+/// copy a migration could not move (see `migrate_legacy_state`).
+fn credential_files() -> [PathBuf; 2] {
+    [creds_path(), legacy_app_base().join("credentials.json")]
+}
+
+/// The saved credential for this (server, email) in the first of `files` that has one.
+fn load_credential_from(files: &[PathBuf], server: &str, email: &str) -> Option<Credential> {
+    let key = creds_key(server, email);
+    files.iter().find_map(|path| {
+        let data = std::fs::read_to_string(path).ok()?;
+        let map: serde_json::Value = serde_json::from_str(&data).ok()?;
+        credential_from_value(server, map.get(&key)?)
+    })
+}
+
+/// Add or replace this (server, email)'s record in the file at `path`, carrying every other
+/// account's entry across unchanged — a legacy bare string included, so nothing is migrated.
+fn save_credential_to(
+    path: &Path,
+    server: &str,
+    email: &str,
+    cred: &Credential,
+) -> std::io::Result<()> {
+    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    map.insert(
-        creds_key(server, email),
-        serde_json::Value::String(token.to_string()),
-    );
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        // Owner-only + atomic: the device token is a bearer credential — never world-readable,
-        // and a crash mid-write must not corrupt every account's tokens.
-        if let Err(e) = write_secure_atomic(&creds_path(), &json) {
-            eprintln!("save_token: could not persist credentials ({e})");
+    map.insert(creds_key(server, email), serde_json::to_value(cred)?);
+    // Owner-only + atomic: both tokens are bearer credentials — never world-readable, and a
+    // crash mid-write must not corrupt every account's sign-in.
+    write_secure_atomic(path, &serde_json::to_string_pretty(&map)?)
+}
+
+fn save_credential(server: &str, email: &str, cred: &Credential) {
+    if let Err(e) = save_credential_to(&creds_path(), server, email, cred) {
+        eprintln!("save_credential: could not persist credentials ({e})");
+    }
+}
+
+/// `(url, token)` for the SYNC routes — the tree, versions, restore, conflicts, locks, and the
+/// daemon `sync_login` mounts on a saved credential. The ONE place a command learns where they
+/// live: the grant's URL since D1, the typed server for a legacy value. `Err` is `NOT_SIGNED_IN`.
+fn sync_endpoint(server: &str, email: &str) -> Result<(String, String), String> {
+    sync_endpoint_from(&credential_files(), server, email)
+}
+
+fn sync_endpoint_from(
+    files: &[PathBuf],
+    server: &str,
+    email: &str,
+) -> Result<(String, String), String> {
+    let cred = load_credential_from(files, server, email).ok_or(NOT_SIGNED_IN)?;
+    Ok((cred.sync_url, cred.sync_token))
+}
+
+/// `(url, token)` for the maker app's own API (`v1/maker/*`), which lives on the TYPED server.
+/// A legacy value carries no maker token: it was this device's one token for the typed server,
+/// used for every route, so it still is.
+fn maker_endpoint(server: &str, email: &str) -> Result<(String, String), String> {
+    maker_endpoint_from(&credential_files(), server, email)
+}
+
+fn maker_endpoint_from(
+    files: &[PathBuf],
+    server: &str,
+    email: &str,
+) -> Result<(String, String), String> {
+    let cred = load_credential_from(files, server, email).ok_or(NOT_SIGNED_IN)?;
+    Ok((
+        server.to_string(),
+        cred.maker_token.unwrap_or(cred.sync_token),
+    ))
+}
+
+/// What a login answer means for this device — one pure function, so each arm is a test.
+///
+/// - `sync: {…}`: a D1 server on a syncable deployment. Sync against the grant; keep the maker
+///   token for the maker API.
+/// - `library.syncable == false`: a D1 server whose files live in a shared folder or a bucket.
+///   Nothing to mount; `Err` is the sentence the sign-in form shows, verbatim.
+/// - neither field: a server older than D1, which served the sync routes itself with the same
+///   token — what a legacy value means.
+fn credential_from_login(
+    typed_server: &str,
+    reg: &sync_client::RegisterResponse,
+) -> Result<Credential, String> {
+    match (&reg.sync, &reg.library) {
+        (Some(grant), _) => Ok(Credential {
+            maker_token: Some(reg.device_token.clone()),
+            sync_url: grant.url.clone(),
+            sync_token: grant.device_token.clone(),
+        }),
+        (None, Some(library)) if !library.syncable => Err(not_syncable_sentence(&library.backend)),
+        // A D1 server on a syncable deployment answers a grant or a 503, never this; saving
+        // it as an older server would point sync at the maker app and reuse that forever.
+        (None, Some(library)) => Err(format!(
+            "This server's library ({}) syncs, but its sign-in answer carried no sync grant. \
+             Nothing was saved; try signing in again.",
+            library.backend
+        )),
+        (None, None) => Ok(Credential {
+            maker_token: Some(reg.device_token.clone()),
+            sync_url: typed_server.to_string(),
+            sync_token: reg.device_token.clone(),
+        }),
+    }
+}
+
+/// The one sentence a library with nothing to sync gets, naming where its files live instead.
+fn not_syncable_sentence(backend: &str) -> String {
+    match backend {
+        "share" => "This server keeps its files in a shared folder (share); there is nothing for \
+                    this app to sync. Open the folder from your file manager instead."
+            .into(),
+        "s3" => "This server keeps its files in a storage bucket (s3); there is nothing for this \
+                 app to sync. Open the bucket with your storage provider's tools instead."
+            .into(),
+        other => format!(
+            "This server keeps its files where this app cannot sync them ({other}); there is \
+             nothing for this app to sync."
+        ),
+    }
+}
+
+/// The sign-in error the form shows. A 503 `sync_unavailable` is the maker app saying it could
+/// not reach its sync server — it enrolled nothing, so the useful words are "try again".
+fn login_error_text(e: &sync_client::Error) -> String {
+    match e {
+        sync_client::Error::Server { status: 503, body } if body.contains("sync_unavailable") => {
+            "The Tinkerex server could not reach its sync server, so this device was not signed \
+             in. Try again in a minute."
+                .into()
         }
+        other => format!("login failed: {other}"),
     }
 }
 
@@ -421,14 +592,16 @@ fn set_prefs(server_url: String, email: String, prefs: Prefs) -> Result<String, 
 
 // ---- mounting ----------------------------------------------------------------------
 
-/// Mount + start the sync loop with an already-obtained device `token`. Shared by
-/// the `sync_login` enrollment path.
-fn mount_with_token(
+/// Mount + start the sync loop against the sync server at `sync_url`, as `sync_token`.
+/// `server_url` is the TYPED server: it keys this account's local tree and prefs exactly as
+/// before D1, even though the daemon itself talks to the grant's host.
+fn mount_with_grant(
     state: &State<AppState>,
     server_url: &str,
     email: &str,
     mountpoint: &str,
-    token: String,
+    sync_url: &str,
+    sync_token: String,
 ) -> Result<String, String> {
     use sync_engine::DaemonConfig;
 
@@ -452,7 +625,7 @@ fn mount_with_token(
     let chunks = base.join("chunks");
     std::fs::create_dir_all(&chunks).map_err(|e| format!("chunk dir: {e}"))?;
     // Expand a leading `~` and make the path absolute. The `.app`'s working directory is `/`,
-    // so a bare `~/Maker` (which the UI suggests) or a relative path resolves under the
+    // so a bare `~/Tinkerex` (which the UI suggests) or a relative path resolves under the
     // read-only root volume → EROFS ("Read-only file system"). Expand it first.
     let mountpoint = expand_mountpoint(mountpoint);
     // On Windows the mount point is a drive letter (e.g. "Z:"), not a directory to create.
@@ -462,7 +635,7 @@ fn mount_with_token(
     // Apply the account's saved file-layer prefs (bandwidth caps) at mount time — these
     // are DaemonConfig start-time options, so they take effect on this sign-in.
     let prefs = load_prefs(server_url, email);
-    let cfg = DaemonConfig::new(&mountpoint, db, chunks, server_url, token)
+    let cfg = DaemonConfig::new(&mountpoint, db, chunks, sync_url, sync_token)
         .with_bandwidth(prefs.up_bps(), prefs.down_bps());
     let mount = Mount::start(cfg).map_err(|e| format!("mount failed: {e}"))?;
     let mp = mount.mountpoint().display().to_string();
@@ -470,11 +643,14 @@ fn mount_with_token(
     Ok(format!("mounted at {mp}"))
 }
 
-/// Enroll this device by logging in (email + password) — the Dropbox model — or reuse a
-/// saved token, then mount + sync against `server_url`. The server authenticates the human
-/// credentials via Devise (a confirmed, unlocked account is required) and returns a device
-/// token; the password is sent once over TLS and never stored — only the token is saved.
-/// Every device of an account logs in independently (no pairing codes).
+/// Sign this device in to the Tinkerex server the user typed (email + password) — the Dropbox
+/// model — or reuse its saved credential, then mount + sync against the sync server that
+/// server's answer named (D1). The server authenticates the human credentials via Devise (a
+/// confirmed, unlocked account is required); the password is sent once — over whatever the
+/// server's address uses; use https where you can — and never stored, only the credential is.
+/// Every device of an account logs in independently (no pairing codes). An `http://` address,
+/// typed or granted, is used exactly as given: the self-hosted LAN deployments answer over
+/// plain HTTP.
 #[tauri::command]
 fn sync_login(
     state: State<AppState>,
@@ -485,18 +661,32 @@ fn sync_login(
 ) -> Result<String, String> {
     use sync_client::ServerClient;
 
-    let token = if let Some(t) = load_token(&server_url, &email) {
-        t // already enrolled on this device — reuse the saved token, never re-login
-    } else {
-        let mut client = ServerClient::new(&server_url);
-        let reg = client
-            .device_login(&email, &password, "maker-app")
-            .map_err(|e| format!("login failed: {e}"))?;
-        save_token(&server_url, &email, &reg.device_token);
-        reg.device_token
+    let (sync_url, sync_token) = match sync_endpoint(&server_url, &email) {
+        Ok(endpoint) => endpoint, // already enrolled on this device — reuse it, never re-login
+        Err(_not_signed_in) => {
+            let mut client = ServerClient::new(&server_url);
+            // The name other devices see in conflict prompts and lock badges.
+            let reg = client
+                .device_login(&email, &password, "Tinkerex desktop")
+                .map_err(|e| login_error_text(&e))?;
+            // A library with nothing to sync is an Err carrying the sentence the form shows,
+            // and saves nothing: the next sign-in asks the server again.
+            let cred = credential_from_login(&server_url, &reg)?;
+            save_credential(&server_url, &email, &cred);
+            // Mount from the credential just minted, not a re-read: a save that failed (it is
+            // logged) must not strand a sign-in the server has already accepted.
+            (cred.sync_url, cred.sync_token)
+        }
     };
 
-    mount_with_token(&state, &server_url, &email, &mountpoint, token)
+    mount_with_grant(
+        &state,
+        &server_url,
+        &email,
+        &mountpoint,
+        &sync_url,
+        sync_token,
+    )
 }
 
 // ---- file browser + versioning (queries the server's synced tree) ------------------
@@ -517,8 +707,8 @@ struct BrowseEntry {
 #[tauri::command]
 fn browse(server_url: String, email: String) -> Result<Vec<BrowseEntry>, String> {
     use sync_client::ServerClient;
-    let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
-    let client = ServerClient::with_token(&server_url, token);
+    let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
+    let client = ServerClient::with_token(sync_url, sync_token);
 
     // Active locks held by OTHER devices → node_id => holder name (best-effort; ignore errors).
     let locked: std::collections::HashMap<String, String> = client
@@ -572,8 +762,8 @@ fn file_versions(
     node_id: String,
 ) -> Result<Vec<VersionEntry>, String> {
     use sync_client::ServerClient;
-    let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
-    let client = ServerClient::with_token(&server_url, token);
+    let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
+    let client = ServerClient::with_token(sync_url, sync_token);
     let vs = client
         .versions(&node_id)
         .map_err(|e| format!("versions failed: {e}"))?;
@@ -598,8 +788,8 @@ fn restore_version(
     version_id: String,
 ) -> Result<String, String> {
     use sync_client::ServerClient;
-    let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
-    let client = ServerClient::with_token(&server_url, token);
+    let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
+    let client = ServerClient::with_token(sync_url, sync_token);
     client
         .restore(&node_id, &version_id)
         .map_err(|e| format!("restore failed: {e}"))?;
@@ -637,8 +827,8 @@ fn side(s: sync_client::ConflictSide) -> ConflictSideOut {
 #[tauri::command]
 fn conflicts(server_url: String, email: String) -> Result<Vec<ConflictOut>, String> {
     use sync_client::ServerClient;
-    let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
-    let client = ServerClient::with_token(&server_url, token);
+    let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
+    let client = ServerClient::with_token(sync_url, sync_token);
     let cs = client
         .conflicts()
         .map_err(|e| format!("conflicts failed: {e}"))?;
@@ -663,8 +853,8 @@ fn resolve_conflict_keep(
     version_id: String,
 ) -> Result<String, String> {
     use sync_client::ServerClient;
-    let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
-    let client = ServerClient::with_token(&server_url, token);
+    let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
+    let client = ServerClient::with_token(sync_url, sync_token);
     client
         .resolve_conflict_keep(&node_id, &version_id)
         .map_err(|e| format!("resolve failed: {e}"))?;
@@ -679,8 +869,8 @@ fn resolve_conflict_split(
     node_id: String,
 ) -> Result<String, String> {
     use sync_client::ServerClient;
-    let token = load_token(&server_url, &email).ok_or("this device isn't signed in yet")?;
-    let client = ServerClient::with_token(&server_url, token);
+    let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
+    let client = ServerClient::with_token(sync_url, sync_token);
     client
         .resolve_conflict_split(&node_id)
         .map_err(|e| format!("split failed: {e}"))?;
@@ -689,11 +879,13 @@ fn resolve_conflict_split(
 
 // ---- maker library (the catalog over the synced tree) ------------------------------
 
-/// Build an authed `ServerClient` from the saved creds for this (server, email), or a
-/// human error if this device isn't signed in. Mirrors the inline pattern in `browse`.
+/// Build an authed `ServerClient` for the MAKER API from the saved credential for this
+/// (server, email), or a human error if this device isn't signed in. Unlike `browse` and the
+/// other sync-route commands, it talks to the typed server with the maker token
+/// (`maker_endpoint`), never to the sync grant's host.
 fn maker_client(server_url: &str, email: &str) -> Result<sync_client::ServerClient, String> {
-    let token = load_token(server_url, email).ok_or("this device isn't signed in yet")?;
-    Ok(sync_client::ServerClient::with_token(server_url, token))
+    let (url, token) = maker_endpoint(server_url, email)?;
+    Ok(sync_client::ServerClient::with_token(url, token))
 }
 
 // -- items --
@@ -1264,7 +1456,7 @@ fn sync_status(state: State<AppState>) -> String {
 }
 
 /// The OS (`"windows"`/`"macos"`/`"linux"`), so the frontend can default the mount point
-/// sensibly — a drive letter on Windows, a directory elsewhere.
+/// sensibly — a sync-root folder under the profile on Windows (CfAPI), a directory elsewhere.
 #[tauri::command]
 fn platform() -> &'static str {
     std::env::consts::OS
@@ -1282,8 +1474,14 @@ pub fn run() {
     // BEFORE the window is created (i.e. before `Builder::run`), so the webview never loads the
     // stale assets in the first place. macOS-only; the bundle id + version come from
     // `tauri.conf.json` (`CARGO_PKG_VERSION` is kept in lockstep with the config `version`).
+    // The id is read off the generated context, not spelled out here: a hard-coded copy kept
+    // naming `com.chaim.maker-app` until D1 renamed the app — the old bundle's cache, not ours.
+    let context = tauri::generate_context!();
     #[cfg(target_os = "macos")]
-    webview_cache::evict_if_version_changed("com.chaim.maker-app", env!("CARGO_PKG_VERSION"));
+    webview_cache::evict_if_version_changed(
+        &context.config().identifier,
+        env!("CARGO_PKG_VERSION"),
+    );
 
     tauri::Builder::default()
         .manage(AppState::default())
@@ -1351,7 +1549,7 @@ pub fn run() {
             get_prefs,
             set_prefs
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 
@@ -1510,5 +1708,320 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dst.join("sub/b.txt")).unwrap(), "b");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- the credential record (D1, 2026-10-13) ----
+    //
+    // Every test reads and writes a credentials.json in a temp dir of its own, through the
+    // `_from`/`_to` functions — NEVER the real one under app_base(), which on a developer's
+    // machine holds their actual sign-ins.
+
+    const SERVER: &str = "https://tinkerex.example.com";
+    const EMAIL: &str = "ada@example.com";
+
+    /// A fresh, private temp dir per test; the test removes it.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tinkerex-creds-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write `entries` as credentials.json, exactly as an older build (or a hand edit) left it.
+    fn write_raw(file: &Path, entries: &[(String, serde_json::Value)]) {
+        let map: serde_json::Map<String, serde_json::Value> = entries.iter().cloned().collect();
+        std::fs::write(file, serde_json::Value::Object(map).to_string()).unwrap();
+    }
+
+    fn grant_record() -> Credential {
+        Credential {
+            maker_token: Some("maker-tok".into()),
+            sync_url: "https://sync.tinkerex.example.com".into(),
+            sync_token: "sync-tok".into(),
+        }
+    }
+
+    fn answer(json: &str) -> sync_client::RegisterResponse {
+        serde_json::from_str(json).expect("a login answer")
+    }
+
+    #[test]
+    fn a_credential_record_round_trips_through_credentials_json_as_an_object() {
+        let dir = scratch("roundtrip");
+        let file = dir.join("credentials.json");
+        save_credential_to(&file, SERVER, EMAIL, &grant_record()).unwrap();
+
+        // On disk: an object with exactly the three fields, under the same key as before D1.
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            on_disk[creds_key(SERVER, EMAIL)],
+            serde_json::json!({
+                "maker_token": "maker-tok",
+                "sync_url": "https://sync.tinkerex.example.com",
+                "sync_token": "sync-tok"
+            })
+        );
+        assert_eq!(
+            load_credential_from(std::slice::from_ref(&file), SERVER, EMAIL),
+            Some(grant_record())
+        );
+        // Keyed as before: a trailing slash and the email's case name the same account.
+        assert_eq!(
+            load_credential_from(&[file], "https://tinkerex.example.com/", "Ada@Example.com"),
+            Some(grant_record())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_bare_string_is_a_sync_token_for_the_typed_server() {
+        // The only shape before D1, and what a token from `tinkerex-sync device issue` pasted
+        // into credentials.json still is. It keeps working, and it is never migrated.
+        let dir = scratch("legacy");
+        let file = dir.join("credentials.json");
+        let typed = "https://sync.tinkerex.home";
+        write_raw(&file, &[(creds_key(typed, EMAIL), "legacy-tok".into())]);
+
+        assert_eq!(
+            load_credential_from(std::slice::from_ref(&file), typed, EMAIL),
+            Some(Credential {
+                maker_token: None,
+                sync_url: typed.into(),
+                sync_token: "legacy-tok".into(),
+            })
+        );
+        assert_eq!(
+            sync_endpoint_from(std::slice::from_ref(&file), typed, EMAIL),
+            Ok((typed.to_string(), "legacy-tok".to_string()))
+        );
+        // The maker API keeps getting the one token it always got, at the typed server.
+        assert_eq!(
+            maker_endpoint_from(&[file], typed, EMAIL),
+            Ok((typed.to_string(), "legacy-tok".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_a_record_leaves_another_accounts_legacy_string_a_string() {
+        // "Nothing is migrated on disk": a save rewrites the whole file, so it must carry every
+        // other entry across unchanged — a legacy string stays a bare string.
+        let dir = scratch("keep-legacy");
+        let file = dir.join("credentials.json");
+        let other = creds_key("https://sync.tinkerex.home", "old@example.com");
+        write_raw(&file, &[(other.clone(), "legacy-tok".into())]);
+
+        save_credential_to(&file, SERVER, EMAIL, &grant_record()).unwrap();
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk[&other], serde_json::json!("legacy-tok"));
+        assert_eq!(
+            load_credential_from(&[file], SERVER, EMAIL),
+            Some(grant_record())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_endpoints_split_a_record_between_the_two_servers() {
+        let dir = scratch("endpoints");
+        let file = dir.join("credentials.json");
+        save_credential_to(&file, SERVER, EMAIL, &grant_record()).unwrap();
+
+        // Sync routes: the grant's URL and token. Maker API: the TYPED server, the maker token.
+        assert_eq!(
+            sync_endpoint_from(std::slice::from_ref(&file), SERVER, EMAIL),
+            Ok((
+                "https://sync.tinkerex.example.com".to_string(),
+                "sync-tok".to_string()
+            ))
+        );
+        assert_eq!(
+            maker_endpoint_from(&[file], SERVER, EMAIL),
+            Ok((SERVER.to_string(), "maker-tok".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_credential_is_the_existing_not_signed_in_sentence() {
+        let dir = scratch("missing");
+        let absent = dir.join("credentials.json"); // never written
+        let not_signed_in = Err("this device isn't signed in yet".to_string());
+        assert_eq!(
+            sync_endpoint_from(std::slice::from_ref(&absent), SERVER, EMAIL),
+            not_signed_in
+        );
+        assert_eq!(maker_endpoint_from(&[absent], SERVER, EMAIL), not_signed_in);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_pre_migration_copy_is_still_read_after_the_durable_file() {
+        // The pre-D1 loader's two-file fallback, kept: the durable file first, then the temp-dir copy
+        // a migration could not move.
+        let dir = scratch("two-files");
+        let durable = dir.join("credentials.json");
+        let legacy_copy = dir.join("legacy-credentials.json");
+        write_raw(
+            &legacy_copy,
+            &[(creds_key(SERVER, EMAIL), "old-tok".into())],
+        );
+        assert_eq!(
+            sync_endpoint_from(&[durable.clone(), legacy_copy.clone()], SERVER, EMAIL),
+            Ok((SERVER.to_string(), "old-tok".to_string()))
+        );
+        save_credential_to(&durable, SERVER, EMAIL, &grant_record()).unwrap();
+        assert_eq!(
+            load_credential_from(&[durable, legacy_copy], SERVER, EMAIL),
+            Some(grant_record())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- what a login answer means (D1) ----
+
+    #[test]
+    fn a_grant_answer_syncs_against_the_grant_and_keeps_the_maker_token() {
+        let reg = answer(
+            r#"{"user_id":3,"device_id":11,"device_token":"maker-tok","head_seq":42,
+                "library":{"backend":"chunk_remote","syncable":true},
+                "sync":{"url":"https://sync.tinkerex.example.com","device_token":"sync-tok",
+                        "user_id":8,"device_id":21,"head_seq":5}}"#,
+        );
+        assert_eq!(credential_from_login(SERVER, &reg), Ok(grant_record()));
+    }
+
+    #[test]
+    fn an_http_grant_url_is_kept_exactly_as_the_server_sent_it() {
+        // The self-hosted LAN deployments answer over plain HTTP (measured 2026-10-13: their
+        // sync host fails a TLS handshake), so a grant naming `http://` must reach the daemon
+        // as-is — never upgraded to https, never refused.
+        let typed = "http://tinkerex.home";
+        let reg = answer(
+            r#"{"user_id":3,"device_id":11,"device_token":"maker-tok","head_seq":42,
+                "library":{"backend":"chunk_remote","syncable":true},
+                "sync":{"url":"http://sync.tinkerex.home","device_token":"sync-tok",
+                        "user_id":8,"device_id":21,"head_seq":5}}"#,
+        );
+        let cred = credential_from_login(typed, &reg).expect("an http grant is a grant");
+        assert_eq!(cred.sync_url, "http://sync.tinkerex.home");
+
+        let dir = scratch("http-grant");
+        let file = dir.join("credentials.json");
+        save_credential_to(&file, typed, EMAIL, &cred).unwrap();
+        assert_eq!(
+            sync_endpoint_from(std::slice::from_ref(&file), typed, EMAIL),
+            Ok((
+                "http://sync.tinkerex.home".to_string(),
+                "sync-tok".to_string()
+            ))
+        );
+        assert_eq!(
+            maker_endpoint_from(&[file], typed, EMAIL),
+            Ok((typed.to_string(), "maker-tok".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_library_with_nothing_to_sync_is_one_sentence_naming_where_its_files_are() {
+        for (backend, place) in [
+            ("share", "in a shared folder (share)"),
+            ("s3", "in a storage bucket (s3)"),
+        ] {
+            let reg = answer(&format!(
+                r#"{{"user_id":3,"device_id":11,"device_token":"maker-tok","head_seq":0,
+                    "library":{{"backend":"{backend}","syncable":false}},"sync":null}}"#
+            ));
+            let err = credential_from_login(SERVER, &reg).expect_err("nothing to mount");
+            assert!(
+                err.starts_with(&format!(
+                    "This server keeps its files {place}; there is nothing for this app to sync."
+                )),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            not_syncable_sentence("share"),
+            "This server keeps its files in a shared folder (share); there is nothing for this \
+             app to sync. Open the folder from your file manager instead."
+        );
+    }
+
+    #[test]
+    fn an_answer_with_no_sync_field_is_an_older_server_that_syncs_itself() {
+        // Before D1 the server answered the four fields and served the sync routes itself, with
+        // the same token: the legacy string's meaning, with the maker token kept as well.
+        let reg = answer(r#"{"user_id":3,"device_id":11,"device_token":"one-tok","head_seq":42}"#);
+        assert_eq!(
+            credential_from_login(SERVER, &reg),
+            Ok(Credential {
+                maker_token: Some("one-tok".into()),
+                sync_url: SERVER.into(),
+                sync_token: "one-tok".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_syncable_library_without_a_grant_is_refused_rather_than_saved() {
+        // A D1 server on a syncable deployment answers a grant or a 503 — never this. Treating
+        // it as an older server would save a credential that points sync at the maker app,
+        // which serves no sync routes, and the app would reuse it on every sign-in.
+        let reg = answer(
+            r#"{"user_id":3,"device_id":11,"device_token":"maker-tok","head_seq":0,
+                "library":{"backend":"chunk_remote","syncable":true},"sync":null}"#,
+        );
+        assert!(credential_from_login(SERVER, &reg).is_err());
+    }
+
+    #[test]
+    fn a_503_sync_unavailable_reads_as_try_again() {
+        let unavailable = sync_client::Error::Server {
+            status: 503,
+            body: r#"{"error":"sync_unavailable"}"#.into(),
+        };
+        assert!(login_error_text(&unavailable).contains("Try again"));
+        let refused = sync_client::Error::Server {
+            status: 401,
+            body: r#"{"error":"invalid_credentials"}"#.into(),
+        };
+        assert!(login_error_text(&refused).starts_with("login failed: "));
+    }
+
+    // ---- the Windows mount default (D1) ----
+
+    #[test]
+    fn a_leading_userprofile_expands_to_the_profile_dir() {
+        // The sign-in form's Windows default is `%USERPROFILE%\Tinkerex`; nothing else expands it.
+        let profile = Some(r"C:\Users\ada");
+        let expected = PathBuf::from(r"C:\Users\ada").join("Tinkerex");
+        assert_eq!(
+            expand_user_profile(r"%USERPROFILE%\Tinkerex", profile),
+            expected
+        );
+        assert_eq!(
+            expand_user_profile(r"%userprofile%\Tinkerex", profile),
+            expected
+        );
+        assert_eq!(
+            expand_user_profile("%USERPROFILE%", profile),
+            PathBuf::from(r"C:\Users\ada")
+        );
+        // Everything else passes through as before: a drive letter, an absolute path.
+        assert_eq!(expand_user_profile("Z:", profile), PathBuf::from("Z:"));
+        assert_eq!(
+            expand_user_profile(r"D:\Sync", profile),
+            PathBuf::from(r"D:\Sync")
+        );
+        // No profile known: left alone rather than guessed.
+        assert_eq!(
+            expand_user_profile(r"%USERPROFILE%\Tinkerex", None),
+            PathBuf::from(r"%USERPROFILE%\Tinkerex")
+        );
     }
 }

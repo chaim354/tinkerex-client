@@ -3,10 +3,10 @@
 // main.js touches `window.__TAURI__` and `document` at import time and can therefore never be
 // loaded by a test runner. Everything in this file is a plain function over plain values, with
 // `invoke` injected where a call is unavoidable. See client/maker-app/test/session.test.js, run
-// by `bin/ci test-app`.
+// with `node --test client/maker-app/test` (no CI job runs it; its header says why).
 //
 // THE BUG THIS FILE EXISTS FOR. main.js pinned the account at sign-in and CLEARED IT ON UNMOUNT,
-// falling back to the live sign-in form — whose values are index.html's dev defaults,
+// falling back to the live sign-in form — whose values were then index.html's dev defaults,
 // http://localhost:3001 and maker@example.com. But the ~60 `maker_*` catalog commands never touch
 // the mount, and the catalog is usable while unmounted, so scoping the only record of *which
 // account* to the mount's lifetime retargeted every one of them at those defaults — twice over,

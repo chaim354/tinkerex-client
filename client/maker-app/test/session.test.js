@@ -1,5 +1,7 @@
-// The desktop app's account-identity rules. Run by `bin/ci test-app` (config/ci.rb) and by the
-// `test-app-js` job in .github/workflows/ci.yml.
+// The desktop app's account-identity rules, and the sign-in form's first-run defaults. Run with
+// `node --test client/maker-app/test` from the repo root. NO CI JOB RUNS IT: the `bin/ci test-app`
+// gate and `test-app-js` job this line used to name were chaim354/tinkerex's, neither exists there
+// now, and this repo's workflows run no JS (checked 2026-10-13).
 //
 // THIS IS THE FIRST JS TEST IN THE REPO. Before it, client/maker-app had no `test` script, no test
 // files, and no gate — the Rust `mod tests` in src-tauri/src/lib.rs covers Prefs/creds_key/atomic
@@ -13,6 +15,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   accountArgs,
@@ -21,8 +24,9 @@ import {
   signedIn,
 } from "../src/session.js";
 
-// index.html:36,40 — the values the sign-in form carries on every launch, and therefore what the
-// old fallback aimed 64 catalog commands at.
+// The values index.html's sign-in form carried on every launch until D1 (2026-10-13) emptied it —
+// section 4 holds that — and so what the old fallback aimed 64 catalog commands at. Still the
+// right fixture: the form holds whatever was last typed into it, and accountArgs must ignore it.
 const DEV_DEFAULTS = { serverUrl: "http://localhost:3001", email: "maker@example.com" };
 const REAL = { serverUrl: "https://sync.example.org", email: "owner@example.org" };
 
@@ -130,4 +134,39 @@ test("fetchConflicts normalises a null answer to an empty list", async () => {
   // an error — harmless today, and a trap for anyone who later acts on the distinction.
   const invoke = countingInvoke(null);
   assert.deepEqual(await fetchConflicts({ invoke, account: REAL }), []);
+});
+
+// ---------------------------------------------------------------------------------------------
+// 4. The first-run form asks for the Tinkerex server and prefills nothing to aim at (D1).
+// ---------------------------------------------------------------------------------------------
+
+// Read as text: main.js cannot load here (see the header), but the defaults a stranger sees on a
+// first launch are plain markup.
+const INDEX_HTML = readFileSync(new URL("../src/index.html", import.meta.url), "utf8");
+const inputTag = (id) => (INDEX_HTML.match(new RegExp(`<input id="${id}"[^>]*>`)) || [])[0];
+
+test("the sign-in form ships with no server and no email, only placeholders", () => {
+  // The form used to carry DEV_DEFAULTS, so a stranger's first sign-in went to a developer's
+  // localhost. An empty field the user must fill is the honest default.
+  for (const id of ["server", "email"]) {
+    const tag = inputTag(id);
+    assert.ok(tag, `index.html has an <input id="${id}">`);
+    assert.doesNotMatch(tag, /\svalue=/, `#${id} must not carry a value`);
+    assert.match(tag, /\splaceholder="[^"]+"/, `#${id} shows a placeholder instead`);
+  }
+  assert.match(inputTag("server"), /placeholder="https:\/\/tinkerex\.example\.com"/);
+  assert.match(INDEX_HTML, /<label for="server">Tinkerex server<\/label>/);
+});
+
+test("the sign-in copy promises no transport it cannot see", () => {
+  // The self-hosted LAN deployments answer over plain HTTP (measured 2026-10-13), so "sent over
+  // TLS" would be false there. The password goes over whatever the typed address uses.
+  assert.match(INDEX_HTML, /Your password is sent once and\s+never stored/);
+  assert.doesNotMatch(INDEX_HTML, /\bTLS\b/);
+});
+
+test("the mount point defaults to ~/Tinkerex, not a temp dir", () => {
+  // /tmp is wiped at reboot: a mount there loses its place every restart. (Windows swaps in
+  // %USERPROFILE%\Tinkerex at runtime, in main.js.)
+  assert.match(inputTag("mount"), /\svalue="~\/Tinkerex"/);
 });

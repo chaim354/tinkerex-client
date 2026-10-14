@@ -1,4 +1,4 @@
-// Maker client — frontend logic.
+// Tinkerex desktop app — frontend logic.
 //
 // Vanilla ES module. All backend calls go through the Tauri `invoke` bridge.
 // The command names + argument casing here MUST match src-tauri/src/lib.rs:
@@ -176,7 +176,7 @@ const validateConnForm = () => {
   setFieldError($("mount"), $("mountErr"), "");
 
   if (!val("server")) {
-    setFieldError($("server"), $("serverErr"), "Enter the sync server URL.");
+    setFieldError($("server"), $("serverErr"), "Enter your Tinkerex server's address.");
     ok = false;
   }
   if (!val("email")) {
@@ -204,8 +204,9 @@ $("mountBtn").onclick = async () => {
   await withBusy($("mountBtn"), "Signing in…", async () => {
     try {
       // sync_login(server_url, email, password, mountpoint) — Tauri maps camelCase→snake_case.
-      // The device enrolls by logging in; the server returns a per-device token (saved
-      // locally), then we mount + start the sync loop. Reused on later launches.
+      // The device signs in to the Tinkerex server; its answer carries this device's token for
+      // that server and a grant for the sync server (saved locally as one credential), and we
+      // mount + start the sync loop against the grant. Reused on later launches.
       const result = await invoke("sync_login", {
         serverUrl: val("server"),
         email: val("email"),
@@ -226,6 +227,9 @@ $("mountBtn").onclick = async () => {
     } catch (e) {
       lastStatus = "unmounted";
       await refreshStatus();
+      // VERBATIM, never prefixed: sync_login's error is already a sentence for a person,
+      // including the one a server with nothing to sync answers ("This server keeps its files
+      // in a shared folder (share); there is nothing for this app to sync. …").
       toast($("connToast"), errText(e), "err");
     }
   });
@@ -420,20 +424,23 @@ const toggleVersions = async (afterRow, nodeId, verBtn) => {
 $("refreshFilesBtn").onclick = loadFiles;
 
 // ---- per-OS mount default ----------------------------------------------------
+//
+// index.html ships `~/Tinkerex`. Windows swaps in `%USERPROFILE%\Tinkerex`, which the backend's
+// expand_mountpoint expands (src-tauri/src/lib.rs, expand_user_profile) — nothing else would.
 
 (async () => {
   try {
     const os = await invoke("platform");
     if (os === "windows") {
-      $("mount").value = "C:\\Users\\you\\MakerCF";
+      $("mount").value = "%USERPROFILE%\\Tinkerex";
       $("mountLabel").innerHTML =
-        "Mount point — a sync-root <b>folder</b> (e.g. <code>%USERPROFILE%\\MakerCF</code>) · Windows / CfAPI";
+        "Mount point — a sync-root <b>folder</b> (e.g. <code>%USERPROFILE%\\Tinkerex</code>) · Windows / CfAPI";
     } else if (os === "macos") {
       $("mountLabel").innerHTML =
-        "Mount point — a directory (e.g. <code>~/Maker</code>) · macOS / WebDAV";
+        "Mount point — a directory (e.g. <code>~/Tinkerex</code>) · macOS / WebDAV";
     } else {
       $("mountLabel").innerHTML =
-        "Mount point — a directory (e.g. <code>~/Maker</code>) · Linux / FUSE";
+        "Mount point — a directory (e.g. <code>~/Tinkerex</code>) · Linux / FUSE";
     }
   } catch {
     /* keep default */

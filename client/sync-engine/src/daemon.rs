@@ -495,8 +495,9 @@ impl Drop for WebdavMount {
 
 #[cfg(target_os = "macos")]
 fn mount_native(addr: &SocketAddr, mp: &Path) -> std::io::Result<()> {
+    // `-v` is the volume name Finder shows under Locations.
     let status = Command::new("/sbin/mount_webdav")
-        .args(["-S", "-v", "Maker", &format!("http://{addr}/")])
+        .args(["-S", "-v", "Tinkerex", &format!("http://{addr}/")])
         .arg(mp)
         .status()?;
     if !status.success() {

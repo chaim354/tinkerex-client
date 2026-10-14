@@ -8,7 +8,7 @@
 //! Two independent client instances (`DeviceCtx` — each with its own SQLite tree, its own
 //! content-addressed chunk cache, its own device token) paired to ONE user/library on one
 //! server. This is exactly the Tauri app's per-account `(provider, chunk_dir, token)` triple
-//! from `maker-app/src-tauri/src/lib.rs::mount_with_token`.
+//! from `maker-app/src-tauri/src/lib.rs::mount_with_grant`.
 //!
 //! Each device's `sync_tick()` here is **literally what `sync_engine::daemon::sync_loop`
 //! calls** on every nudge/poll: `SyncEngine::push_outbox` (drain local writes → server +
