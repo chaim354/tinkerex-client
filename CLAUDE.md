@@ -117,12 +117,12 @@ per-object presigned URLs.
 
 | crate | `cargo test` |
 |---|---|
-| `fs-provider` | **83 passing** across 6 test binaries (chunking, posix, convergence, concurrency, caching) |
-| `sync-engine` | **92 passing** |
-| `sync-client` | **43 passing** (2026-10-13; was 39) |
+| `fs-provider` | **228 passing** across 30 test targets (unit, 28 test files, doc) (2026-10-22; the 83 across 6 recorded here on 2026-08-25 had gone stale — 226 before #472) |
+| `sync-engine` | **107 passing** (2026-10-22; was 92) |
+| `sync-client` | **46 passing** (2026-10-22; was 43) |
 | `fs-webdav` | **8 passing** |
 | `fs-fuse` | **build failure on macOS by design** — §0.3 |
-| `maker-app/src-tauri` | **27 passing** (2026-10-13), plus `node --test client/maker-app/test` **26 passing** — neither runs in CI (§6) |
+| `maker-app/src-tauri` | **38 passing** (2026-10-22; was 27), plus `node --test client/maker-app/test` **37 passing** (was 26) — neither runs in CI (§6) |
 
 **The server-backed `sync-engine` suites run against `chaim354/tinkerex-sync` only with two env
 knobs, and until 2026-09-30 could not run against it at all.** Every suite and example enrolled
@@ -164,6 +164,19 @@ working); an answer with neither field is an older server, read the same way; `s
 mounts nothing and says why in one sentence. `http://` grant URLs are used as given: the LAN
 deployments are plain HTTP. `device_login` still keeps the MAKER token on its client. **The
 suites' two modes above are unchanged** — their maker-app mode does not follow the grant.
+
+**A REFUSED TOKEN SIGNS THE DEVICE OUT. IT NEVER WEDGES THE APP OR COSTS AN UNPUSHED EDIT
+(tinkerex#472, 2026-10-22).** The maker app revokes and idle-expires device tokens since its #466,
+and the sync server will (#473). Only the server's own refusal counts: a 401 carrying the API's
+JSON error body (`sync_client::Error::is_auth_rejection`). Offline, a 5xx and a proxy's 401 never
+sign anyone out, and the login route's own 401 is a wrong password. A refusal on a maker or sync
+route forgets the record, compare-and-delete so a late 401 cannot delete a fresh sign-in; every
+command then answers `SIGNED_OUT`, and the next sign-in really logs in. The daemon parks on a
+sync 401 confirmed by `whoami` (`SyncHealth::SignedOut`): no more 2 s retries, only a `whoami`
+probe from 30 s doubling to 15 min, the nudge socket off, and no final drain. The mount stays up
+and `sync_status` answers `signed_out`. **The local DB is bound to the server's library (`whoami`'s
+`user_id`), not to the token**, and `SqliteProvider::reset_synced_state` refuses while the outbox
+holds anything. The old binding hashed the token, so every fresh grant deleted the outbox.
 
 ```sh
 (cd client/fs-provider && cargo test)

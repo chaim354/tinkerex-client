@@ -28,6 +28,11 @@
       <!-- Connection -->
       <section class="card">
         <h2>Sign in to sync</h2>
+        <!-- Shown when the server refused this device's token (tinkerex#472); main.js fills the text. -->
+        <div id="signedOutNotice" class="notice warn hidden" role="alert">
+          <span id="signedOutText"></span>
+          <button id="signInAgain" class="primary">Sign in again</button>
+        </div>
         <p class="muted">Sign in with the account you use on the web. Your password is sent once and
           never stored: this device keeps only its own token.</p>
 

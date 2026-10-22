@@ -11,9 +11,21 @@
 // frontend root. It does NOT disturb the load order window.MakerUI depends on: a dependency is
 // evaluated before its importer, and the <script type="module"> tags still run in document order,
 // so main.js is still fully evaluated before library.js and the rest.
-import { accountArgs, accountAfter, fetchConflicts, signedIn, SIGNED_OUT_HINT } from "/session.js";
+import {
+  accountArgs,
+  accountAfter,
+  fetchConflicts,
+  guardInvoke,
+  isSignedOutError,
+  pillFor,
+  signedIn,
+  SIGNED_OUT_HINT,
+  SIGNED_OUT_NOTICE,
+} from "/session.js";
 
-const { invoke } = window.__TAURI__.core;
+// Every command goes through the signed-out guard (src/session.js), so a server's refusal met by
+// ANY surface — the 5 s conflict poll included — puts the app in its signed-out state.
+const invoke = guardInvoke(window.__TAURI__.core.invoke, () => showSignedOut());
 const $ = (id) => document.getElementById(id);
 const val = (id) => $(id).value.trim();
 
@@ -52,14 +64,31 @@ const relWhen = (s) => {
   return `${day} day${day === 1 ? "" : "s"} ago`;
 };
 
-/** Dismissible toast. kind: "info" | "ok" | "err". */
+/**
+ * Dismissible toast. kind: "info" | "ok" | "err". A signed-out answer, from whichever surface,
+ * shows as the signed-out notice with its "Sign in again" action — never as the raw error.
+ */
 const toast = (el, text, kind = "info") => {
-  el.className = "toast" + (kind === "err" ? " err" : kind === "ok" ? " ok" : "");
+  const signedOutAnswer = isSignedOutError(text);
+  // In the sign-in card the notice above the form already says it, with the same action.
+  if (signedOutAnswer && el.closest(".card")?.contains($("signedOutNotice"))) {
+    el.classList.add("hidden");
+    return;
+  }
+  el.className =
+    "toast" + (signedOutAnswer ? " warn" : kind === "err" ? " err" : kind === "ok" ? " ok" : "");
   el.innerHTML = "";
   const msg = document.createElement("span");
   msg.className = "toast-msg";
-  msg.textContent = text;
+  msg.textContent = signedOutAnswer ? SIGNED_OUT_NOTICE : text;
   el.appendChild(msg);
+  if (signedOutAnswer) {
+    const again = document.createElement("button");
+    again.className = "toast-action";
+    again.textContent = "Sign in again";
+    again.onclick = () => signInAgain();
+    el.appendChild(again);
+  }
   const x = document.createElement("button");
   x.className = "close";
   x.setAttribute("aria-label", "Dismiss");
@@ -109,33 +138,53 @@ const args = () =>
 
 // ---- status pill -------------------------------------------------------------
 
+// A `sync_status` answer ({ state, mountpoint }), or the transient "mounting" / "unmounted".
 let lastStatus = "unmounted";
-const setStatus = (text) => {
-  lastStatus = text;
-  const pill = $("statusPill");
-  const label = $("statusText");
-  if (text.startsWith("mounted")) {
-    pill.className = "pill on";
-    label.textContent = text; // "mounted at <path>"
-  } else if (text === "mounting") {
-    pill.className = "pill busy";
-    label.textContent = "signing in…";
-  } else {
-    pill.className = "pill";
-    label.textContent = "unmounted";
-  }
-  $("unmountBtn").disabled = !text.startsWith("mounted");
+const setStatus = (status) => {
+  lastStatus = status;
+  const pill = pillFor(status);
+  $("statusPill").className = pill.className;
+  $("statusText").textContent = pill.label;
+  $("unmountBtn").disabled = !pill.unmount;
 };
 
 const refreshStatus = async () => {
   // don't clobber a transient "mounting" the click handler set
   if (lastStatus === "mounting") return;
   try {
-    setStatus(await invoke("sync_status"));
+    const status = await invoke("sync_status");
+    setStatus(status);
+    // The daemon parked on a refused token; the backend has forgotten the record.
+    if (status && status.state === "signed_out") showSignedOut();
   } catch {
     setStatus("unmounted");
   }
 };
+
+// ---- signed out by the server (tinkerex#472) -----------------------------------
+//
+// The server refused this device's token and the backend forgot the record, so the account is
+// gone: drop it (every catalog command stops asking), say so, and offer the way back. Idempotent —
+// the status poll, the conflict poll and any surface's call can all report it.
+function showSignedOut() {
+  const wasSignedIn = signedIn(signedInAccount);
+  signedInAccount = accountAfter(signedInAccount, { type: "signed-out" });
+  $("signedOutText").textContent = SIGNED_OUT_NOTICE;
+  $("signedOutNotice").classList.remove("hidden");
+  hideToast($("connToast")); // an earlier "mounted at …" would contradict the notice
+  loadFiles(); // signed out, this only renders its locked state — it asks nothing
+  // Re-show the open view so its surface renders its own signed-out state (each checks
+  // MakerUI.signedIn()) instead of an empty grid. Once: the polls report this every 3-5 s.
+  if (wasSignedIn) showView(VIEWS.find((v) => !$("view" + cap(v)).classList.contains("hidden")) || "sync");
+}
+
+// The way back: the sign-in form, which now really signs in (the dead record is gone).
+function signInAgain() {
+  showView("sync");
+  $("password").value = "";
+  $("password").focus();
+}
+$("signInAgain").onclick = signInAgain;
 
 // ---- top-level view nav (data-driven) ----------------------------------------
 //
@@ -206,7 +255,8 @@ $("mountBtn").onclick = async () => {
       // sync_login(server_url, email, password, mountpoint) — Tauri maps camelCase→snake_case.
       // The device signs in to the Tinkerex server; its answer carries this device's token for
       // that server and a grant for the sync server (saved locally as one credential), and we
-      // mount + start the sync loop against the grant. Reused on later launches.
+      // mount + start the sync loop against the grant. Reused on later launches — until a
+      // server refuses it, when the backend forgets it and this asks the server again.
       const result = await invoke("sync_login", {
         serverUrl: val("server"),
         email: val("email"),
@@ -221,7 +271,12 @@ $("mountBtn").onclick = async () => {
         serverUrl: val("server"),
         email: val("email"),
       });
+      $("signedOutNotice").classList.add("hidden");
       toast($("connToast"), result, "ok");
+      // The sign-in is over: end the transient "mounting" so the status poll reports again.
+      // Until 2026-10-22 only the FAILURE path did, so after a successful sign-in the pill said
+      // "signing in…" for good — and a sync server's later refusal could never have surfaced.
+      lastStatus = "unmounted";
       await refreshStatus();
       loadFiles();
     } catch (e) {
@@ -284,6 +339,9 @@ const loadFiles = async () => {
   try {
     entries = await invoke("browse", args());
   } catch (e) {
+    // Signed out: show that state, not an error. (showSignedOut drops the account first, so
+    // its own loadFiles cannot come back here.)
+    if (isSignedOutError(e)) return showSignedOut();
     showFilesError(errText(e));
     return;
   }

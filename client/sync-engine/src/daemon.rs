@@ -19,7 +19,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fs_provider::{LocalChunkStore, SqliteProvider};
+use fs_provider::{LocalChunkStore, Reset, SqliteProvider};
 use sync_client::ServerClient;
 
 use crate::{ChunkIO, PresignedIO, SyncEngine, ThrottledChunkIO};
@@ -37,6 +37,42 @@ use fuser::MountOption;
 /// Default poll fallback interval (the nudge is the fast path; this bounds staleness if
 /// the WebSocket is down).
 pub const DEFAULT_POLL: Duration = Duration::from_secs(2);
+
+/// Whether the sync server still accepts this device's token, as the sync loop last learned it.
+/// A host reads it to show "signed out" instead of "mounted" (tinkerex#472).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncHealth {
+    /// Syncing, or retrying a transient failure (offline, a 5xx) — nothing for the user to do.
+    Syncing,
+    /// The sync server refused this device's token (revoked, expired, unknown). Sync is parked:
+    /// the drive still serves local files, edits keep queueing in the outbox, and only a cheap
+    /// identity probe goes out, on a growing interval. Signing in again is the fix.
+    SignedOut,
+}
+
+impl SyncHealth {
+    fn from_flag(signed_out: &AtomicBool) -> Self {
+        if signed_out.load(Ordering::SeqCst) {
+            SyncHealth::SignedOut
+        } else {
+            SyncHealth::Syncing
+        }
+    }
+}
+
+/// How a signed-out sync loop spaces its identity probes: `first`, doubling, capped at `cap`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProbeBackoff {
+    pub first: Duration,
+    pub cap: Duration,
+}
+
+/// 30 s, then doubling to one probe every 15 minutes — a revoked device costs its server a
+/// handful of requests an hour, not one every poll.
+pub(crate) const SIGNED_OUT_PROBE: ProbeBackoff = ProbeBackoff {
+    first: Duration::from_secs(30),
+    cap: Duration::from_secs(15 * 60),
+};
 
 /// Everything the daemon needs to mount + sync one library on this device.
 #[derive(Clone, Debug)]
@@ -192,6 +228,7 @@ impl DaemonConfig {
 #[cfg(target_os = "linux")]
 pub struct Daemon {
     stop: Arc<AtomicBool>,
+    signed_out: Arc<AtomicBool>,
     session: Option<fuser::BackgroundSession>,
     sync_handle: Option<JoinHandle<()>>,
     mountpoint: PathBuf,
@@ -205,17 +242,10 @@ impl Daemon {
     pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
         let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
         let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
-        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
-        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
-        // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider
-            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
-            .unwrap_or(false)
-        {
-            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
-        }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
+        bind_to_library(&provider, &client, &cfg.server_url, &cfg.token)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let signed_out = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
 
         // Active cache-invalidation hook. Shared by the sync loop + the freshness adapter so
@@ -234,6 +264,7 @@ impl Daemon {
             let inval = inval_dyn.clone();
             let limits = limits.clone();
             let debounce = cfg.debounce;
+            let signed_out = signed_out.clone();
             thread::spawn(move || {
                 sync_loop(
                     provider,
@@ -245,13 +276,16 @@ impl Daemon {
                     None,
                     limits,
                     debounce,
+                    signed_out,
+                    SIGNED_OUT_PROBE,
                 )
             })
         };
         {
             let client = client.clone();
             let stop = stop.clone();
-            thread::spawn(move || nudge_loop(client, stop, nudge_tx));
+            let signed_out = signed_out.clone();
+            thread::spawn(move || nudge_loop(client, stop, nudge_tx, signed_out));
         }
 
         let hydrator = Arc::new(EngineHydrator::with_concurrency(
@@ -313,6 +347,7 @@ impl Daemon {
 
         Ok(Self {
             stop,
+            signed_out,
             session: Some(session),
             sync_handle: Some(sync_handle),
             mountpoint: cfg.mountpoint,
@@ -321,6 +356,11 @@ impl Daemon {
 
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
+    }
+
+    /// Whether the sync server still accepts this device's token — see [`SyncHealth`].
+    pub fn sync_health(&self) -> SyncHealth {
+        SyncHealth::from_flag(&self.signed_out)
     }
 
     /// True while the FUSE session thread is still serving.
@@ -386,6 +426,7 @@ impl Drop for Daemon {
 /// per platform.
 pub struct WebdavMount {
     stop: Arc<AtomicBool>,
+    signed_out: Arc<AtomicBool>,
     rt: Option<tokio::runtime::Runtime>, // owns the WebDAV server task; drop = shutdown
     sync_handle: Option<JoinHandle<()>>,
     mountpoint: PathBuf,
@@ -395,17 +436,10 @@ impl WebdavMount {
     pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
         let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
         let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
-        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
-        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
-        // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider
-            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
-            .unwrap_or(false)
-        {
-            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
-        }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
+        bind_to_library(&provider, &client, &cfg.server_url, &cfg.token)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let signed_out = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
 
         // Same sync + nudge threads as the FUSE Daemon.
@@ -416,16 +450,28 @@ impl WebdavMount {
             let stop = stop.clone();
             let poll = cfg.poll;
             let debounce = cfg.debounce;
+            let signed_out = signed_out.clone();
             thread::spawn(move || {
                 sync_loop(
-                    provider, client, stop, nudge_rx, poll, None, None, limits, debounce,
+                    provider,
+                    client,
+                    stop,
+                    nudge_rx,
+                    poll,
+                    None,
+                    None,
+                    limits,
+                    debounce,
+                    signed_out,
+                    SIGNED_OUT_PROBE,
                 )
             })
         };
         {
             let client = client.clone();
             let stop = stop.clone();
-            thread::spawn(move || nudge_loop(client, stop, nudge_tx));
+            let signed_out = signed_out.clone();
+            thread::spawn(move || nudge_loop(client, stop, nudge_tx, signed_out));
         }
 
         // Hydrate-on-read: resolve the WebDAV ino → node_id and pull missing chunks.
@@ -463,6 +509,7 @@ impl WebdavMount {
 
         Ok(Self {
             stop,
+            signed_out,
             rt: Some(rt),
             sync_handle: Some(sync_handle),
             mountpoint: cfg.mountpoint,
@@ -471,6 +518,11 @@ impl WebdavMount {
 
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
+    }
+
+    /// Whether the sync server still accepts this device's token — see [`SyncHealth`].
+    pub fn sync_health(&self) -> SyncHealth {
+        SyncHealth::from_flag(&self.signed_out)
     }
 
     pub fn is_running(&self) -> bool {
@@ -525,6 +577,7 @@ fn unmount_native(mp: &Path) {
 #[cfg(target_os = "windows")]
 pub struct WinfspMount {
     stop: Arc<AtomicBool>,
+    signed_out: Arc<AtomicBool>,
     fs_thread: Option<JoinHandle<()>>,
     sync_handle: Option<JoinHandle<()>>,
     mountpoint: PathBuf,
@@ -535,17 +588,10 @@ impl WinfspMount {
     pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
         let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
         let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
-        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
-        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
-        // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider
-            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
-            .unwrap_or(false)
-        {
-            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
-        }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
+        bind_to_library(&provider, &client, &cfg.server_url, &cfg.token)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let signed_out = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
 
         // Same sync + nudge threads as the other backends.
@@ -556,16 +602,28 @@ impl WinfspMount {
             let stop = stop.clone();
             let poll = cfg.poll;
             let debounce = cfg.debounce;
+            let signed_out = signed_out.clone();
             thread::spawn(move || {
                 sync_loop(
-                    provider, client, stop, nudge_rx, poll, None, None, limits, debounce,
+                    provider,
+                    client,
+                    stop,
+                    nudge_rx,
+                    poll,
+                    None,
+                    None,
+                    limits,
+                    debounce,
+                    signed_out,
+                    SIGNED_OUT_PROBE,
                 )
             })
         };
         {
             let client = client.clone();
             let stop = stop.clone();
-            thread::spawn(move || nudge_loop(client, stop, nudge_tx));
+            let signed_out = signed_out.clone();
+            thread::spawn(move || nudge_loop(client, stop, nudge_tx, signed_out));
         }
 
         // Hydrate-on-read: WinFsp ino → node_id → pull missing chunks.
@@ -622,6 +680,7 @@ impl WinfspMount {
 
         Ok(Self {
             stop,
+            signed_out,
             fs_thread: Some(fs_thread),
             sync_handle: Some(sync_handle),
             mountpoint: cfg.mountpoint,
@@ -630,6 +689,11 @@ impl WinfspMount {
 
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
+    }
+
+    /// Whether the sync server still accepts this device's token — see [`SyncHealth`].
+    pub fn sync_health(&self) -> SyncHealth {
+        SyncHealth::from_flag(&self.signed_out)
     }
 
     pub fn is_running(&self) -> bool {
@@ -689,6 +753,7 @@ impl crate::Invalidate for EngineCfInvalidate {
 #[cfg(target_os = "windows")]
 pub struct CfApiMount {
     stop: Arc<AtomicBool>,
+    signed_out: Arc<AtomicBool>,
     handle: Option<fs_cfapi::CfApiMountHandle>,
     sync_handle: Option<JoinHandle<()>>,
     mountpoint: PathBuf,
@@ -717,17 +782,10 @@ impl CfApiMount {
     pub fn start(cfg: DaemonConfig) -> crate::Result<Self> {
         let store = Box::new(LocalChunkStore::new(&cfg.chunk_dir)?);
         let provider = Arc::new(SqliteProvider::open(&cfg.db, store)?);
-        // Bind the local DB to this (server, token) library; if it last served a DIFFERENT
-        // library, wipe its stale tree/cursor so a reused DB path can't mix two (the chunk
-        // cache is kept — content-addressed, so hydrated files stay available offline).
-        if provider
-            .bind_library(library_id_for(&cfg.server_url, &cfg.token))
-            .unwrap_or(false)
-        {
-            eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
-        }
         let client = ServerClient::with_token(&cfg.server_url, &cfg.token);
+        bind_to_library(&provider, &client, &cfg.server_url, &cfg.token)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let signed_out = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::channel::<i64>();
 
         // Pull the current tree before mounting (so the first enumeration shows the library)
@@ -788,6 +846,7 @@ impl CfApiMount {
             let push_gate = push_gate.clone();
             let limits = limits.clone();
             let debounce = cfg.debounce;
+            let signed_out = signed_out.clone();
             thread::spawn(move || {
                 sync_loop(
                     provider,
@@ -799,13 +858,16 @@ impl CfApiMount {
                     Some(push_gate),
                     limits,
                     debounce,
+                    signed_out,
+                    SIGNED_OUT_PROBE,
                 )
             })
         };
         {
             let client = client.clone();
             let stop = stop.clone();
-            thread::spawn(move || nudge_loop(client, stop, nudge_tx));
+            let signed_out = signed_out.clone();
+            thread::spawn(move || nudge_loop(client, stop, nudge_tx, signed_out));
         }
 
         // Hydrate-on-FETCH_DATA: CfAPI hands us the node_id (placeholder FileIdentity) + the
@@ -848,6 +910,7 @@ impl CfApiMount {
 
         Ok(Self {
             stop,
+            signed_out,
             handle: Some(handle),
             sync_handle: Some(sync_handle),
             mountpoint: cfg.mountpoint,
@@ -860,6 +923,11 @@ impl CfApiMount {
 
     pub fn mountpoint(&self) -> &Path {
         &self.mountpoint
+    }
+
+    /// Whether the sync server still accepts this device's token — see [`SyncHealth`].
+    pub fn sync_health(&self) -> SyncHealth {
+        SyncHealth::from_flag(&self.signed_out)
     }
 
     pub fn is_running(&self) -> bool {
@@ -953,6 +1021,12 @@ impl CfApiMount {
     /// for a few consecutive polls before declaring done (CfAPI can deliver a callback a moment
     /// after `CfDisconnectSyncRoot` returns), bounded by a deadline.
     fn shutdown_drain(&self) {
+        // Signed out, every push below would be refused and retried until HARD_CAP — two
+        // minutes of requests on each unmount. The outbox stays queued for the next sign-in.
+        if self.signed_out.load(Ordering::SeqCst) {
+            eprintln!("cfapi: signed out — no shutdown drain; the outbox stays queued");
+            return;
+        }
         let io = self.limits.wrap(PresignedIO::new(&self.client));
         let start = std::time::Instant::now();
         // CfAPI flushes its batched NOTIFY callbacks (delete/rename/edit) at disconnect, so the
@@ -1025,10 +1099,126 @@ impl Drop for CfApiMount {
     }
 }
 
-/// A stable id for "the library this (server, token) points at", used to bind a local DB to
-/// one library so a reused DB path can't mix two. (Keyed by token, so each device's cache is
-/// its own — which is correct; cross-device sharing of a local cache is never wanted.)
-fn library_id_for(server: &str, token: &str) -> i64 {
+// ---- binding the local DB to a library -------------------------------------------------
+//
+// A local DB holds ONE library's tree, so a reused DB path must not mix two (the Windows
+// "cursor 14 > head_seq 5" + duplicate-placeholder bug). Until tinkerex#472 the binding was a hash
+// of (server, TOKEN). A token is a device credential, not a library: a device signed out by its
+// server and signed in again gets a fresh token for the SAME library, the hash changed, and the
+// wipe that followed deleted the tree, the cursor and every outbox entry the old token never
+// pushed. The binding is now the library the SERVER says the credential reaches (`whoami`), and
+// the wipe itself refuses while anything is unpushed (`SqliteProvider::reset_synced_state`).
+
+/// `sync_state` key: [`library_tag`] of the library this DB holds.
+const LIBRARY_KEY: &str = "library_key";
+/// `sync_state` key: [`credential_tag`] of the credential that last proved it, so a start with
+/// the same credential needs no network.
+const CREDENTIAL_KEY: &str = "credential_key";
+/// `sync_state` key the pre-#472 binding wrote: [`legacy_library_id`]. Read, never written.
+const LEGACY_LIBRARY_KEY: &str = "library";
+
+/// What [`bind_to_library`] found and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Binding {
+    /// The credential that last proved this DB's library: nothing asked, nothing changed.
+    Kept,
+    /// A new credential for the library this DB already holds — a fresh grant. Everything kept.
+    Rebound,
+    /// The DB's library was never recorded (a DB from before #472, or a first start) and it
+    /// holds unpushed changes: adopted as it stands rather than wiped.
+    Adopted,
+    /// A different (or unrecorded) library and nothing unpushed: the stale tree was wiped.
+    Wiped,
+    /// The server could not say which library the credential reaches (offline, 5xx, 401):
+    /// left exactly as it was, and asked again next start.
+    Unresolved,
+}
+
+/// Bind the local DB to the library `token` reaches on `server_url`, before anything syncs.
+///
+/// Only a credential this DB has not seen costs a request (`whoami`), so an offline start with
+/// the usual credential mounts as it always did. `Err` only for a DIFFERENT library while
+/// changes are unpushed — [`crate::Error::UnpushedChangesElsewhere`]: the mount is refused rather
+/// than either losing them or pushing them into a library they were not made in.
+pub(crate) fn bind_to_library(
+    provider: &SqliteProvider,
+    client: &ServerClient,
+    server_url: &str,
+    token: &str,
+) -> crate::Result<Binding> {
+    let server = server_url.trim_end_matches('/');
+    let credential = credential_tag(server, token);
+    let stored_credential = provider.sync_state(CREDENTIAL_KEY)?;
+    if stored_credential == Some(credential) {
+        return Ok(Binding::Kept);
+    }
+    if stored_credential.is_none()
+        && provider.sync_state(LEGACY_LIBRARY_KEY)? == Some(legacy_library_id(server_url, token))
+    {
+        return Ok(Binding::Kept); // the pre-#472 binding of this very token
+    }
+
+    let who = match client.whoami() {
+        Ok(who) => who,
+        Err(e) => {
+            eprintln!("sync: could not ask {server} which library this sign-in reaches ({e}); local DB left as it was");
+            return Ok(Binding::Unresolved);
+        }
+    };
+    let library = library_tag(server, who.user_id);
+    let stored_library = provider.sync_state(LIBRARY_KEY)?;
+    let binding = if stored_library == Some(library) {
+        Binding::Rebound
+    } else {
+        match provider.reset_synced_state()? {
+            Reset::Wiped { had_nodes } => {
+                if had_nodes {
+                    eprintln!("sync: local DB was a different library — wiped, re-syncing fresh");
+                }
+                Binding::Wiped
+            }
+            Reset::Refused { pending } if stored_library.is_none() => {
+                eprintln!("sync: adopting this DB's tree for the library this sign-in reaches ({pending} unpushed change(s) kept)");
+                Binding::Adopted
+            }
+            Reset::Refused { pending } => {
+                return Err(crate::Error::UnpushedChangesElsewhere { pending });
+            }
+        }
+    };
+    provider.set_sync_state(LIBRARY_KEY, library)?;
+    provider.set_sync_state(CREDENTIAL_KEY, credential)?;
+    Ok(binding)
+}
+
+/// A tag of `parts` stable across Rust releases (SHA-256, not `DefaultHasher`), as the i64 that
+/// `sync_state` stores.
+fn stable_tag(parts: &[&str]) -> i64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in parts {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    let digest = h.finalize();
+    i64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
+}
+
+/// The library: the server, and the account `whoami` says the credential belongs to (one
+/// library per sync-server user). Unchanged by a new device token.
+fn library_tag(server: &str, user_id: i64) -> i64 {
+    stable_tag(&["library", server, &user_id.to_string()])
+}
+
+/// The device credential — changes with every grant.
+fn credential_tag(server: &str, token: &str) -> i64 {
+    stable_tag(&["credential", server, token])
+}
+
+/// The pre-#472 binding, hash of (server, token): kept ONLY to recognise a DB bound by an older
+/// build to the very token it is being started with. `DefaultHasher` may change between Rust
+/// releases; if it does, such a DB just takes the `whoami` path, which loses nothing.
+fn legacy_library_id(server: &str, token: &str) -> i64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     server.hash(&mut h);
@@ -1039,6 +1229,13 @@ fn library_id_for(server: &str, token: &str) -> i64 {
 /// Push the outbox + pull the changelog delta on each nudge or poll-timeout. `inval`, when
 /// present (the FUSE `Daemon`), drops the kernel cache for any inode a pull repoints at new
 /// content; the WebDAV/WinFsp mounts pass `None` (no strong push-invalidation yet).
+///
+/// **A refused token parks the loop** (tinkerex#472). A tick that fails with the server's own
+/// 401 ([`sync_client::Error::is_auth_rejection`]), confirmed on the identity route, sets
+/// `signed_out`; from then on the loop sends nothing but one `whoami` per `probe` step (doubling
+/// to its cap), resumes by itself if one succeeds, and skips the final drain on stop — every
+/// push would be refused, and the outbox must outlive this token for the next sign-in to push.
+/// Any other failure (offline, a 5xx, a proxy's 401) is retried on the normal poll as before.
 #[allow(clippy::too_many_arguments)]
 fn sync_loop(
     provider: Arc<SqliteProvider>,
@@ -1050,11 +1247,29 @@ fn sync_loop(
     push_gate: Option<Arc<std::sync::Mutex<()>>>,
     limits: TransferLimits,
     debounce: Debounce,
+    signed_out: Arc<AtomicBool>,
+    probe: ProbeBackoff,
 ) {
     let mut cursor = provider.cursor().unwrap_or(0);
     println!("sync loop started (cursor {cursor}, poll {poll:?})");
     let mut tick: u64 = 0;
+    let mut wait = probe.first;
     while !stop.load(Ordering::Relaxed) {
+        if signed_out.load(Ordering::SeqCst) {
+            if !sleep_unless_stopped(&stop, wait) {
+                break;
+            }
+            wait = (wait * 2).min(probe.cap);
+            match client.whoami() {
+                Ok(_) => {
+                    eprintln!("sync: the server accepts this device's token again — resuming");
+                    signed_out.store(false, Ordering::SeqCst);
+                }
+                Err(e) if e.is_auth_rejection() => {}
+                Err(e) => eprintln!("sync: signed-out probe failed ({e}); still parked"),
+            }
+            continue;
+        }
         tick += 1;
         // Wrap the production transport in the bandwidth throttle (a no-op when unlimited).
         let io = limits.wrap(PresignedIO::new(&client));
@@ -1086,6 +1301,15 @@ fn sync_loop(
                     cursor = new_cursor;
                 }
             }
+            Err(e) if refused_by_server(&e, &client) => {
+                eprintln!(
+                    "sync: the server refused this device's token ({e}) — signed out; sync parked, \
+                     local changes stay queued until this device signs in again"
+                );
+                signed_out.store(true, Ordering::SeqCst);
+                wait = probe.first;
+                continue;
+            }
             Err(e) => eprintln!("sync tick #{tick} error: {e}"),
         }
         // Wait for a nudge (pull now) or the poll fallback; coalesce a burst.
@@ -1108,6 +1332,11 @@ fn sync_loop(
     // push is not gated. The cost of that overlap is a duplicate version row, a duplicate
     // changelog entry and redundant chunk re-PUTs — never a conflict, because both drains push
     // through the same `ServerClient` and `Sync::Commit` exempts a same-device divergence.
+    if signed_out.load(Ordering::SeqCst) {
+        let queued = provider.outbox_len().unwrap_or(0);
+        println!("sync loop stopped signed out; {queued} local change(s) stay queued");
+        return;
+    }
     let io = limits.wrap(PresignedIO::new(&client));
     if let Err(e) = SyncEngine::push_outbox(&provider, &client, &io) {
         eprintln!("sync: final outbox drain failed: {e}");
@@ -1115,10 +1344,43 @@ fn sync_loop(
     println!("sync loop stopped");
 }
 
+/// Whether a failed tick means the server refused this device's token: its own 401 on the
+/// tick, CONFIRMED by a 401 on the identity route. The confirmation costs one request and keeps
+/// any other 401 a tick might carry from signing the device out.
+fn refused_by_server(e: &crate::Error, client: &ServerClient) -> bool {
+    matches!(e, crate::Error::Api(api) if api.is_auth_rejection())
+        && client.whoami().is_err_and(|w| w.is_auth_rejection())
+}
+
+/// Sleep `total` in short slices so a `stop` is honoured promptly even across a long backoff.
+/// `false` if stopped.
+fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    while !stop.load(Ordering::Relaxed) {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(100)));
+    }
+    false
+}
+
 /// Subscribe to the LibraryChannel; forward each `{head_seq}` to the sync loop.
 /// Reconnects on socket drop (the poll covers correctness meanwhile).
-fn nudge_loop(client: ServerClient, stop: Arc<AtomicBool>, nudge_tx: mpsc::Sender<i64>) {
+fn nudge_loop(
+    client: ServerClient,
+    stop: Arc<AtomicBool>,
+    nudge_tx: mpsc::Sender<i64>,
+    signed_out: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
+        // Signed out, the socket would only be refused: stay off it until the sync loop's probe
+        // finds the token accepted again.
+        if signed_out.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         let tx = nudge_tx.clone();
         if let Err(e) = client.watch_library(move |seq| {
             let _ = tx.send(seq);
@@ -1131,5 +1393,641 @@ fn nudge_loop(client: ServerClient, stop: Arc<AtomicBool>, nudge_tx: mpsc::Sende
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod stub {
+    //! A tiny scripted HTTP server for the daemon's tests: every request is answered by `route`
+    //! (request line in, `(status, body)` out) and its request line recorded, so a test can count
+    //! exactly what the daemon sent. One request per connection (`connection: close`).
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    pub struct Stub {
+        pub url: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Stub {
+        pub fn start(route: impl Fn(&str) -> (u16, String) + Send + 'static) -> Stub {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                    let line = line.trim_end().to_string();
+                    let (status, reply) = route(&line);
+                    log.lock().unwrap().push(line);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                }
+            });
+            Stub { url, seen }
+        }
+
+        /// Every request line received so far, in order.
+        pub fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// A `whoami` answer for sync-server user (library) `user_id`.
+    pub fn whoami(user_id: i64) -> (u16, String) {
+        (
+            200,
+            format!(r#"{{"user_id":{user_id},"device_id":7,"head_seq":0}}"#),
+        )
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    //! THE DATA-LOSS PATH (tinkerex#472). A device signed out by its server signs in again and is
+    //! handed a FRESH grant: same library, new device token. Before this fix the local DB was
+    //! bound to a hash of (server, TOKEN), so the new token read as "a different library" and
+    //! `bind_library` deleted the tree, the cursor and — the loss — every outbox entry the old
+    //! token never got to push. Each test opens a real file-backed DB, closes it, and reopens it
+    //! the way the next start does.
+    use super::stub::{self, Stub};
+    use super::*;
+    use fs_provider::{Provider, ROOT_INO};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sync-bind-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn open(dir: &Path) -> SqliteProvider {
+        let store = Box::new(LocalChunkStore::new(dir.join("chunks")).unwrap());
+        SqliteProvider::open(&dir.join("tree.db"), store).unwrap()
+    }
+
+    /// A local edit the server has not seen: a file created and flushed, so it sits in the outbox.
+    fn unpushed_edit(p: &SqliteProvider, name: &str, body: &[u8]) {
+        let f = p.create(ROOT_INO, name).unwrap();
+        p.write(f.ino, 0, body).unwrap();
+        p.flush(f.ino).unwrap();
+    }
+
+    fn names(p: &SqliteProvider) -> Vec<String> {
+        let mut v: Vec<String> = p
+            .export_tree()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// First start under token A (the server says: library 42), an edit that never got pushed,
+    /// and a cursor — the state a device is in when its token is revoked.
+    fn device_with_unpushed_edit(dir: &Path, server: &Stub) {
+        let p = open(dir);
+        let client = ServerClient::with_token(&server.url, "token-A");
+        bind_to_library(&p, &client, &server.url, "token-A").unwrap();
+        unpushed_edit(&p, "draft.scad", b"cube(10);");
+        p.set_cursor(17).unwrap();
+        assert_eq!(
+            p.outbox_list().unwrap().len(),
+            1,
+            "the edit is queued, unpushed"
+        );
+    }
+
+    #[test]
+    fn a_fresh_grant_for_the_same_library_keeps_the_unpushed_outbox() {
+        let dir = scratch("fresh-grant");
+        let server = Stub::start(|_| stub::whoami(42));
+        device_with_unpushed_edit(&dir, &server);
+
+        // Signed out, signed in again: the next start runs with token B for the SAME library.
+        let p = open(&dir);
+        let client = ServerClient::with_token(&server.url, "token-B");
+        bind_to_library(&p, &client, &server.url, "token-B").unwrap();
+
+        assert_eq!(
+            p.outbox_list().unwrap().len(),
+            1,
+            "the unpushed edit must survive a new grant"
+        );
+        assert_eq!(
+            names(&p),
+            vec!["draft.scad".to_string()],
+            "the local tree is kept"
+        );
+        assert_eq!(p.cursor().unwrap(), 17, "the cursor is kept: same library");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_db_bound_by_the_old_token_hash_keeps_its_unpushed_edit_through_a_new_grant() {
+        // Every install that predates this fix: the DB carries only the pre-#472 key, a hash of
+        // (server, old token). Its first start with a fresh grant cannot tell which library
+        // that was, and it holds an unpushed edit — adopted, never wiped.
+        let dir = scratch("legacy");
+        let server = Stub::start(|_| stub::whoami(42));
+        {
+            let p = open(&dir);
+            p.set_sync_state("library", legacy_library_id(&server.url, "token-A"))
+                .unwrap();
+            unpushed_edit(&p, "draft.scad", b"cube(10);");
+            p.set_cursor(17).unwrap();
+        }
+        let p = open(&dir);
+        // The old token itself still binds with no question asked, exactly as before.
+        let old = ServerClient::with_token(&server.url, "token-A");
+        assert_eq!(
+            bind_to_library(&p, &old, &server.url, "token-A").unwrap(),
+            Binding::Kept
+        );
+        assert!(
+            server.seen().is_empty(),
+            "the pre-fix binding of the same token needs no request"
+        );
+
+        let client = ServerClient::with_token(&server.url, "token-B");
+        assert_eq!(
+            bind_to_library(&p, &client, &server.url, "token-B").unwrap(),
+            Binding::Adopted
+        );
+        assert_eq!(
+            p.outbox_len().unwrap(),
+            1,
+            "the unpushed edit survives the upgrade + new grant"
+        );
+        assert_eq!(names(&p), vec!["draft.scad".to_string()]);
+        assert_eq!(p.cursor().unwrap(), 17);
+        // From here on it is an ordinary bound DB: the next start with token B asks nothing.
+        let asked = server.seen().len();
+        assert_eq!(
+            bind_to_library(&p, &client, &server.url, "token-B").unwrap(),
+            Binding::Kept
+        );
+        assert_eq!(server.seen().len(), asked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server whose `whoami` names whichever library `library` holds at the time.
+    fn switchable_server(library: &Arc<std::sync::atomic::AtomicI64>) -> Stub {
+        let library = library.clone();
+        Stub::start(move |_| stub::whoami(library.load(Ordering::SeqCst)))
+    }
+
+    #[test]
+    fn a_different_library_with_unpushed_changes_refuses_to_mount_and_deletes_nothing() {
+        let dir = scratch("other-library");
+        let library = Arc::new(std::sync::atomic::AtomicI64::new(42));
+        let server = switchable_server(&library);
+        device_with_unpushed_edit(&dir, &server);
+
+        // The server now says this sign-in reaches library 99, not 42.
+        library.store(99, Ordering::SeqCst);
+        let p = open(&dir);
+        let client = ServerClient::with_token(&server.url, "token-B");
+        let err = bind_to_library(&p, &client, &server.url, "token-B")
+            .expect_err("a different library with pending changes must not bind");
+
+        assert!(
+            matches!(err, crate::Error::UnpushedChangesElsewhere { pending: 1 }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Nothing was deleted"), "{err}");
+        assert_eq!(p.outbox_len().unwrap(), 1, "the unpushed edit is untouched");
+        assert_eq!(names(&p), vec!["draft.scad".to_string()]);
+        assert_eq!(p.cursor().unwrap(), 17);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_different_library_with_nothing_unpushed_is_still_wiped() {
+        // The protection the binding exists for is kept: two libraries never share one tree.
+        let dir = scratch("wipe");
+        let library = Arc::new(std::sync::atomic::AtomicI64::new(42));
+        let server = switchable_server(&library);
+        device_with_unpushed_edit(&dir, &server);
+        {
+            let p = open(&dir);
+            let (node_id, _) = p.outbox_list().unwrap().remove(0);
+            p.outbox_clear(&node_id).unwrap(); // pushed
+        }
+        library.store(99, Ordering::SeqCst);
+        let p = open(&dir);
+        let client = ServerClient::with_token(&server.url, "token-B");
+        assert_eq!(
+            bind_to_library(&p, &client, &server.url, "token-B").unwrap(),
+            Binding::Wiped
+        );
+        assert!(names(&p).is_empty(), "the other library's tree is gone");
+        assert_eq!(p.cursor().unwrap(), 0, "and its cursor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_same_credential_binds_offline_without_a_request() {
+        let dir = scratch("offline-same");
+        let server = Stub::start(|_| stub::whoami(42));
+        device_with_unpushed_edit(&dir, &server);
+        assert_eq!(server.seen().len(), 1, "the first start asked once");
+
+        // Next start, network down: the credential is the one the DB last proved.
+        let p = open(&dir);
+        let offline = ServerClient::with_token(closed_port(), "token-A");
+        assert_eq!(
+            bind_to_library(&p, &offline, &server.url, "token-A").unwrap(),
+            Binding::Kept
+        );
+        assert_eq!(p.outbox_len().unwrap(), 1);
+        assert_eq!(server.seen().len(), 1, "no request at all");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_credential_the_server_cannot_place_leaves_the_db_exactly_as_it_was() {
+        // Offline, a 5xx, or a 401 on whoami: no authoritative answer, so nothing is decided.
+        let dir = scratch("unresolved");
+        let server = Stub::start(|_| stub::whoami(42));
+        device_with_unpushed_edit(&dir, &server);
+        let p = open(&dir);
+        let answers: [(&str, Option<(u16, &str)>); 3] = [
+            ("network down", None),
+            ("503", Some((503, r#"{"error":"unavailable"}"#))),
+            ("401", Some((401, r#"{"error":"unauthorized"}"#))),
+        ];
+        for (what, answer) in answers {
+            let url = match answer {
+                None => closed_port(),
+                Some((status, body)) => {
+                    let body = body.to_string();
+                    Stub::start(move |_| (status, body.clone())).url
+                }
+            };
+            let client = ServerClient::with_token(&url, "token-B");
+            assert_eq!(
+                bind_to_library(&p, &client, &server.url, "token-B").unwrap(),
+                Binding::Unresolved,
+                "{what}"
+            );
+            assert_eq!(
+                p.outbox_len().unwrap(),
+                1,
+                "{what}: the edit is still queued"
+            );
+            assert_eq!(names(&p), vec!["draft.scad".to_string()], "{what}");
+            assert_eq!(p.cursor().unwrap(), 17, "{what}");
+        }
+        // Once the server answers, the same library is recognised and nothing is lost.
+        let client = ServerClient::with_token(&server.url, "token-B");
+        assert_eq!(
+            bind_to_library(&p, &client, &server.url, "token-B").unwrap(),
+            Binding::Rebound
+        );
+        assert_eq!(p.outbox_len().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A URL nothing listens on: connection refused, the cheapest "network down".
+    fn closed_port() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        drop(l);
+        url
+    }
+}
+
+#[cfg(test)]
+mod signed_out_tests {
+    //! A device whose token the SYNC server refuses (tinkerex#472; real once tinkerex#473 lands).
+    //! Before this fix the sync loop logged the 401 and retried every poll, forever, while the
+    //! host went on reporting "mounted"; the nudge loop re-dialled `/cable` every second. Each
+    //! test runs the REAL `sync_loop` on its own thread against a scripted server, with the
+    //! poll shrunk to 20 ms so "forever" is visible inside a second.
+    use super::stub::{self, Stub};
+    use super::*;
+    use fs_provider::{ChunkConfig, Provider, ROOT_INO};
+    use std::sync::atomic::AtomicI64;
+    use std::time::Instant;
+
+    const REFUSED: &str = r#"{"error":"unauthorized"}"#;
+    const POLL: Duration = Duration::from_millis(20);
+    const PROBE: ProbeBackoff = ProbeBackoff {
+        first: Duration::from_millis(150),
+        cap: Duration::from_millis(300),
+    };
+
+    fn provider() -> Arc<SqliteProvider> {
+        let store = Box::new(LocalChunkStore::temp().unwrap());
+        let tiny = ChunkConfig {
+            min: 64,
+            avg: 256,
+            max: 1024,
+        };
+        Arc::new(SqliteProvider::in_memory(store, tiny).unwrap())
+    }
+
+    struct Running {
+        stop: Arc<AtomicBool>,
+        signed_out: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+        _nudge: mpsc::Sender<i64>,
+    }
+
+    impl Running {
+        fn health(&self) -> SyncHealth {
+            SyncHealth::from_flag(&self.signed_out)
+        }
+        fn stop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                h.join().unwrap();
+            }
+        }
+    }
+
+    fn run(provider: Arc<SqliteProvider>, url: &str) -> Running {
+        let client = ServerClient::with_token(url, "dead-token");
+        let stop = Arc::new(AtomicBool::new(false));
+        let signed_out = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let handle = {
+            let (stop, signed_out) = (stop.clone(), signed_out.clone());
+            thread::spawn(move || {
+                sync_loop(
+                    provider,
+                    client,
+                    stop,
+                    rx,
+                    POLL,
+                    None,
+                    None,
+                    TransferLimits::default(),
+                    Debounce::default(),
+                    signed_out,
+                    PROBE,
+                )
+            })
+        };
+        Running {
+            stop,
+            signed_out,
+            handle: Some(handle),
+            _nudge: tx,
+        }
+    }
+
+    fn count(server: &Stub, prefix: &str) -> usize {
+        server
+            .seen()
+            .iter()
+            .filter(|l| l.starts_with(prefix))
+            .count()
+    }
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_refused_token_parks_the_loop_instead_of_retrying_every_poll() {
+        let server = Stub::start(|_| (401, REFUSED.into()));
+        let mut running = run(provider(), &server.url);
+        thread::sleep(Duration::from_secs(1));
+
+        assert_eq!(running.health(), SyncHealth::SignedOut);
+        // One tick saw the 401 and stopped. The old loop asked ~50 times in this second.
+        assert_eq!(count(&server, "GET /v1/changes"), 1, "{:?}", server.seen());
+        // Parked, it only probes identity, on a growing interval: ~4 in a second at 150/300 ms.
+        let probes = count(&server, "GET /v1/devices/whoami");
+        assert!(
+            (1..=6).contains(&probes),
+            "{probes} probes: {:?}",
+            server.seen()
+        );
+        assert_eq!(server.seen().len(), 1 + probes, "nothing but the probes");
+        running.stop();
+    }
+
+    #[test]
+    fn a_5xx_never_signs_the_device_out() {
+        let server = Stub::start(|_| (503, r#"{"error":"unavailable"}"#.into()));
+        let mut running = run(provider(), &server.url);
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(running.health(), SyncHealth::Syncing);
+        assert!(
+            count(&server, "GET /v1/changes") > 5,
+            "a transient error keeps the normal poll going"
+        );
+        running.stop();
+    }
+
+    #[test]
+    fn a_network_failure_never_signs_the_device_out() {
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            drop(l);
+            url
+        };
+        let mut running = run(provider(), &closed);
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(running.health(), SyncHealth::Syncing);
+        running.stop();
+    }
+
+    #[test]
+    fn a_401_without_the_apis_body_is_not_a_sign_out() {
+        // A proxy in front of the server, not the server refusing the token.
+        let server = Stub::start(|_| (401, "<html>401 Authorization Required</html>".into()));
+        let mut running = run(provider(), &server.url);
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(running.health(), SyncHealth::Syncing);
+        running.stop();
+    }
+
+    #[test]
+    fn a_parked_loop_resumes_once_the_server_accepts_the_token_again() {
+        let refusing = Arc::new(AtomicI64::new(1));
+        let server = {
+            let refusing = refusing.clone();
+            Stub::start(move |line| {
+                if refusing.load(Ordering::SeqCst) == 1 {
+                    (401, REFUSED.into())
+                } else if line.starts_with("GET /v1/devices/whoami") {
+                    stub::whoami(42)
+                } else {
+                    (200, r#"{"changes":[],"head_seq":0,"oldest_seq":0}"#.into())
+                }
+            })
+        };
+        let mut running = run(provider(), &server.url);
+        wait_until("signed out", || running.health() == SyncHealth::SignedOut);
+
+        refusing.store(0, Ordering::SeqCst);
+        wait_until("syncing again", || running.health() == SyncHealth::Syncing);
+        let before = count(&server, "GET /v1/changes");
+        wait_until("polling again", || {
+            count(&server, "GET /v1/changes") > before + 3
+        });
+        running.stop();
+    }
+
+    #[test]
+    fn stopping_a_signed_out_loop_keeps_the_outbox_and_does_not_push_it_again() {
+        let p = provider();
+        let f = p.create(ROOT_INO, "draft.scad").unwrap();
+        p.write(f.ino, 0, b"cube(10);").unwrap();
+        p.flush(f.ino).unwrap();
+        let server = Stub::start(|_| (401, REFUSED.into()));
+        let mut running = run(p.clone(), &server.url);
+        wait_until("signed out", || running.health() == SyncHealth::SignedOut);
+        let pushes = count(&server, "POST ");
+        assert_eq!(
+            pushes,
+            1,
+            "the first tick tried the edit once: {:?}",
+            server.seen()
+        );
+
+        running.stop();
+        assert_eq!(
+            count(&server, "POST "),
+            pushes,
+            "no final drain with a refused token: {:?}",
+            server.seen()
+        );
+        assert_eq!(
+            p.outbox_len().unwrap(),
+            1,
+            "the edit stays queued for the next sign-in"
+        );
+    }
+
+    #[test]
+    fn the_nudge_loop_stays_off_the_socket_while_signed_out() {
+        let server = Stub::start(|_| (401, REFUSED.into()));
+        let client = ServerClient::with_token(&server.url, "dead-token");
+        let stop = Arc::new(AtomicBool::new(false));
+        let signed_out = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::channel();
+        let h = {
+            let (stop, signed_out) = (stop.clone(), signed_out.clone());
+            thread::spawn(move || nudge_loop(client, stop, tx, signed_out))
+        };
+        thread::sleep(Duration::from_millis(400));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        assert!(
+            server.seen().is_empty(),
+            "dialled /cable: {:?}",
+            server.seen()
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_server_tests {
+    //! The two facts the fix for tinkerex#472 rests on, against a REAL sync server
+    //! (chaim354/tinkerex-sync) instead of the scripted stub. Skipped, with a notice, unless
+    //! `SYNC_IT_SERVER_URL` and `SYNC_IT_ADMIN_TOKEN` are set — the suites' admin-door mode
+    //! (CLAUDE.md §5).
+    use super::*;
+    use fs_provider::{Provider, ROOT_INO};
+
+    fn server() -> Option<String> {
+        let url = std::env::var("SYNC_IT_SERVER_URL").ok()?;
+        sync_client::admin_token_configured().then_some(url)
+    }
+
+    macro_rules! server_or_skip {
+        () => {
+            match server() {
+                Some(url) => url,
+                None => {
+                    eprintln!("SKIPPED (set SYNC_IT_SERVER_URL and SYNC_IT_ADMIN_TOKEN to run)");
+                    return;
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn live_a_sibling_device_token_reaches_the_same_library_and_keeps_the_outbox() {
+        // A fresh grant is a SIBLING device on the same sync-server user: the maker app's
+        // SyncGrant mints one with `create_device`. Its token differs; `whoami` must not.
+        let url = server_or_skip!();
+        let email = format!("bind-{}@example.com", uuid::Uuid::new_v4());
+        let mut a = ServerClient::new(&url);
+        a.enroll(&email, "unused", "device A")
+            .expect("provision a library");
+        let token_a = a.token().unwrap().to_string();
+        let token_b = a.create_device("device B").expect("a sibling").device_token;
+        assert_ne!(token_a, token_b);
+        let b = ServerClient::with_token(&url, &token_b);
+        assert_eq!(a.whoami().unwrap().user_id, b.whoami().unwrap().user_id);
+
+        let dir = std::env::temp_dir().join(format!("sync-bind-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = || {
+            let store = Box::new(LocalChunkStore::new(dir.join("chunks")).unwrap());
+            SqliteProvider::open(&dir.join("tree.db"), store).unwrap()
+        };
+        {
+            let p = open();
+            bind_to_library(&p, &a, &url, &token_a).unwrap();
+            let f = p.create(ROOT_INO, "draft.scad").unwrap();
+            p.write(f.ino, 0, b"cube(10);").unwrap();
+            p.flush(f.ino).unwrap();
+        }
+        let p = open();
+        assert_eq!(
+            bind_to_library(&p, &b, &url, &token_b).unwrap(),
+            Binding::Rebound
+        );
+        assert_eq!(
+            p.outbox_len().unwrap(),
+            1,
+            "the unpushed edit survives the new token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_the_servers_refusal_is_what_parks_the_loop() {
+        let url = server_or_skip!();
+        let dead = ServerClient::with_token(&url, "not-a-device-token");
+        let e = dead.whoami().unwrap_err();
+        assert!(e.is_auth_rejection(), "{e}");
+        let tick: crate::Error = dead.changes_paged(0, 10).unwrap_err().into();
+        assert!(refused_by_server(&tick, &dead), "{tick}");
     }
 }

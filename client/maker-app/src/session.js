@@ -48,8 +48,11 @@ export const SIGNED_OUT_HINT = "Sign in to browse your library.";
  * can "tidy" back to `account = null` with nothing going red. Here it is a case a test holds.
  *
  *   "signed-in"  a successful device login. REPLACES whatever was there — this is the explicit
- *                account switch, and the only thing that ever changes the account.
+ *                account switch, and the only way back from a sign-out.
  *   "unmounted"  the drive stopped. Identity untouched; unmounting is not signing out.
+ *   "signed-out" the SERVER refused this device's token (tinkerex#472) and the backend has
+ *                forgotten the record. The account really is gone, so this is the one event
+ *                that clears it: every catalog command stops asking until the next sign-in.
  *
  * A FAILED sign-in sends no event, so it leaves the working account alone rather than blanking
  * it. (The mount PHASE — mounting/mounted/unmounted — is a separate concern that still lives as
@@ -61,6 +64,8 @@ export function accountAfter(account, event) {
       return { serverUrl: event.serverUrl, email: event.email };
     case "unmounted":
       return account; // NOT null — see this file's header
+    case "signed-out":
+      return null;
     default:
       return account;
   }
@@ -84,5 +89,68 @@ export async function fetchConflicts({ invoke, account }) {
     return (await invoke("conflicts", a)) || [];
   } catch {
     return null; // daemon not up yet, etc.
+  }
+}
+
+// ---- signed out by the server (tinkerex#472) ------------------------------------------------
+//
+// Since tinkerex#466 the maker app can sign a device out (Settings → Devices, a password change,
+// DEVICE_IDLE_DAYS of idleness), and the sync server will too (tinkerex#473). The backend turns
+// the server's refusal into ONE answer, whichever of the ~60 commands met it — SIGNED_OUT in
+// src-tauri/src/lib.rs, which starts with SIGNED_OUT_PREFIX — and forgets the dead record, so the
+// next sign-in really signs in. test/signed-out.test.js holds the two halves together.
+
+/** How every "signed out" answer from the backend begins (lib.rs `SIGNED_OUT`). */
+export const SIGNED_OUT_PREFIX = "Signed out:";
+
+/** The backend's answer once the record is gone (lib.rs `NOT_SIGNED_IN`). */
+export const NOT_SIGNED_IN = "this device isn't signed in yet";
+
+/** What the signed-out notice and toasts say. */
+export const SIGNED_OUT_NOTICE =
+  "This device was signed out of Tinkerex: its sign-in was revoked or has expired. " +
+  "Sign in again to keep syncing. Nothing on this device was deleted.";
+
+/**
+ * Did the backend just say this device is signed out? Only its two signed-out answers count.
+ * Offline, a 5xx, a proxy's 401 and a wrong password are ordinary errors: signing a device out
+ * for any of them would be the opposite bug.
+ */
+export const isSignedOutError = (e) => {
+  const text = e == null ? "" : String(e);
+  return text.startsWith(SIGNED_OUT_PREFIX) || text === NOT_SIGNED_IN;
+};
+
+/**
+ * Wrap the Tauri `invoke` so a signed-out answer from ANY command reaches `onSignedOut`, whichever
+ * surface made the call — including the background polls that swallow their own errors. The
+ * rejection is re-thrown unchanged, so each caller's own catch still runs as before.
+ */
+export function guardInvoke(invoke, onSignedOut) {
+  return async (cmd, args) => {
+    try {
+      return await invoke(cmd, args);
+    } catch (e) {
+      if (isSignedOutError(e)) onSignedOut(String(e));
+      throw e;
+    }
+  };
+}
+
+/**
+ * The status pill for a `sync_status` answer — `{ state, mountpoint }`, state one of "mounted",
+ * "signed_out", "unmounted" — or the transient "mounting" the sign-in button sets. "signed_out"
+ * is still mounted (the drive serves local files; edits queue) but nothing syncs, and the pill
+ * used to say "mounted at …" for it.
+ */
+export function pillFor(status) {
+  if (status === "mounting") return { className: "pill busy", label: "signing in…", unmount: false };
+  switch (status && status.state) {
+    case "mounted":
+      return { className: "pill on", label: `mounted at ${status.mountpoint}`, unmount: true };
+    case "signed_out":
+      return { className: "pill warn", label: "signed out — sync paused", unmount: true };
+    default:
+      return { className: "pill", label: "unmounted", unmount: false };
   }
 }

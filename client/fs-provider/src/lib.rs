@@ -355,6 +355,15 @@ pub enum FsError {
 
 pub type Result<T> = std::result::Result<T, FsError>;
 
+/// What [`SqliteProvider::reset_synced_state`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reset {
+    /// The synced tree is gone; `had_nodes` says whether there was one.
+    Wiped { had_nodes: bool },
+    /// Nothing was touched: `pending` outbox entries have never reached the server.
+    Refused { pending: usize },
+}
+
 /// FastCDC chunking parameters. Large defaults suit big maker files; tests shrink them.
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkConfig {
@@ -1675,38 +1684,67 @@ impl SqliteProvider {
             .unwrap_or(0))
     }
 
-    /// Bind this local DB to a `library_id` (a stable per-library/account id). If the DB was
-    /// last used by a **different** library, its stale tree state — nodes, manifests, outbox,
-    /// and the cursor — is wiped so a reused DB path can't mix two libraries (which produced
-    /// duplicate/colliding placeholders + a stale cursor). The content-addressed chunk store
-    /// is left intact (safe to share — keyed by hash). Returns `true` if it wiped a different
-    /// library's state, `false` if the DB already belonged to this library (kept as-is).
-    pub fn bind_library(&self, library_id: i64) -> Result<bool> {
+    /// One integer from `sync_state` (the cursor's table), or `None` if the key was never set.
+    /// The sync engine keeps its library binding here (`library_key`, `credential_key`).
+    pub fn sync_state(&self, key: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
-        let current: Option<i64> = conn
+        Ok(conn
             .query_row(
-                "SELECT value FROM sync_state WHERE key = 'library'",
-                [],
+                "SELECT value FROM sync_state WHERE key = ?1",
+                params![key],
                 |r| r.get(0),
             )
-            .optional()?;
-        if current == Some(library_id) {
-            return Ok(false); // same library — keep the local cache + cursor
+            .optional()?)
+    }
+
+    pub fn set_sync_state(&self, key: &str, value: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_state(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// How many outbox entries are queued: local changes the server has not acknowledged.
+    pub fn outbox_len(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Forget the synced tree so this DB can serve a different library: nodes, manifests, the
+    /// cursor and every `sync_state` key. The content-addressed chunk store is left intact (safe
+    /// to share — keyed by hash).
+    ///
+    /// **Refuses while the outbox holds anything** ([`Reset::Refused`], nothing touched). Those
+    /// entries are local edits the server has never seen, and the tree rows they point at are
+    /// the only copy of them; the wipe this replaces (`bind_library`) deleted both whenever a
+    /// device's token changed, which is how a signed-out device that signed in again lost every
+    /// edit it had not pushed (tinkerex#472). The count and the wipe share one transaction, so a
+    /// write landing between them cannot slip under the check.
+    pub fn reset_synced_state(&self) -> Result<Reset> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let pending: i64 = tx.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?;
+        if pending > 0 {
+            return Ok(Reset::Refused {
+                pending: pending as usize,
+            });
         }
-        let had_nodes: i64 = conn.query_row(
+        let had_nodes: i64 = tx.query_row(
             "SELECT COUNT(*) FROM nodes WHERE parent_ino IS NOT NULL",
             [],
             |r| r.get(0),
         )?;
-        conn.execute("DELETE FROM nodes WHERE parent_ino IS NOT NULL", [])?;
-        conn.execute("DELETE FROM manifest_chunks", [])?;
-        conn.execute("DELETE FROM outbox", [])?;
-        conn.execute("DELETE FROM sync_state", [])?; // clears the old cursor too
-        conn.execute(
-            "INSERT INTO sync_state(key, value) VALUES ('library', ?1)",
-            params![library_id],
-        )?;
-        Ok(had_nodes > 0)
+        tx.execute("DELETE FROM nodes WHERE parent_ino IS NOT NULL", [])?;
+        tx.execute("DELETE FROM manifest_chunks", [])?;
+        tx.execute("DELETE FROM sync_state", [])?; // clears the old cursor too
+        tx.commit()?;
+        Ok(Reset::Wiped {
+            had_nodes: had_nodes > 0,
+        })
     }
 
     pub fn set_cursor(&self, cursor: i64) -> Result<()> {
