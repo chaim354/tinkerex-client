@@ -189,6 +189,9 @@ button.danger { color: var(--err); border-color: var(--err); }
 .pill.on { color: var(--ok); }
 .pill.busy .dot { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
 .pill.busy { color: var(--warn); }
+/* Signed out: still mounted, nothing syncing (tinkerex#472). */
+.pill.warn .dot { background: var(--warn); }
+.pill.warn { color: var(--warn); }
 @keyframes pulse { 50% { opacity: 0.35; } }
 
 .muted { color: var(--muted); font-size: 0.85rem; }
@@ -575,3 +578,18 @@ button.active { background: var(--accent); color: var(--accent-ink); border-colo
 /* picker rows used by the shared maker file picker */
 .picker-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-meta { color: var(--muted); font-size: 0.8rem; }
+
+/* ---- signed out (tinkerex#472) ---- */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0 0 1rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--warn);
+  border-radius: var(--r-sm);
+  color: var(--warn);
+}
+.notice span { flex: 1; }
+.toast.warn { border: 1px solid var(--warn); color: var(--warn); }
+.toast .toast-action { flex: none; }

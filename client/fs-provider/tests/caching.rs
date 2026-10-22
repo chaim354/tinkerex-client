@@ -11,7 +11,7 @@
 mod common;
 use common::*;
 
-use fs_provider::Provider;
+use fs_provider::{Provider, Reset};
 
 #[test]
 fn flush_sets_a_nonzero_mtime() {
@@ -223,33 +223,61 @@ fn ingest_bytes_replaces_content_and_enqueues_sync() {
 }
 
 #[test]
-fn bind_library_wipes_a_different_librarys_stale_state() {
-    // A reused local DB must not mix two libraries: binding it to a different library_id
-    // wipes the stale tree (the bug behind the Windows "cursor 14 > head_seq 5" + duplicate
-    // placeholders). Same id → kept; different id → wiped; chunk cache untouched.
+fn reset_synced_state_wipes_a_fully_pushed_tree() {
+    // A reused local DB must not mix two libraries: re-binding it to a different library wipes
+    // the stale tree (the bug behind the Windows "cursor 14 > head_seq 5" + duplicate
+    // placeholders). With nothing left to push, the wipe loses nothing the server lacks.
     let p = provider();
-    let _ = write_file(&p, ROOT, "a.bin", b"library one file");
+    let ino = write_file(&p, ROOT, "a.bin", b"library one file");
+    let node_id = p.node_id_for(ino).unwrap().unwrap();
+    p.outbox_clear(&node_id).unwrap(); // pushed
     p.set_cursor(42).unwrap();
+    p.set_sync_state("library_key", 1001).unwrap();
 
-    // First bind → no prior library tag, but there's data → reports a wipe and clears it.
-    assert!(
-        p.bind_library(1001).unwrap(),
-        "data present, no tag → wiped to adopt the library"
+    assert_eq!(
+        p.reset_synced_state().unwrap(),
+        Reset::Wiped { had_nodes: true }
     );
     assert!(p.export_tree().unwrap().is_empty(), "tree wiped");
     assert_eq!(p.cursor().unwrap(), 0, "cursor reset");
+    assert_eq!(
+        p.sync_state("library_key").unwrap(),
+        None,
+        "every binding key goes with it"
+    );
+}
 
-    // Re-bind to the SAME library → no wipe.
-    let _ = write_file(&p, ROOT, "b.bin", b"library 1001 file");
-    p.set_cursor(7).unwrap();
-    assert!(!p.bind_library(1001).unwrap(), "same library → kept as-is");
-    assert_eq!(p.export_tree().unwrap().len(), 1, "tree preserved");
-    assert_eq!(p.cursor().unwrap(), 7, "cursor preserved");
+#[test]
+fn reset_synced_state_refuses_while_the_outbox_holds_unpushed_changes() {
+    // tinkerex#472: the wipe used to delete the outbox with the tree, so re-binding a DB whose
+    // device had been signed out destroyed every edit it never got to push. The outbox is local
+    // intent the server has never seen; no binding decision is worth it.
+    let p = provider();
+    let _ = write_file(&p, ROOT, "draft.scad", b"cube(10);");
+    p.set_cursor(17).unwrap();
+    assert_eq!(p.outbox_len().unwrap(), 1);
 
-    // Bind to a DIFFERENT library → wipe.
-    assert!(p.bind_library(2002).unwrap(), "different library → wiped");
-    assert!(p.export_tree().unwrap().is_empty(), "stale tree gone");
-    assert_eq!(p.cursor().unwrap(), 0, "cursor reset for the new library");
+    assert_eq!(
+        p.reset_synced_state().unwrap(),
+        Reset::Refused { pending: 1 }
+    );
+    assert_eq!(
+        p.outbox_len().unwrap(),
+        1,
+        "the unpushed edit is still queued"
+    );
+    assert_eq!(p.export_tree().unwrap().len(), 1, "and still in the tree");
+    assert_eq!(p.cursor().unwrap(), 17, "nothing else moved either");
+}
+
+#[test]
+fn sync_state_keys_round_trip_and_read_absent_as_none() {
+    let p = provider();
+    assert_eq!(p.sync_state("credential_key").unwrap(), None);
+    p.set_sync_state("credential_key", -5).unwrap();
+    p.set_sync_state("credential_key", 9).unwrap(); // an upsert, not a second row
+    assert_eq!(p.sync_state("credential_key").unwrap(), Some(9));
+    assert_eq!(p.sync_state("library_key").unwrap(), None);
 }
 
 #[test]

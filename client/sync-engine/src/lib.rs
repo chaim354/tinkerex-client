@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use sync_client::{Change, ChunkRef, CommitBegin, ServerClient, TreeNode};
 
 mod daemon;
-pub use daemon::{DaemonConfig, Debounce, WebdavMount, DEFAULT_HYDRATE_CONCURRENCY, DEFAULT_POLL};
+pub use daemon::{
+    DaemonConfig, Debounce, SyncHealth, WebdavMount, DEFAULT_HYDRATE_CONCURRENCY, DEFAULT_POLL,
+};
 
 /// Client-side bandwidth throttling: a [`ThrottledChunkIO`](throttle::ThrottledChunkIO)
 /// decorator that token-bucket rate-limits the bytes any [`ChunkIO`] transfers (separate
@@ -48,6 +50,11 @@ pub enum Error {
     /// the manifest hash; `got` is the sha256 actually computed over the returned bytes.
     #[error("chunk corrupt: expected {expected}, got {got} (storage returned bytes that don't match the content hash)")]
     ChunkCorrupt { expected: String, got: String },
+    /// The local DB holds a different library than the one this sign-in reaches, AND changes
+    /// that never reached a server. Wiping would lose them and syncing would push them into a
+    /// library they were not made in, so the mount is refused instead (tinkerex#472).
+    #[error("this device holds {pending} local change(s) that never reached the server, made while it synced a different library than the one this sign-in reaches. Nothing was deleted, and the drive was not mounted so nothing can be: the changes stay in this device's local database")]
+    UnpushedChangesElsewhere { pending: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

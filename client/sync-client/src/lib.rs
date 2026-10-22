@@ -35,6 +35,22 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// The server refused this device's token: a **401 carrying the API's JSON error body**,
+    /// which is what both the maker app and the sync server answer a revoked, expired or
+    /// unknown device token (`{"error":"unauthorized"}`). This is the ONE error a host may
+    /// treat as "signed out" (tinkerex#472). A transport failure, a 5xx, a 403, and a 401
+    /// without that body (a proxy in front of the server) are not — signing a device out
+    /// for being offline would be the opposite bug.
+    pub fn is_auth_rejection(&self) -> bool {
+        match self {
+            Error::Server { status: 401, body } => serde_json::from_str::<serde_json::Value>(body)
+                .is_ok_and(|v| v.get("error").is_some_and(|e| e.is_string())),
+            _ => false,
+        }
+    }
+}
+
 // ---- wire types -----------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1263,5 +1279,77 @@ mod tests {
             "the client keeps the maker token"
         );
         assert_eq!(reg.sync.expect("grant").device_token, "sync-tok");
+    }
+
+    // ---- a server refusing this device's token (tinkerex#472) ----
+
+    const REFUSED: &str = r#"{"error":"unauthorized"}"#;
+
+    #[test]
+    fn an_auth_rejection_is_a_401_carrying_the_apis_json_error() {
+        // What both the maker app (V1::Authentication) and the sync server (ApiError::
+        // Unauthorized) answer a revoked, expired or unknown device token.
+        assert!(Error::Server {
+            status: 401,
+            body: REFUSED.into()
+        }
+        .is_auth_rejection());
+    }
+
+    #[test]
+    fn nothing_but_that_401_is_an_auth_rejection() {
+        // Signing a device out on anything else would sign it out for being offline. A proxy's
+        // 401 (HTML, or no body) is not the server refusing the token; nor is any other status.
+        for body in [
+            "<html><body>401 Authorization Required</body></html>",
+            "",
+            "unauthorized",
+        ] {
+            assert!(
+                !Error::Server {
+                    status: 401,
+                    body: body.into()
+                }
+                .is_auth_rejection(),
+                "a 401 with body {body:?} is not the API's refusal"
+            );
+        }
+        for status in [400u16, 403, 404, 408, 429, 500, 502, 503, 504] {
+            assert!(
+                !Error::Server {
+                    status,
+                    body: REFUSED.into()
+                }
+                .is_auth_rejection(),
+                "status {status}"
+            );
+        }
+        // No token configured locally is a programming error, not the server's verdict.
+        assert!(!Error::Unauthenticated.is_auth_rejection());
+        // Network down: connection refused.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            drop(l);
+            url
+        };
+        let down = ServerClient::with_token(closed, "tok")
+            .whoami()
+            .unwrap_err();
+        assert!(matches!(down, Error::Http(_)), "{down}");
+        assert!(!down.is_auth_rejection());
+    }
+
+    #[test]
+    fn a_revoked_token_reads_as_an_auth_rejection_on_both_servers_routes() {
+        let sync = one_shot_stub("GET /v1/devices/whoami", "401 Unauthorized", REFUSED);
+        let e = ServerClient::with_token(sync, "dead").whoami().unwrap_err();
+        assert!(e.is_auth_rejection(), "{e}");
+
+        let maker = one_shot_stub("GET /v1/maker/tags", "401 Unauthorized", REFUSED);
+        let e = ServerClient::with_token(maker, "dead")
+            .list_tags()
+            .unwrap_err();
+        assert!(e.is_auth_rejection(), "{e}");
     }
 }

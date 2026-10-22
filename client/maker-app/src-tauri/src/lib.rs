@@ -3,7 +3,9 @@
 //! Commands drive the native sync daemon. Auth is **token-persisted**: a device signs in
 //! once (`sync_login`: email + password → `POST /v1/devices/login` on the TINKEREX server the
 //! user typed, authenticated by Devise there), the credential is saved under the app dir, and
-//! later starts reuse it — we never re-login. Since D1 (2026-10-13) that login answers two
+//! later starts reuse it without asking the server — until a server REFUSES it (revoked or
+//! expired, tinkerex#472): then the record is forgotten, every command answers `SIGNED_OUT`, and
+//! the next sign-in logs in afresh. Since D1 (2026-10-13) that login answers two
 //! devices' worth of credential: the maker app's own token, and a `sync` grant naming the sync
 //! server and a token it accepts. The sync routes go to the grant (`sync_endpoint`), the maker
 //! API to the typed server (`maker_endpoint`). Every device of an account logs in
@@ -114,7 +116,31 @@ type Mount = sync_engine::WinfspMount;
 
 /// Holds the running mount (or `None` when stopped).
 #[derive(Default)]
-struct AppState(Mutex<Option<Mount>>);
+struct AppState(Mutex<Option<Running>>);
+
+/// The running mount and the sign-in it runs on: which account, and the sync token its daemon
+/// holds. A status poll needs them to forget the record the sync server refused, and a sign-in
+/// to decide whether to replace the mount (`remount`).
+struct Running {
+    mount: Mount,
+    server: String,
+    email: String,
+    sync_token: String,
+}
+
+impl Running {
+    fn signed_out(&self) -> bool {
+        self.mount.is_running() && self.mount.sync_health() == sync_engine::SyncHealth::SignedOut
+    }
+
+    /// The sync server refused this mount's token: forget the record it came from (only if it
+    /// still holds that token), so the next sign-in enrols instead of reusing it.
+    fn forget_if_refused(&self) {
+        if self.signed_out() {
+            forget_credential(&self.server, &self.email, &self.sync_token);
+        }
+    }
+}
 
 // ---- credential persistence (sign in once, reuse the credential) -------------------
 
@@ -436,6 +462,163 @@ fn maker_endpoint_from(
     ))
 }
 
+// ---- a credential the server refused (tinkerex#472) -------------------------------
+//
+// Since tinkerex#466 the maker app signs a device out (Settings → Devices, any password change,
+// DEVICE_IDLE_DAYS of idleness) and its token then gets 401; the sync server will do the same
+// (tinkerex#473). This app used to show that as a raw `server 401: …` toast and then, worse, reuse
+// the dead record on every later sign-in without asking the server anything, so the only way out
+// was hand-editing credentials.json. Now the moment the app learns a token is dead — a command's
+// call refused, or the daemon parked as `SignedOut` — the record is forgotten, every command
+// answers `SIGNED_OUT`, and the next sign-in enrols afresh. Only the server's own refusal counts
+// (`sync_client::Error::is_auth_rejection`): offline, a 5xx or a proxy never signs anyone out.
+
+/// What a command answers when the server refused this device's token. The frontend keys its
+/// signed-out state off the leading `Signed out:` (client/maker-app/src/session.js).
+const SIGNED_OUT: &str =
+    "Signed out: this device's sign-in to Tinkerex was revoked or has expired. \
+     Sign in again to keep syncing. Nothing on this device was deleted.";
+
+/// Remove this (server, email)'s record from every file in `files` — but only where it still
+/// holds `used_token`, the token the server just refused. A call made with the dead token can
+/// answer after the user has signed in again; compare-and-delete keeps that late 401 from
+/// deleting the fresh record. Every other account's entry is carried across untouched. `true`
+/// if a record was removed.
+fn forget_credential_from(
+    files: &[PathBuf],
+    server: &str,
+    email: &str,
+    used_token: &str,
+) -> std::io::Result<bool> {
+    let key = creds_key(server, email);
+    let mut forgot = false;
+    for path in files {
+        let Some(mut map) = std::fs::read_to_string(path).ok().and_then(|s| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s).ok()
+        }) else {
+            continue;
+        };
+        let dead = map
+            .get(&key)
+            .and_then(|v| credential_from_value(server, v))
+            .is_some_and(|c| {
+                c.sync_token == used_token || c.maker_token.as_deref() == Some(used_token)
+            });
+        if dead {
+            map.remove(&key);
+            write_secure_atomic(path, &serde_json::to_string_pretty(&map)?)?;
+            forgot = true;
+        }
+    }
+    Ok(forgot)
+}
+
+/// Forget the record in the real credential files. Logged, never fatal: the command still
+/// answers `SIGNED_OUT`, and a record that could not be removed is refused again next time.
+fn forget_credential(server: &str, email: &str, used_token: &str) {
+    match forget_credential_from(&credential_files(), server, email, used_token) {
+        Ok(true) => eprintln!(
+            "credentials: forgot the refused sign-in for {}",
+            creds_key(server, email)
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("credentials: could not forget the refused sign-in ({e})"),
+    }
+}
+
+/// The text a command answers for a failed call made with `used_token`: `SIGNED_OUT` (and the
+/// record forgotten) when the server refused the token, otherwise `"<what> failed: <error>"`.
+fn on_failure(
+    files: &[PathBuf],
+    server: &str,
+    email: &str,
+    used_token: Option<&str>,
+    what: &str,
+    e: sync_client::Error,
+) -> String {
+    if !e.is_auth_rejection() {
+        return format!("{what} failed: {e}");
+    }
+    if let Some(token) = used_token {
+        if let Err(io) = forget_credential_from(files, server, email, token) {
+            eprintln!("credentials: could not forget the refused sign-in ({io})");
+        }
+    }
+    SIGNED_OUT.to_string()
+}
+
+/// `.map_err(failed(&server_url, &email, &client, "list items"))` — how every command reports
+/// a server call's failure. `client` carries the token the call was made with.
+fn failed<'a>(
+    server: &'a str,
+    email: &'a str,
+    client: &'a sync_client::ServerClient,
+    what: &'a str,
+) -> impl FnOnce(sync_client::Error) -> String + 'a {
+    move |e| on_failure(&credential_files(), server, email, client.token(), what, e)
+}
+
+/// What a sign-in should do about a mount that is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remount {
+    /// Nothing running: mount.
+    Start,
+    /// Stop the running mount, then mount the new credential.
+    Replace,
+    /// Leave it: "already mounted — unmount first", as before.
+    Refuse,
+}
+
+/// The running mount, as [`remount`] needs to see it.
+#[derive(Debug, Clone, Copy)]
+struct RunningView<'a> {
+    /// `creds_key` of the account it syncs.
+    key: &'a str,
+    sync_token: &'a str,
+    running: bool,
+    signed_out: bool,
+}
+
+/// A mount the server refused serves nobody, so any sign-in replaces it; a fresh grant for the
+/// mounted account replaces the token it runs on (otherwise the drive would keep syncing as a
+/// device the server is about to revoke). Anything else stays as it was. Replacing never costs
+/// unpushed edits: they live in the account's tree.db, which the new mount binds to the same
+/// library (sync-engine's `bind_to_library`).
+fn remount(current: Option<RunningView>, key: &str, sync_token: &str) -> Remount {
+    match current {
+        Some(r) if r.running && r.signed_out => Remount::Replace,
+        Some(r) if r.running && r.key == key && r.sync_token != sync_token => Remount::Replace,
+        Some(r) if r.running => Remount::Refuse,
+        _ => Remount::Start,
+    }
+}
+
+/// What `sync_status` answers: `state` is `"mounted"`, `"signed_out"` (still mounted, sync
+/// parked because the server refused the token) or `"unmounted"`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct MountStatus {
+    state: &'static str,
+    mountpoint: Option<String>,
+}
+
+/// `current` is the running mount's `(is_running, health, mountpoint)`.
+fn mount_status(current: Option<(bool, sync_engine::SyncHealth, String)>) -> MountStatus {
+    match current {
+        Some((true, sync_engine::SyncHealth::SignedOut, mp)) => MountStatus {
+            state: "signed_out",
+            mountpoint: Some(mp),
+        },
+        Some((true, sync_engine::SyncHealth::Syncing, mp)) => MountStatus {
+            state: "mounted",
+            mountpoint: Some(mp),
+        },
+        _ => MountStatus {
+            state: "unmounted",
+            mountpoint: None,
+        },
+    }
+}
+
 /// What a login answer means for this device — one pure function, so each arm is a test.
 ///
 /// - `sync: {…}`: a D1 server on a syncable deployment. Sync against the grant; keep the maker
@@ -494,6 +677,11 @@ fn login_error_text(e: &sync_client::Error) -> String {
             "The Tinkerex server could not reach its sync server, so this device was not signed \
              in. Try again in a minute."
                 .into()
+        }
+        // The login route's own 401 is a wrong password, NOT a refused device token: this is
+        // the one 401 that must never go through `on_failure`.
+        sync_client::Error::Server { status: 401, .. } => {
+            "That email and password did not sign in to this Tinkerex server.".into()
         }
         other => format!("login failed: {other}"),
     }
@@ -608,14 +796,34 @@ fn mount_with_grant(
     // Recover a poisoned lock instead of panicking: a prior command that panicked while
     // holding it must not permanently wedge every future mount/unmount.
     let mut guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.as_ref().is_some_and(|m| m.is_running()) {
-        return Err("already mounted — unmount first".into());
-    }
-    // Drop any stale, stopped mount BEFORE starting the new one. Its `Drop` may unmount its
-    // mountpoint; if we created the new mount first (and it reused the same path), the old
-    // one's teardown could unmount the fresh mount out from under us.
-    if let Some(old) = guard.take() {
-        drop(old);
+    let running_key = guard.as_ref().map(|r| creds_key(&r.server, &r.email));
+    let current = guard
+        .as_ref()
+        .zip(running_key.as_deref())
+        .map(|(r, key)| RunningView {
+            key,
+            sync_token: &r.sync_token,
+            running: r.mount.is_running(),
+            signed_out: r.signed_out(),
+        });
+    match remount(current, &creds_key(server_url, email), &sync_token) {
+        Remount::Refuse => return Err("already mounted — unmount first".into()),
+        // Stop the old mount — and let its own teardown finish — BEFORE starting the new one:
+        // they share this account's tree.db and (macOS) the WebDAV port. A healthy one drains
+        // its outbox on the way out; a signed-out one keeps it queued for the new token.
+        Remount::Replace => {
+            if let Some(mut old) = guard.take() {
+                old.mount.stop();
+            }
+        }
+        // Drop any stale, stopped mount BEFORE starting the new one. Its `Drop` may unmount its
+        // mountpoint; if we created the new mount first (and it reused the same path), the old
+        // one's teardown could unmount the fresh mount out from under us.
+        Remount::Start => {
+            if let Some(old) = guard.take() {
+                drop(old);
+            }
+        }
     }
 
     // Per-account local tree + chunk cache, so switching accounts doesn't surface the
@@ -635,17 +843,24 @@ fn mount_with_grant(
     // Apply the account's saved file-layer prefs (bandwidth caps) at mount time — these
     // are DaemonConfig start-time options, so they take effect on this sign-in.
     let prefs = load_prefs(server_url, email);
-    let cfg = DaemonConfig::new(&mountpoint, db, chunks, sync_url, sync_token)
+    let cfg = DaemonConfig::new(&mountpoint, db, chunks, sync_url, sync_token.clone())
         .with_bandwidth(prefs.up_bps(), prefs.down_bps());
     let mount = Mount::start(cfg).map_err(|e| format!("mount failed: {e}"))?;
     let mp = mount.mountpoint().display().to_string();
-    *guard = Some(mount);
+    *guard = Some(Running {
+        mount,
+        server: server_url.to_string(),
+        email: email.to_string(),
+        sync_token,
+    });
     Ok(format!("mounted at {mp}"))
 }
 
 /// Sign this device in to the Tinkerex server the user typed (email + password) — the Dropbox
 /// model — or reuse its saved credential, then mount + sync against the sync server that
-/// server's answer named (D1). The server authenticates the human credentials via Devise (a
+/// server's answer named (D1). A credential a server has refused is never reused: it was
+/// forgotten where the refusal was seen, so this logs in again, and a running mount on the dead
+/// token is replaced (`remount`) without losing its unpushed edits. The server authenticates the human credentials via Devise (a
 /// confirmed, unlocked account is required); the password is sent once — over whatever the
 /// server's address uses; use https where you can — and never stored, only the credential is.
 /// Every device of an account logs in independently (no pairing codes). An `http://` address,
@@ -661,8 +876,15 @@ fn sync_login(
 ) -> Result<String, String> {
     use sync_client::ServerClient;
 
+    // A running mount the sync server refused holds a dead record: forget it first, so the
+    // lookup below falls through to a real login instead of reusing it (tinkerex#472).
+    if let Some(r) = state.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        r.forget_if_refused();
+    }
     let (sync_url, sync_token) = match sync_endpoint(&server_url, &email) {
-        Ok(endpoint) => endpoint, // already enrolled on this device — reuse it, never re-login
+        // Already enrolled on this device — reuse it. A record the server has refused is gone by
+        // now (forgotten where the refusal was seen), so this is never a dead token.
+        Ok(endpoint) => endpoint,
         Err(_not_signed_in) => {
             let mut client = ServerClient::new(&server_url);
             // The name other devices see in conflict prompts and lock badges.
@@ -725,7 +947,7 @@ fn browse(server_url: String, email: String) -> Result<Vec<BrowseEntry>, String>
     loop {
         let tree = client
             .tree(after)
-            .map_err(|e| format!("browse failed: {e}"))?;
+            .map_err(failed(&server_url, &email, &client, "browse"))?;
         if tree.nodes.is_empty() {
             break;
         }
@@ -766,7 +988,7 @@ fn file_versions(
     let client = ServerClient::with_token(sync_url, sync_token);
     let vs = client
         .versions(&node_id)
-        .map_err(|e| format!("versions failed: {e}"))?;
+        .map_err(failed(&server_url, &email, &client, "versions"))?;
     Ok(vs
         .versions
         .into_iter()
@@ -790,9 +1012,12 @@ fn restore_version(
     use sync_client::ServerClient;
     let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
     let client = ServerClient::with_token(sync_url, sync_token);
-    client
-        .restore(&node_id, &version_id)
-        .map_err(|e| format!("restore failed: {e}"))?;
+    client.restore(&node_id, &version_id).map_err(failed(
+        &server_url,
+        &email,
+        &client,
+        "restore",
+    ))?;
     Ok("restored".into())
 }
 
@@ -831,7 +1056,7 @@ fn conflicts(server_url: String, email: String) -> Result<Vec<ConflictOut>, Stri
     let client = ServerClient::with_token(sync_url, sync_token);
     let cs = client
         .conflicts()
-        .map_err(|e| format!("conflicts failed: {e}"))?;
+        .map_err(failed(&server_url, &email, &client, "conflicts"))?;
     Ok(cs
         .conflicts
         .into_iter()
@@ -857,7 +1082,7 @@ fn resolve_conflict_keep(
     let client = ServerClient::with_token(sync_url, sync_token);
     client
         .resolve_conflict_keep(&node_id, &version_id)
-        .map_err(|e| format!("resolve failed: {e}"))?;
+        .map_err(failed(&server_url, &email, &client, "resolve"))?;
     Ok("kept".into())
 }
 
@@ -871,9 +1096,12 @@ fn resolve_conflict_split(
     use sync_client::ServerClient;
     let (sync_url, sync_token) = sync_endpoint(&server_url, &email)?;
     let client = ServerClient::with_token(sync_url, sync_token);
-    client
-        .resolve_conflict_split(&node_id)
-        .map_err(|e| format!("split failed: {e}"))?;
+    client.resolve_conflict_split(&node_id).map_err(failed(
+        &server_url,
+        &email,
+        &client,
+        "split",
+    ))?;
     Ok("split".into())
 }
 
@@ -900,7 +1128,7 @@ fn maker_list_items(
 ) -> Result<Vec<sync_client::Item>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_items(item_type.as_deref(), tag.as_deref(), q.as_deref())
-        .map_err(|e| format!("list items failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list items"))
 }
 
 #[tauri::command]
@@ -910,7 +1138,8 @@ fn maker_get_item(
     id: i64,
 ) -> Result<sync_client::ItemDetail, String> {
     let c = maker_client(&server_url, &email)?;
-    c.get_item(id).map_err(|e| format!("open item failed: {e}"))
+    c.get_item(id)
+        .map_err(failed(&server_url, &email, &c, "open item"))
 }
 
 #[tauri::command]
@@ -921,7 +1150,7 @@ fn maker_create_item(
 ) -> Result<sync_client::ItemDetail, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_item(&input)
-        .map_err(|e| format!("create item failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create item"))
 }
 
 #[tauri::command]
@@ -933,14 +1162,14 @@ fn maker_update_item(
 ) -> Result<sync_client::ItemDetail, String> {
     let c = maker_client(&server_url, &email)?;
     c.update_item(id, &input)
-        .map_err(|e| format!("update item failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "update item"))
 }
 
 #[tauri::command]
 fn maker_delete_item(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_item(id)
-        .map_err(|e| format!("delete item failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete item"))
 }
 
 // -- file attachments --
@@ -954,14 +1183,14 @@ fn maker_attach_file(
 ) -> Result<sync_client::FileAttachment, String> {
     let c = maker_client(&server_url, &email)?;
     c.attach_file(item_id, &input)
-        .map_err(|e| format!("attach failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "attach"))
 }
 
 #[tauri::command]
 fn maker_detach_file(server_url: String, email: String, attachment_id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.detach_file(attachment_id)
-        .map_err(|e| format!("detach failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "detach"))
 }
 
 // -- tags & taggings --
@@ -975,20 +1204,21 @@ fn maker_tag_item(
 ) -> Result<String, String> {
     let c = maker_client(&server_url, &email)?;
     c.tag_item(item_id, &name)
-        .map_err(|e| format!("tag failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "tag"))
 }
 
 #[tauri::command]
 fn maker_untag(server_url: String, email: String, tagging_id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.untag(tagging_id)
-        .map_err(|e| format!("untag failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "untag"))
 }
 
 #[tauri::command]
 fn maker_list_tags(server_url: String, email: String) -> Result<Vec<sync_client::Tag>, String> {
     let c = maker_client(&server_url, &email)?;
-    c.list_tags().map_err(|e| format!("list tags failed: {e}"))
+    c.list_tags()
+        .map_err(failed(&server_url, &email, &c, "list tags"))
 }
 
 // -- collections --
@@ -1000,7 +1230,7 @@ fn maker_list_collections(
 ) -> Result<Vec<sync_client::Collection>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_collections()
-        .map_err(|e| format!("list collections failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list collections"))
 }
 
 #[tauri::command]
@@ -1012,7 +1242,7 @@ fn maker_create_collection(
 ) -> Result<sync_client::Collection, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_collection(&name, description.as_deref())
-        .map_err(|e| format!("create collection failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create collection"))
 }
 
 #[tauri::command]
@@ -1023,7 +1253,7 @@ fn maker_collection_items(
 ) -> Result<Vec<sync_client::CollectionItem>, String> {
     let c = maker_client(&server_url, &email)?;
     c.collection_items(collection_id)
-        .map_err(|e| format!("collection items failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "collection items"))
 }
 
 #[tauri::command]
@@ -1034,8 +1264,12 @@ fn maker_add_to_collection(
     item_id: i64,
 ) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
-    c.add_to_collection(collection_id, item_id)
-        .map_err(|e| format!("add to collection failed: {e}"))
+    c.add_to_collection(collection_id, item_id).map_err(failed(
+        &server_url,
+        &email,
+        &c,
+        "add to collection",
+    ))
 }
 
 #[tauri::command]
@@ -1047,7 +1281,7 @@ fn maker_remove_from_collection(
 ) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.remove_from_collection(collection_id, item_id)
-        .map_err(|e| format!("remove from collection failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "remove from collection"))
 }
 
 // -- tasks --
@@ -1060,7 +1294,7 @@ fn maker_list_tasks(
 ) -> Result<Vec<sync_client::Task>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_tasks(open_only)
-        .map_err(|e| format!("list tasks failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list tasks"))
 }
 
 #[tauri::command]
@@ -1071,7 +1305,7 @@ fn maker_create_task(
 ) -> Result<sync_client::Task, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_task(&input)
-        .map_err(|e| format!("create task failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create task"))
 }
 
 #[tauri::command]
@@ -1083,14 +1317,14 @@ fn maker_update_task(
 ) -> Result<sync_client::Task, String> {
     let c = maker_client(&server_url, &email)?;
     c.update_task(id, &input)
-        .map_err(|e| format!("update task failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "update task"))
 }
 
 #[tauri::command]
 fn maker_delete_task(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_task(id)
-        .map_err(|e| format!("delete task failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete task"))
 }
 
 // -- projects --
@@ -1103,7 +1337,7 @@ fn maker_list_projects(
 ) -> Result<Vec<sync_client::Project>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_projects(status.as_deref())
-        .map_err(|e| format!("list projects failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list projects"))
 }
 
 #[tauri::command]
@@ -1114,7 +1348,7 @@ fn maker_get_project(
 ) -> Result<sync_client::Project, String> {
     let c = maker_client(&server_url, &email)?;
     c.get_project(id)
-        .map_err(|e| format!("open project failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "open project"))
 }
 
 #[tauri::command]
@@ -1125,7 +1359,7 @@ fn maker_create_project(
 ) -> Result<sync_client::Project, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_project(&input)
-        .map_err(|e| format!("create project failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create project"))
 }
 
 #[tauri::command]
@@ -1137,14 +1371,14 @@ fn maker_update_project(
 ) -> Result<sync_client::Project, String> {
     let c = maker_client(&server_url, &email)?;
     c.update_project(id, &input)
-        .map_err(|e| format!("update project failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "update project"))
 }
 
 #[tauri::command]
 fn maker_delete_project(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_project(id)
-        .map_err(|e| format!("delete project failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete project"))
 }
 
 #[tauri::command]
@@ -1156,14 +1390,14 @@ fn maker_add_build_log(
 ) -> Result<sync_client::BuildLogEntry, String> {
     let c = maker_client(&server_url, &email)?;
     c.add_build_log(project_id, &input)
-        .map_err(|e| format!("add build-log failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "add build-log"))
 }
 
 #[tauri::command]
 fn maker_delete_build_log(server_url: String, email: String, entry_id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_build_log(entry_id)
-        .map_err(|e| format!("delete build-log failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete build-log"))
 }
 
 #[tauri::command]
@@ -1175,7 +1409,7 @@ fn maker_attach_file_to_project(
 ) -> Result<sync_client::FileAttachment, String> {
     let c = maker_client(&server_url, &email)?;
     c.attach_file_to_project(project_id, &input)
-        .map_err(|e| format!("attach failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "attach"))
 }
 
 // -- inventory --
@@ -1189,7 +1423,7 @@ fn maker_list_inventory(
 ) -> Result<Vec<sync_client::InventoryItem>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_inventory(category.as_deref(), location_id)
-        .map_err(|e| format!("list inventory failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list inventory"))
 }
 
 #[tauri::command]
@@ -1199,7 +1433,7 @@ fn maker_low_stock(
 ) -> Result<Vec<sync_client::InventoryItem>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_low_stock()
-        .map_err(|e| format!("low-stock failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "low-stock"))
 }
 
 #[tauri::command]
@@ -1210,7 +1444,7 @@ fn maker_get_inventory_item(
 ) -> Result<sync_client::InventoryItem, String> {
     let c = maker_client(&server_url, &email)?;
     c.get_inventory_item(id)
-        .map_err(|e| format!("open item failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "open item"))
 }
 
 #[tauri::command]
@@ -1221,7 +1455,7 @@ fn maker_create_inventory_item(
 ) -> Result<sync_client::InventoryItem, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_inventory_item(&input)
-        .map_err(|e| format!("create item failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create item"))
 }
 
 #[tauri::command]
@@ -1233,14 +1467,14 @@ fn maker_update_inventory_item(
 ) -> Result<sync_client::InventoryItem, String> {
     let c = maker_client(&server_url, &email)?;
     c.update_inventory_item(id, &input)
-        .map_err(|e| format!("update item failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "update item"))
 }
 
 #[tauri::command]
 fn maker_delete_inventory_item(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_inventory_item(id)
-        .map_err(|e| format!("delete item failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete item"))
 }
 
 #[tauri::command]
@@ -1254,7 +1488,7 @@ fn maker_adjust_inventory(
 ) -> Result<sync_client::InventoryItem, String> {
     let c = maker_client(&server_url, &email)?;
     c.adjust_inventory(id, delta, reason.as_deref(), note.as_deref())
-        .map_err(|e| format!("adjust failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "adjust"))
 }
 
 #[tauri::command]
@@ -1265,7 +1499,7 @@ fn maker_inventory_transactions(
 ) -> Result<Vec<sync_client::InventoryTransaction>, String> {
     let c = maker_client(&server_url, &email)?;
     c.inventory_transactions(id)
-        .map_err(|e| format!("transactions failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "transactions"))
 }
 
 #[tauri::command]
@@ -1275,7 +1509,7 @@ fn maker_list_locations(
 ) -> Result<Vec<sync_client::Location>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_locations()
-        .map_err(|e| format!("list locations failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list locations"))
 }
 
 #[tauri::command]
@@ -1288,14 +1522,14 @@ fn maker_create_location(
 ) -> Result<sync_client::Location, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_location(&name, description.as_deref(), parent_id)
-        .map_err(|e| format!("create location failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create location"))
 }
 
 #[tauri::command]
 fn maker_delete_location(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_location(id)
-        .map_err(|e| format!("delete location failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete location"))
 }
 
 #[tauri::command]
@@ -1305,7 +1539,7 @@ fn maker_list_suppliers(
 ) -> Result<Vec<sync_client::Supplier>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_suppliers()
-        .map_err(|e| format!("list suppliers failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list suppliers"))
 }
 
 #[tauri::command]
@@ -1318,14 +1552,14 @@ fn maker_create_supplier(
 ) -> Result<sync_client::Supplier, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_supplier(&name, url.as_deref(), notes.as_deref())
-        .map_err(|e| format!("create supplier failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create supplier"))
 }
 
 #[tauri::command]
 fn maker_delete_supplier(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_supplier(id)
-        .map_err(|e| format!("delete supplier failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete supplier"))
 }
 
 // -- BOM --
@@ -1338,7 +1572,7 @@ fn maker_list_boms(
 ) -> Result<Vec<sync_client::Bom>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_boms(project_id)
-        .map_err(|e| format!("list boms failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list boms"))
 }
 
 #[tauri::command]
@@ -1350,13 +1584,14 @@ fn maker_create_bom(
 ) -> Result<sync_client::Bom, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_bom(project_id, &input)
-        .map_err(|e| format!("create bom failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "create bom"))
 }
 
 #[tauri::command]
 fn maker_delete_bom(server_url: String, email: String, id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
-    c.delete_bom(id).map_err(|e| format!("delete bom failed: {e}"))
+    c.delete_bom(id)
+        .map_err(failed(&server_url, &email, &c, "delete bom"))
 }
 
 #[tauri::command]
@@ -1366,7 +1601,8 @@ fn maker_bom_rollup(
     id: i64,
 ) -> Result<sync_client::BomRollup, String> {
     let c = maker_client(&server_url, &email)?;
-    c.bom_rollup(id).map_err(|e| format!("rollup failed: {e}"))
+    c.bom_rollup(id)
+        .map_err(failed(&server_url, &email, &c, "rollup"))
 }
 
 #[tauri::command]
@@ -1378,7 +1614,7 @@ fn maker_create_bom_line(
 ) -> Result<sync_client::BomLine, String> {
     let c = maker_client(&server_url, &email)?;
     c.create_bom_line(bom_id, &input)
-        .map_err(|e| format!("add line failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "add line"))
 }
 
 #[tauri::command]
@@ -1390,14 +1626,14 @@ fn maker_update_bom_line(
 ) -> Result<sync_client::BomLine, String> {
     let c = maker_client(&server_url, &email)?;
     c.update_bom_line(line_id, &input)
-        .map_err(|e| format!("update line failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "update line"))
 }
 
 #[tauri::command]
 fn maker_delete_bom_line(server_url: String, email: String, line_id: i64) -> Result<(), String> {
     let c = maker_client(&server_url, &email)?;
     c.delete_bom_line(line_id)
-        .map_err(|e| format!("delete line failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "delete line"))
 }
 
 // -- previews --
@@ -1412,7 +1648,7 @@ fn maker_list_previews(
 ) -> Result<Vec<sync_client::Preview>, String> {
     let c = maker_client(&server_url, &email)?;
     c.list_previews(node_id.as_deref(), version_id.as_deref(), kind.as_deref())
-        .map_err(|e| format!("list previews failed: {e}"))
+        .map_err(failed(&server_url, &email, &c, "list previews"))
 }
 
 #[tauri::command]
@@ -1431,28 +1667,40 @@ fn maker_enqueue_preview(
         kind.as_deref(),
         filename.as_deref(),
     )
-    .map_err(|e| format!("enqueue preview failed: {e}"))
+    .map_err(failed(&server_url, &email, &c, "enqueue preview"))
 }
 
 #[tauri::command]
 fn sync_stop(state: State<AppState>) -> Result<String, String> {
     let mut guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
     match guard.take() {
-        Some(mut m) => {
-            m.stop();
+        Some(mut r) => {
+            // Unmounting a refused mount must not leave its dead record behind for the next
+            // sign-in to reuse.
+            r.forget_if_refused();
+            r.mount.stop();
             Ok("unmounted".into())
         }
         None => Err("not mounted".into()),
     }
 }
 
+/// The mount's state for the status pill, polled every 3 s. `signed_out` is the daemon parked
+/// on a refused token — still mounted, nothing syncing — and the record it ran on is forgotten
+/// here, so "Sign in again" really signs in.
 #[tauri::command]
-fn sync_status(state: State<AppState>) -> String {
+fn sync_status(state: State<AppState>) -> MountStatus {
     let guard = state.0.lock().unwrap_or_else(|p| p.into_inner());
-    match guard.as_ref() {
-        Some(m) if m.is_running() => format!("mounted at {}", m.mountpoint().display()),
-        _ => "unmounted".into(),
+    if let Some(r) = guard.as_ref() {
+        r.forget_if_refused();
     }
+    mount_status(guard.as_ref().map(|r| {
+        (
+            r.mount.is_running(),
+            r.mount.sync_health(),
+            r.mount.mountpoint().display().to_string(),
+        )
+    }))
 }
 
 /// The OS (`"windows"`/`"macos"`/`"linux"`), so the frontend can default the mount point
@@ -1986,11 +2234,11 @@ mod tests {
             body: r#"{"error":"sync_unavailable"}"#.into(),
         };
         assert!(login_error_text(&unavailable).contains("Try again"));
-        let refused = sync_client::Error::Server {
-            status: 401,
-            body: r#"{"error":"invalid_credentials"}"#.into(),
+        let other = sync_client::Error::Server {
+            status: 422,
+            body: r#"{"error":"unconfirmed"}"#.into(),
         };
-        assert!(login_error_text(&refused).starts_with("login failed: "));
+        assert!(login_error_text(&other).starts_with("login failed: "));
     }
 
     // ---- the Windows mount default (D1) ----
@@ -2022,6 +2270,285 @@ mod tests {
         assert_eq!(
             expand_user_profile(r"%USERPROFILE%\Tinkerex", None),
             PathBuf::from(r"%USERPROFILE%\Tinkerex")
+        );
+    }
+
+    // ---- a credential the server refused (tinkerex#472) ----
+
+    const REFUSED: &str = r#"{"error":"unauthorized"}"#;
+
+    fn refused() -> sync_client::Error {
+        sync_client::Error::Server {
+            status: 401,
+            body: REFUSED.into(),
+        }
+    }
+
+    #[test]
+    fn a_refused_maker_token_forgets_the_credential_so_the_next_sign_in_enrols() {
+        // The wedge: sync_login reused ANY saved credential and never contacted the server, so a
+        // revoked device could only escape by hand-editing credentials.json. A refusal now
+        // removes the record; the next sign-in finds none and logs in afresh.
+        let dir = scratch("forget-maker");
+        let file = dir.join("credentials.json");
+        save_credential_to(&file, SERVER, EMAIL, &grant_record()).unwrap();
+
+        let text = on_failure(
+            std::slice::from_ref(&file),
+            SERVER,
+            EMAIL,
+            Some("maker-tok"),
+            "list items",
+            refused(),
+        );
+        assert_eq!(
+            text, SIGNED_OUT,
+            "one sentence, never the raw `server 401: …`"
+        );
+        assert_eq!(
+            maker_endpoint_from(std::slice::from_ref(&file), SERVER, EMAIL),
+            Err(NOT_SIGNED_IN.to_string())
+        );
+        assert_eq!(
+            sync_endpoint_from(&[file], SERVER, EMAIL),
+            Err(NOT_SIGNED_IN.to_string()),
+            "the whole record goes: the next sign-in mints both tokens again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_sync_token_forgets_the_credential_too() {
+        let dir = scratch("forget-sync");
+        let file = dir.join("credentials.json");
+        save_credential_to(&file, SERVER, EMAIL, &grant_record()).unwrap();
+        assert_eq!(
+            on_failure(
+                std::slice::from_ref(&file),
+                SERVER,
+                EMAIL,
+                Some("sync-tok"),
+                "browse",
+                refused()
+            ),
+            SIGNED_OUT
+        );
+        assert!(load_credential_from(&[file], SERVER, EMAIL).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_refusal_of_an_old_token_never_deletes_a_fresh_sign_in() {
+        // A call made with the dead token can answer AFTER the user has signed in again (calls
+        // run on Tauri's pool, with a 30 s timeout). It must not delete the new record.
+        let dir = scratch("forget-race");
+        let file = dir.join("credentials.json");
+        save_credential_to(&file, SERVER, EMAIL, &grant_record()).unwrap();
+        assert!(
+            !forget_credential_from(std::slice::from_ref(&file), SERVER, EMAIL, "dead-tok")
+                .unwrap()
+        );
+        assert_eq!(
+            load_credential_from(&[file], SERVER, EMAIL),
+            Some(grant_record())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_reaches_the_pre_migration_copy_and_leaves_other_accounts_alone() {
+        // The loader falls back to the temp-dir copy, so a dead token left there would simply
+        // be read back on the next sign-in. Every other entry, a legacy string included, stays.
+        let dir = scratch("forget-both");
+        let durable = dir.join("credentials.json");
+        let legacy_copy = dir.join("legacy-credentials.json");
+        let other = creds_key("https://sync.tinkerex.home", "old@example.com");
+        write_raw(
+            &legacy_copy,
+            &[
+                (creds_key(SERVER, EMAIL), "old-tok".into()),
+                (other.clone(), "keep-tok".into()),
+            ],
+        );
+        let files = [durable.clone(), legacy_copy.clone()];
+        assert_eq!(
+            sync_endpoint_from(&files, SERVER, EMAIL),
+            Ok((SERVER.to_string(), "old-tok".to_string()))
+        );
+
+        assert!(forget_credential_from(&files, SERVER, EMAIL, "old-tok").unwrap());
+        assert_eq!(
+            sync_endpoint_from(&files, SERVER, EMAIL),
+            Err(NOT_SIGNED_IN.to_string())
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&legacy_copy).unwrap()).unwrap();
+        assert_eq!(on_disk[&other], serde_json::json!("keep-tok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transient_failure_signs_nobody_out() {
+        // Network down, a 5xx, a proxy's 401: the old "<what> failed: …" text, credential kept.
+        let dir = scratch("transient");
+        let file = dir.join("credentials.json");
+        save_credential_to(&file, SERVER, EMAIL, &grant_record()).unwrap();
+        let down = sync_client::ServerClient::with_token("http://127.0.0.1:9", "maker-tok")
+            .list_tags()
+            .unwrap_err();
+        let failures = [
+            down,
+            sync_client::Error::Server {
+                status: 503,
+                body: r#"{"error":"unavailable"}"#.into(),
+            },
+            sync_client::Error::Server {
+                status: 401,
+                body: "<html>proxy</html>".into(),
+            },
+        ];
+        for e in failures {
+            let shown = e.to_string();
+            let text = on_failure(
+                std::slice::from_ref(&file),
+                SERVER,
+                EMAIL,
+                Some("maker-tok"),
+                "list tags",
+                e,
+            );
+            assert_eq!(text, format!("list tags failed: {shown}"));
+            assert_eq!(
+                load_credential_from(std::slice::from_ref(&file), SERVER, EMAIL),
+                Some(grant_record()),
+                "{shown}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_server_call_in_a_command_reports_through_failed() {
+        // 56 server calls each map their own error; one left on the old `format!` would show
+        // the raw 401 and keep the dead credential. Read as text, as session.test.js reads
+        // index.html. (`Mount::start`'s error is the local daemon's, not a server's.)
+        let src = include_str!("lib.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let stray: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains(".map_err(|e| format!(") && l.contains(" failed: {e}"))
+            .filter(|l| !l.contains("Mount::start"))
+            .collect();
+        assert!(stray.is_empty(), "these bypass `failed`: {stray:#?}");
+        assert!(body.matches(".map_err(failed(").count() >= 56);
+    }
+
+    // ---- replacing the mount when the account signs in again ----
+
+    const KEY: &str = "https://tinkerex.example.com|ada@example.com";
+
+    fn running(sync_token: &str, signed_out: bool) -> RunningView<'_> {
+        RunningView {
+            key: KEY,
+            sync_token,
+            running: true,
+            signed_out,
+        }
+    }
+
+    #[test]
+    fn a_signed_out_mount_is_replaced_by_the_next_sign_in() {
+        // It used to answer "already mounted — unmount first" with the dead mount still up.
+        assert_eq!(
+            remount(Some(running("dead", true)), KEY, "fresh"),
+            Remount::Replace
+        );
+        // Whoever signs in: a refused mount serves nobody.
+        assert_eq!(
+            remount(Some(running("dead", true)), "other|x@y.z", "fresh"),
+            Remount::Replace
+        );
+    }
+
+    #[test]
+    fn a_fresh_grant_for_the_mounted_account_replaces_the_old_token() {
+        // A maker 401 forgets the credential while the old sync token may still work; signing
+        // in again mints a new grant, and the drive must move onto it.
+        assert_eq!(
+            remount(Some(running("old", false)), KEY, "fresh"),
+            Remount::Replace
+        );
+    }
+
+    #[test]
+    fn a_healthy_mount_is_left_alone_as_before() {
+        assert_eq!(
+            remount(Some(running("tok", false)), KEY, "tok"),
+            Remount::Refuse
+        );
+        assert_eq!(
+            remount(Some(running("tok", false)), "other|x@y.z", "other-tok"),
+            Remount::Refuse
+        );
+        let stopped = RunningView {
+            running: false,
+            ..running("tok", false)
+        };
+        assert_eq!(remount(Some(stopped), KEY, "tok"), Remount::Start);
+        assert_eq!(remount(None, KEY, "tok"), Remount::Start);
+    }
+
+    #[test]
+    fn a_refused_mount_reports_signed_out_not_mounted() {
+        use sync_engine::SyncHealth;
+        assert_eq!(
+            mount_status(Some((
+                true,
+                SyncHealth::SignedOut,
+                "/Users/ada/Tinkerex".into()
+            ))),
+            MountStatus {
+                state: "signed_out",
+                mountpoint: Some("/Users/ada/Tinkerex".into())
+            }
+        );
+        assert_eq!(
+            mount_status(Some((
+                true,
+                SyncHealth::Syncing,
+                "/Users/ada/Tinkerex".into()
+            ))),
+            MountStatus {
+                state: "mounted",
+                mountpoint: Some("/Users/ada/Tinkerex".into())
+            }
+        );
+        assert_eq!(
+            mount_status(Some((false, SyncHealth::SignedOut, "/x".into()))),
+            MountStatus {
+                state: "unmounted",
+                mountpoint: None
+            }
+        );
+        assert_eq!(
+            mount_status(None),
+            MountStatus {
+                state: "unmounted",
+                mountpoint: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_wrong_password_reads_as_one_sentence() {
+        // Signing in again is now the everyday recovery, so its commonest failure is worded.
+        let wrong = sync_client::Error::Server {
+            status: 401,
+            body: r#"{"error":"invalid_credentials"}"#.into(),
+        };
+        assert_eq!(
+            login_error_text(&wrong),
+            "That email and password did not sign in to this Tinkerex server."
         );
     }
 }
