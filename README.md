@@ -30,6 +30,11 @@ The wire between them is specified in `docs/sync-protocol.md` in chaim354/tinker
 There is no Cargo workspace, so every crate builds on its own: `cd client/<crate> && cargo test`.
 [CLAUDE.md](CLAUDE.md) is the cheatsheet: the commands, the per-OS gotchas, and what CI runs.
 
+## Security
+
+Found a vulnerability? Report it privately through the repository's Security tab, as
+[SECURITY.md](SECURITY.md) describes, rather than in a public issue.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
