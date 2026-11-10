@@ -1,4 +1,4 @@
-//! Client for the Rails sync server (`docs/sync-protocol.md`).
+//! Client for the Rails sync server (`docs/sync-protocol.md` in chaim354/tinkerex-sync).
 //!
 //! Two responsibilities:
 //! 1. **Control plane** — a typed HTTP client for the v1 API (register, commit,

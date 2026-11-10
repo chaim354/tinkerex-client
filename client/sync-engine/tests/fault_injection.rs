@@ -18,7 +18,7 @@
 //!   [`FaultyChunkIO`] decorator that injects transient/persistent PUT/GET failures. The
 //!   bytes still land in a content-addressed store exactly as the cloud would hold them.
 //! - A small [`MockCloud`] standing in for the Rails control plane: an authoritative
-//!   node map + a per-user changelog with `seq`, mirroring `docs/sync-protocol.md`
+//!   node map + a per-user changelog with `seq`, mirroring tinkerex-sync's `docs/sync-protocol.md`
 //!   ("The changelog & cursor"). It implements the *documented* idempotency + failure
 //!   semantics (commit keyed by id, content-addressed PUT no-op on retry, changelog apply
 //!   idempotent, cursor advances only on success, mid-pull → resume from cursor).
@@ -244,7 +244,7 @@ impl ChunkIO for FaultyChunkIO {
 // ----------------------------------------------------------------------------------------
 // MockCloud — the Rails control plane (authoritative tree + changelog), in-process.
 //
-// Models exactly the documented protocol (docs/sync-protocol.md): an authoritative node
+// Models exactly the documented protocol (tinkerex-sync's docs/sync-protocol.md): an authoritative node
 // map keyed by stable node_id, a per-user changelog (ordered seq), and conflict detection
 // via base_version_id. Implements the documented idempotency/failure semantics so the
 // harness asserts the *engine's* behavior against a faithful server, not a strawman.
