@@ -23,7 +23,7 @@ them.
 - **[chaim354/tinkerex-sync](https://github.com/chaim354/tinkerex-sync)** is the sync server:
   versions, the changelog and chunk storage. With that grant, the app syncs against it directly.
 
-The wire between them is specified in `docs/sync-protocol.md` in chaim354/tinkerex.
+The wire between them is specified in `docs/sync-protocol.md` in chaim354/tinkerex-sync.
 
 ## Build and test
 
